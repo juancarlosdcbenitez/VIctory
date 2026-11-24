@@ -6046,6 +6046,8 @@ impl<'a> Lower<'a> {
                     self.s.m.cmp(c, p, a, b)
                 }
             }
+            // Constant results need no operands.
+            "u64" | "i64" if matches!(op, "f" | "t") => self.s.m.bool(op == "t"),
             "u64" | "i64" => {
                 let (a, b) = (self.src64(inst, 0)?, self.src64(inst, 1)?);
                 let signed = ty == "i64";

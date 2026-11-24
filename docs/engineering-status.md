@@ -47,8 +47,10 @@ Done (commits after `ffe310e`):
   `victory translate` over the title was not run.
 * **ISA sweeps of existing lowerings** (verified off-GPU, no defects
   found): all VOPC predicates (f32, f16, 16/32/64-bit integers, class),
-  conversions, rounding, omod/clamp, carries, 64-bit SALU, SDWA, f32
-  arithmetic and the legacy multiply, packed 16-bit integers.
+  conversions, rounding, omod/clamp, carries, 64-bit SALU, SDWA, f32 and
+  f16 arithmetic and the legacy multiply, packed 16-bit integers,
+  `v_perm_b32` with literal and computed selectors. The sweep found the
+  constant `v_cmp_f/t_i64/u64` refused; they now translate.
 * **victory-gpu builds on Linux** (verified): its 24 portable tests run.
 * Evaluator programs are validated by `dxil.dll` wherever it loads
   (implemented, not run: there is no `dxil.dll` here; Windows CI has one).
@@ -69,7 +71,7 @@ P3 runtime compatibility, P4 usability.
 | SH-2 | P1 | not implemented | `tbuffer_store_format_*`: typed-format stores are refused (`buffer()`); the inverse of `format_load` (pack, round and saturate per numeric format). |
 | SH-3 | P1 | not implemented | Double precision (`v_*_f64`, `v_cvt_*_f64`, f64 compares): the DXIL writer has no `double` type. |
 | SH-4 | P1 | not implemented | `v_div_scale/fmas/fixup_f32` (the precise division sequence). |
-| SH-5 | P1 | not implemented | `v_permlane16/x16_b32`, `v_dot2_f32_f16`, `v_dot2c_f32_f16`, `v_msad_u8`, `v_qsad/mqsad`, `image_msaa_load`, `image_*_pck*`, flat and scratch memory, `s_getreg_b32`, scalar stores and atomics, clamped integer arithmetic (VOP3 clamp), constant `v_cmp_f/t_*64`. |
+| SH-5 | P1 | not implemented | `v_permlane16/x16_b32`, `v_dot2_f32_f16`, `v_dot2c_f32_f16`, `v_msad_u8`, `v_qsad/mqsad`, `image_msaa_load`, `image_*_pck*`, flat and scratch memory, `s_getreg_b32`, scalar stores and atomics, clamped integer arithmetic (VOP3 clamp). |
 | SH-6 | P1 | not implemented | Merged geometry stages; 64-lane cross-lane code on 32-lane hosts (README). |
 | SH-7 | P1 | not checked | The 59 new lowerings through `dxil.dll` and on a GPU: Windows CI's `cargo test` now validates them (evaluator programs); `valu_tests` cases for a few (`v_mad_u64_u32`, `v_ldexp_f32`, `v_frexp_*`) would cover the GPU. |
 | PERF-1 | P2 | open | World frames take 0.5-1.8 s (README, one machine). No measurement possible here. The existing switches (`VICTORY_GPU_TIMING`, `VICTORY_SHADER_LOOP_LIMIT`) are where to start. |

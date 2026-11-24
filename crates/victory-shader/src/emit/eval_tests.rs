@@ -1215,14 +1215,8 @@ fn wide_integer_compares_match_the_isa() {
     for (ty, signed) in [("i64", true), ("u64", false)] {
         for p in INT_PREDICATES {
             let name = format!("v_cmp_{p}_{ty}");
-            let l = match lower_valu(&compare_body(&name, true)) {
-                Ok(l) => l,
-                // A refusal is an honest answer; a wrong result is not.
-                Err(e) => {
-                    eprintln!("{name}: {e}");
-                    continue;
-                }
-            };
+            let l = lower_valu(&compare_body(&name, true))
+                .unwrap_or_else(|e| panic!("{name} does not lower: {e}"));
             for c in &cases {
                 let a = u64::from(c[0]) | u64::from(c[1]) << 32;
                 let b = u64::from(c[2]) | u64::from(c[3]) << 32;
@@ -1738,5 +1732,110 @@ fn packed_16_bit_integers_match_the_isa() {
             &cases,
             |[a, b, ..]| lanes(a, b, op),
         );
+    }
+}
+
+/// `v_perm_b32`'s byte select (RDNA2 ISA): bytes 0-3 of S1, then 4-7 of S0;
+/// 8-11 the sign of bytes 1 and 3 of S1, then of S0, as 0x00 or 0xFF; 12
+/// is 0x00, anything above 0xFF.
+fn perm_reference(s0: u32, s1: u32, sel: u32) -> u32 {
+    let data = u64::from(s0) << 32 | u64::from(s1);
+    (0..4)
+        .map(|i| {
+            let s = (sel >> (8 * i)) & 0xFF;
+            let byte = match s {
+                0..=7 => (data >> (8 * s)) & 0xFF,
+                8..=11 => {
+                    let bit = [15, 31, 47, 63][s as usize - 8];
+                    if data >> bit & 1 != 0 { 0xFF } else { 0 }
+                }
+                12 => 0,
+                _ => 0xFF,
+            };
+            (byte as u32) << (8 * i)
+        })
+        .sum()
+}
+
+#[test]
+fn v_perm_b32_matches_the_isa() {
+    let selectors = [
+        0x0706_0504u32,
+        0x0302_0100,
+        0x0C0C_0C0C,
+        0x0B0A_0908,
+        0x0D0E_FF10,
+        0x0001_0806,
+        0x0405_0607,
+        0x0C08_0901,
+    ];
+    let mut cases = Vec::new();
+    for &a in &[0x8081_7F01u32, 0x1234_5678, 0xFFFF_0000, 0x0080_8000] {
+        for &b in &[0x00FF_80FFu32, 0xDEAD_BEEF, 0x7F7F_7F7F] {
+            for &s in &selectors {
+                cases.push([a, b, s, 0]);
+            }
+        }
+    }
+    // A computed selector (v3), and each selector as a literal.
+    check_v0(
+        "v_perm_b32 (dynamic)",
+        &vop3(vop3_op("v_perm_b32"), 0, vgpr(1), vgpr(2), vgpr(3)),
+        &cases,
+        |[a, b, s, _]| perm_reference(a, b, s),
+    );
+    for &s in &selectors {
+        let mut body = vop3(vop3_op("v_perm_b32"), 0, vgpr(1), vgpr(2), LITERAL).to_vec();
+        body.push(s);
+        let mine: Vec<[u32; 4]> = cases.iter().filter(|c| c[2] == s).copied().collect();
+        check_v0(
+            &format!("v_perm_b32 {s:#010x}"),
+            &body,
+            &mine,
+            |[a, b, ..]| perm_reference(a, b, s),
+        );
+    }
+}
+
+#[test]
+fn f16_arithmetic_rounds_once_as_the_isa() {
+    // Every product or sum of two halves is exact in f32 and rounds once to
+    // f16 (round to nearest even), as the hardware does.
+    let halves = [
+        0x0000u32, 0x8000, 0x0001, 0x03FF, 0x0400, 0x3C00, 0xBC00, 0x3C01, 0x7BFF, 0xFBFF, 0x7C00,
+        0xFC00, 0x7E00, 0x3555, 0x4248, 0x1400,
+    ];
+    let mut cases = Vec::new();
+    for &a in &halves {
+        for &b in &halves {
+            cases.push([a, b, 0, 0]);
+        }
+    }
+    let to_h = |x: f32| u32::from(super::bitcode::eval::f32_to_f16(x));
+    let h = |x: u32| f16_to_f32(x as u16);
+    type HalfOp = (&'static str, fn(f32, f32) -> f32);
+    let ops: &[HalfOp] = &[
+        ("v_add_f16", |a, b| a + b),
+        ("v_sub_f16", |a, b| a - b),
+        ("v_subrev_f16", |a, b| b - a),
+        ("v_mul_f16", |a, b| a * b),
+    ];
+    for &(name, op) in ops {
+        let body = vop3(vop3_op(name), 0, vgpr(1), vgpr(2), 0);
+        for (c, got) in cases.iter().zip(eval_cases(&body, &cases)) {
+            let want = op(h(c[0]), h(c[1]));
+            let got_h = got[0] & 0xFFFF;
+            if want.is_nan() {
+                assert!(
+                    h(got_h).is_nan(),
+                    "{name}({:#06x}, {:#06x}) = {got_h:#06x}",
+                    c[0],
+                    c[1]
+                );
+            } else {
+                assert_eq!(got_h, to_h(want), "{name}({:#06x}, {:#06x})", c[0], c[1]);
+            }
+            assert_eq!(got[0] >> 16, 0, "{name} keeps the high half");
+        }
     }
 }
