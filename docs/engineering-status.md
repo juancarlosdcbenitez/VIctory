@@ -88,7 +88,9 @@ Baseline: `d472bbd`. Each commit was pushed to the branch as it landed.
   `synth::eval_wave` gives each lane its own inputs. Sweeps of the
   existing cross-lane lowering (readlane/writelane/readfirstlane, mbcnt,
   all DPP16 controls with masks and bound_ctrl, DPP8, ds_swizzle) found
-  no defects.
+  no defects, nor did sweeps of packed f16 arithmetic under op_sel and of
+  group-shared memory across a wave (offsets, read2/write2 with st64,
+  atomics).
 * **v_permlane16/x16_b32 and ds_bpermute_b32 translated** (verified
   off-GPU). ds_bpermute's wave32 index wrap is our reading of the ISA.
 * **ds_swizzle rotate and FFT modes refused** (offsets from 0xC000): the
