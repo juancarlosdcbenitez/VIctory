@@ -1,0 +1,172 @@
+name: Windows validation
+
+# The development branches' checks on Windows: the workspace linted and
+# built, its tests in two groups (crates that never open a D3D12 device,
+# then the crates and tests that may), DXIL validated by the Windows SDK's
+# dxil.dll (required once found: a validator that does not load fails the
+# run instead of skipping validation), and a report of what the machine's
+# D3D12 adapters support. Logs are kept as an artifact.
+#
+# Hosted runners have no GPU. Their D3D12 adapters are WARP and the Basic
+# Render Driver, both software; the tests and the summary say which adapter
+# each D3D12 run used. Nothing here is hardware GPU validation.
+
+on:
+  push:
+    branches: ["claude/**"]
+    paths-ignore: ["docs/**", "**.md"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+  RUST_BACKTRACE: "1"
+
+jobs:
+  validate:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+      # The version and components pinned in rust-toolchain.toml.
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Machine and tools
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force logs | Out-Null
+          $log = "logs/machine.txt"
+          $os = Get-CimInstance Win32_OperatingSystem
+          "Windows: $($os.Caption) $($os.Version)" | Tee-Object -FilePath $log
+          "Display adapters (WMI):" | Tee-Object -Append -FilePath $log
+          Get-CimInstance Win32_VideoController |
+            ForEach-Object { "  $($_.Name), driver $($_.DriverVersion)" } |
+            Tee-Object -Append -FilePath $log
+          # The SDK's validator, newest SDK first. Found: the tests must
+          # validate with it. Not found: said so, here and in the summary.
+          $dll = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin\*\x64\dxil.dll' -ErrorAction SilentlyContinue |
+            Sort-Object { [version]$_.Directory.Parent.Name } | Select-Object -Last 1
+          if ($dll) {
+            "dxil.dll: $($dll.FullName), version $($dll.VersionInfo.FileVersion)" | Tee-Object -Append -FilePath $log
+            "VICTORY_DXIL=$($dll.FullName)" >> $env:GITHUB_ENV
+            "VICTORY_DXIL_REQUIRED=1" >> $env:GITHUB_ENV
+          } else {
+            "dxil.dll: not found; DXIL validation is not performed" | Tee-Object -Append -FilePath $log
+            Write-Output "::warning::No dxil.dll in the Windows SDK: DXIL validation is not performed"
+          }
+          rustc -Vv | Tee-Object -Append -FilePath $log
+
+      - name: Clippy
+        shell: bash
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings 2>&1 | tee logs/clippy.txt
+
+      - name: Clippy, diagnostics build
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings 2>&1 | tee logs/clippy-diagnostics.txt
+
+      - name: Build the tests
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: cargo test --workspace --locked --no-run 2>&1 | tee logs/build-tests.txt
+
+      # Crates whose tests never open a D3D12 device, and victory-shader
+      # without its D3D12 tests. The shader evaluator tests are here: every
+      # program they lower also goes through dxil.dll.
+      - name: Tests without a D3D12 device
+        if: ${{ !cancelled() }}
+        timeout-minutes: 30
+        shell: bash
+        run: >-
+          cargo test --workspace --locked
+          --exclude victory-gpu --exclude victory-hle --exclude victory
+          --
+          --skip emit::valu_tests --skip emit::waterfall_tests
+          --skip emit::diff_tests --skip emit::tests::stub_pipeline_is_created
+          2>&1 | tee logs/tests-no-device.txt
+
+      # The translated-shader tests, on the first hardware adapter at SM 6.6
+      # and on WARP; each run prints its adapter and whether it renders in
+      # software, and the hardware half says why it was skipped. The
+      # differential tests skip: they need the console SDK's compiler,
+      # which this repository does not provide.
+      - name: Shader tests on D3D12 (software on hosted runners)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 30
+        shell: bash
+        run: >-
+          cargo test --locked -p victory-shader --
+          emit::valu_tests emit::waterfall_tests emit::diff_tests
+          emit::tests::stub_pipeline_is_created --nocapture
+          2>&1 | tee logs/tests-shader-d3d12.txt
+
+      # The GPU layer, the runtime and the app: their tests may open the
+      # GPU layer's device, which is on the system's default adapter (the
+      # Basic Render Driver on hosted runners). The first test names it.
+      - name: GPU layer, runtime and app tests (default adapter)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 30
+        shell: bash
+        run: |
+          cargo test --locked -p victory-gpu the_host_device_names_its_adapter -- --nocapture 2>&1 | tee logs/tests-gpu-adapter.txt
+          cargo test --locked -p victory-gpu -p victory-hle -p victory 2>&1 | tee logs/tests-gpu-hle-app.txt
+
+      - name: D3D12 capability report
+        if: ${{ !cancelled() }}
+        timeout-minutes: 10
+        shell: bash
+        run: cargo test --locked -p victory-shader capability_report -- --ignored --nocapture 2>&1 | tee logs/capabilities.txt
+
+      - name: Summary
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          {
+            echo "## Windows validation"
+            echo
+            echo '```'
+            cat logs/machine.txt 2>/dev/null || echo "no machine report"
+            echo '```'
+            echo
+            echo "### Test results"
+            echo
+            for f in logs/tests-*.txt; do
+              [ -e "$f" ] || continue
+              passed=$(grep -oE "test result: [a-zA-Z]+\. [0-9]+ passed" "$f" | grep -oE "[0-9]+ passed" | awk '{s+=$1} END {print s+0}')
+              failed=$(grep -oE "[0-9]+ failed" "$f" | awk '{s+=$1} END {print s+0}')
+              ignored=$(grep -oE "[0-9]+ ignored" "$f" | awk '{s+=$1} END {print s+0}')
+              echo "- \`$(basename "$f")\`: $passed passed, $failed failed, $ignored ignored"
+            done
+            echo
+            echo "### D3D12 adapters"
+            echo
+            echo '```'
+            grep -E "adapter" logs/capabilities.txt 2>/dev/null || echo "no capability report"
+            grep -hE "^(hardware|warp): |^GPU layer device: |^pipelines on " logs/tests-*.txt 2>/dev/null | sort | uniq -c
+            echo '```'
+            echo
+            if grep -q "^hardware adapter" logs/capabilities.txt 2>/dev/null; then
+              echo "A hardware adapter was present; the lines above say which runs used it."
+            else
+              echo "**No hardware GPU on this runner: every D3D12 result above is from software rendering (WARP or the Basic Render Driver). None of it is hardware GPU validation.**"
+            fi
+            if grep -q "^dxil.dll: not found" logs/machine.txt 2>/dev/null; then
+              echo
+              echo "**dxil.dll was not found: DXIL validation was not performed.**"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-validation-logs
+          path: logs/
+          retention-days: 14
