@@ -108,11 +108,12 @@ result.
 
 * **Windows validation on the fork** (verified):
   `.github/workflows/windows-validation.yml` runs on pushes to `claude/**`
-  (see [testing.md](testing.md)). Runs 3 to 6 (`a6699d5`, `5a7e0c0`,
-  `1c87a62`, `37c0ff5`) passed, about 7 minutes each with the cache: both
-  clippy configurations, the workspace tests, the shader evaluator tests
-  with the SDK's `dxil.dll` (10.0.26100.0) required, and the D3D12 tests
-  on WARP. Every evaluator program, the new loop tests' included, passes
+  (see [testing.md](testing.md)). Runs 3 to 10 (`a6699d5`, `5a7e0c0`,
+  `1c87a62`, `37c0ff5`, `71a1129`, `54ef1ba`, `f931612`, `adfdd3f`) all
+  passed, 3 to 7 minutes each with the cache: both clippy configurations,
+  the workspace tests, the shader evaluator tests with the SDK's
+  `dxil.dll` (10.0.26100.0) required, and the D3D12 tests on WARP. Every
+  evaluator program, the loop and image atomic tests' included, passes
   Microsoft's validator (SH-7). Runs 1 and 2 were cancelled by later
   pushes, which no longer cancel a run in progress.
 * **"Hardware" GPU-test runs were software** (fixed, verified on
@@ -208,6 +209,11 @@ result.
   without OPTIONS9/OPTIONS11 support, and a diagnostics build turns them
   on with `VICTORY_SHADER_IMAGE_ATOMICS_64=1` (implemented, not run in the
   world).
+* **The first session's integer lowerings on WARP** (verified on WARP,
+  run 10): 24-bit mul_hi, add/sub_nc_i32, mul_lo_i32, the 16-bit mads,
+  cvt_pk_*16_*32, the sad family, lerp_u8, v_mad_u64_u32 and
+  v_mad_i64_i32, each for 16 input sets: all four stored dwords match the
+  evaluator (`valu_tests::integer_lowerings_agree_with_the_evaluator_on_the_host`).
 * **ds_swizzle and ds_bpermute** (reviewed, unchanged): LLVM's AMDGPU
   assembler (SIDefines.h, AMDGPUAsmParser.cpp) confirms GFX9-and-later
   encodings: rotate from 0xC000 (direction bit 10, size bits 9:5), FFT
@@ -237,16 +243,17 @@ P3 runtime compatibility, P4 usability.
 | SH-4 | P1 | not implemented | `v_div_scale/fmas/fixup_f32` (the precise division sequence). |
 | SH-5 | P1 | not implemented | `ds_permute_b32` (forward permute), ds_swizzle's rotate and FFT modes (refused; encodings confirmed from LLVM, semantics need AMD's ISA guide), `v_msad_u8`, `v_qsad/mqsad`, `image_msaa_load`, `image_*_pck*`, flat and scratch memory, `s_getreg_b32`, scalar stores and atomics, clamped integer mads. (v_permlane16/x16, v_dot2(c)_f32_f16, ds_bpermute and integer clamp on adds, subtracts and dots were done in the second session.) |
 | SH-6 | P1 | not implemented | Merged geometry stages; 64-lane cross-lane code on 32-lane hosts (README). |
-| SH-7 | P1 | DXIL verified | The evaluator programs, the 59 lowerings of the first session among them, pass `dxil.dll` on Windows CI (third session). Not run on a GPU: `valu_tests` cases for a few (`v_mad_u64_u32`, `v_ldexp_f32`, `v_frexp_*`) would cover WARP, and hardware where there is one. |
+| SH-7 | P1 | DXIL verified; integers on WARP | The evaluator programs, the 59 lowerings of the first session among them, pass `dxil.dll` on Windows CI, and the integer ones agree with WARP (third session). Left: the float ones (`v_ldexp_f32`, `v_frexp_*`, conversions) on WARP, where NaN payloads and signed zeros may differ by driver choice, and everything on hardware. |
 | SH-8 | P1 | not verified | ds_bpermute's index in wave32 (we wrap at 32) against AMD's RDNA2 ISA guide (DS_BPERMUTE_B32), which this environment cannot reach. |
 | CI-1 | P1 | verified | Windows validation workflow (third session). It never claims a hardware result: hosted runners have no GPU. A hardware result needs a self-hosted runner with a GPU or a run on the owner's machine. |
 | PERF-1 | P2 | open | World frames take 0.5-1.8 s (README, one machine). No measurement possible here. The existing switches (`VICTORY_GPU_TIMING`, `VICTORY_SHADER_LOOP_LIMIT`) are where to start. |
 
 ## Next session
 
-Remote branch head at the end of the third session: see the last commit
-of `claude/sharp-thompson-o8cl4c` (the docs commit that adds this
-paragraph); Windows validation run 6 (`37c0ff5`) is the last code run.
+Remote branch head at the end of the third session: the last commit of
+`claude/sharp-thompson-o8cl4c` (the docs commit that adds this
+paragraph); Windows validation run 10 (`adfdd3f`) is the last code run,
+green.
 
 1. Check the latest Windows validation run of the branch (Actions tab or
    the job summary): it must stay green, and its summary must say no
