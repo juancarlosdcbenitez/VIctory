@@ -2601,3 +2601,89 @@ fn loops_of_other_shapes_stop_at_the_limit_too() {
     let got = eval_cases_limited(&skippable, Some(8), &[[9, 0, 0, 0]]);
     assert_eq!(got[0], [NOT_STORED; 4], "skippable, 9 iterations");
 }
+
+/// The MIMG opcode of `name`.
+fn mimg_op(name: &str) -> u16 {
+    crate::gfx10::opcode(crate::gfx10::Encoding::Mimg, name).unwrap_or_else(|| panic!("{name}"))
+}
+
+/// A texture's dwords as bytes.
+fn texel_bytes(texels: &[u32]) -> Vec<u8> {
+    texels.iter().flat_map(|t| t.to_le_bytes()).collect()
+}
+
+/// An image atomic's reference: the texel's new value from its old one,
+/// the data and (cmpswap) the compare value.
+type ImageAtomic = (&'static str, fn(u64, u64, u64, u32) -> u64);
+
+/// The image atomics the lowering takes, by the ISA's definitions
+/// (IMAGE_ATOMIC_*: the texel becomes `op(old, data)`, cmpswap stores its
+/// first data dword where the texel equals its second); `bits` is the
+/// width (32, or 64 for the two-dword forms).
+const IMAGE_ATOMICS: &[ImageAtomic] = &[
+    ("image_atomic_swap", |_, x, _, _| x),
+    (
+        "image_atomic_cmpswap",
+        |m, x, c, _| if m == c { x } else { m },
+    ),
+    ("image_atomic_add", |m, x, _, _| m.wrapping_add(x)),
+    ("image_atomic_sub", |m, x, _, _| m.wrapping_sub(x)),
+    ("image_atomic_smin", |m, x, _, bits| {
+        let s = |v: u64| ((v << (64 - bits)) as i64) >> (64 - bits);
+        if s(m) <= s(x) { m } else { x }
+    }),
+    ("image_atomic_umin", |m, x, _, _| m.min(x)),
+    ("image_atomic_smax", |m, x, _, bits| {
+        let s = |v: u64| ((v << (64 - bits)) as i64) >> (64 - bits);
+        if s(m) >= s(x) { m } else { x }
+    }),
+    ("image_atomic_umax", |m, x, _, _| m.max(x)),
+    ("image_atomic_and", |m, x, _, _| m & x),
+    ("image_atomic_or", |m, x, _, _| m | x),
+    ("image_atomic_xor", |m, x, _, _| m ^ x),
+];
+
+/// 32-bit image atomics on a 4x4 R32 texture UAV: the addressed texel
+/// becomes the operation's result, the others stay, and with glc the old
+/// value comes back in the data VGPR. (`v[1:2]` = (x, y) and `v3` (`v[3:4]`
+/// for cmpswap: data, compare) come from the root constants.)
+#[test]
+fn image_atomics_on_a_typed_texture() {
+    let texels: Vec<u32> = (0..16u32).map(|i| i.wrapping_mul(0x9E37_79B9)).collect();
+    for &(name, reference) in IMAGE_ATOMICS {
+        let cmpswap = name.ends_with("cmpswap");
+        for glc in [false, true] {
+            let mut body =
+                super::synth::mimg(mimg_op(name), 3, 1, 12, 1 + 2 * u8::from(cmpswap), 1, glc)
+                    .to_vec();
+            body.push(vop1(0x001, 0, vgpr(3))); // v0 = v3
+            let l = super::synth::lower_native(&super::synth::image_program(&body))
+                .unwrap_or_else(|e| panic!("{name}: does not lower: {e}"));
+            for (x, y, data) in [(2u32, 3u32, 5u32), (0, 0, 0x8000_0001), (3, 1, 0xFFFF_FFFF)] {
+                let i = (y * 4 + x) as usize;
+                // A compare that matches, and one that does not.
+                for cmp in [texels[i], texels[i] ^ 1] {
+                    let (out, after) = super::synth::eval_image(
+                        &l,
+                        [x, y, data, cmp],
+                        [4, 4, 1],
+                        texel_bytes(&texels),
+                    )
+                    .unwrap_or_else(|e| panic!("{name}: does not run: {e}"));
+                    let old = texels[i];
+                    let want =
+                        reference(u64::from(old), u64::from(data), u64::from(cmp), 32) as u32;
+                    let mut texels_after = texels.clone();
+                    texels_after[i] = want;
+                    assert_eq!(
+                        after,
+                        texel_bytes(&texels_after),
+                        "{name} at ({x}, {y}) with {data:#x}, compare {cmp:#x}"
+                    );
+                    let back = if glc { old } else { data };
+                    assert_eq!(out[0], back, "{name}, glc {glc}: returned");
+                }
+            }
+        }
+    }
+}

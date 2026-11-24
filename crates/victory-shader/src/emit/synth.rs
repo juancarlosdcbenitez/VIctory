@@ -39,6 +39,38 @@ pub(super) const fn s_load_dwordx4(dst: u8, base: u8) -> [u32; 2] {
     ]
 }
 
+/// SMEM `s_load_dwordx8 s[dst:dst+7], s[base:base+1], offset` (bytes).
+pub(super) const fn s_load_dwordx8(dst: u8, base: u8, offset: u32) -> [u32; 2] {
+    [
+        0x3D << 26 | 0x03 << 18 | (dst as u32) << 6 | (base as u32 >> 1),
+        125 << 25 | (offset & 0x1F_FFFF),
+    ]
+}
+
+/// MIMG `op v[vdata], v[vaddr], s[srsrc:srsrc+7] dmask:dmask dim unorm`
+/// (`glc` returns the old value of an atomic). `dim`: 0 1D, 1 2D, 2 3D,
+/// 4 1D array, 5 2D array.
+pub(super) const fn mimg(
+    op: u16,
+    vdata: u8,
+    vaddr: u8,
+    srsrc: u8,
+    dmask: u8,
+    dim: u8,
+    glc: bool,
+) -> [u32; 2] {
+    [
+        0x3C << 26
+            | (op as u32 & 0x7F) << 18
+            | (glc as u32) << 13
+            | 1 << 12
+            | (dmask as u32 & 0xF) << 8
+            | (dim as u32 & 7) << 3
+            | (op as u32 >> 7 & 1),
+        (srsrc as u32 >> 2) << 16 | (vdata as u32) << 8 | vaddr as u32,
+    ]
+}
+
 /// VOP1 `op vdst, src0` (`src0`: 0..105 = SGPR, 256..511 = VGPR).
 pub(super) const fn vop1(op: u16, vdst: u8, src0: u16) -> u32 {
     0x7E00_0000 | (vdst as u32) << 17 | (op as u32) << 9 | (src0 as u32 & 0x1FF)
@@ -315,6 +347,61 @@ pub(super) fn wave_program_lds(body: &[u32], lanes: u32, wave64: bool, lds: u32)
         threads: [lanes, 1, 1],
     });
     p
+}
+
+/// Where [`image_program`]'s texture UAV is in the heap.
+pub(super) const IMAGE_INDEX: u32 = 1;
+
+/// [`valu_program`] with a typed texture UAV too (a table entry after the
+/// result buffer's: heap index [`IMAGE_INDEX`]), its image descriptor
+/// loaded into `s[12:19]` before `body` runs.
+pub(super) fn image_program(body: &[u32]) -> NativeProgram {
+    let mut words = s_load_dwordx8(12, 4, 32).to_vec();
+    words.extend_from_slice(body);
+    let mut native = valu_program(&words);
+    native.used.push(UsedResource {
+        kind: ResourceType::Uav,
+        root: RootType::Table,
+        table_offset_dwords: 8,
+        lower_bound: 0,
+        stride: 0,
+        dwords: 8,
+        user_data: 4,
+        slot: 1,
+    });
+    native
+}
+
+/// Runs a lowered [`image_program`] whose texture (`dims`: width, height,
+/// depth or layers) holds `texels`: the stored `v0, v5, v6, v7` and the
+/// texture's bytes afterwards.
+pub(super) fn eval_image(
+    l: &Lowered,
+    inputs: [u32; 4],
+    dims: [u32; 3],
+    texels: Vec<u8>,
+) -> Result<([u32; 4], Vec<u8>), String> {
+    let mut env = Env {
+        user_data: user_data(l, inputs),
+        ..Env::default()
+    };
+    env.heap.insert(
+        0,
+        [0xDEAD_BEEFu32; 4]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect(),
+    );
+    env.heap.insert(IMAGE_INDEX, texels);
+    env.textures.insert(IMAGE_INDEX, dims);
+    eval::run(&l.module, &mut env)?;
+    if env.out_of_bounds != 0 {
+        return Err(format!("{} accesses out of bounds", env.out_of_bounds));
+    }
+    let texels = env.heap.remove(&IMAGE_INDEX).expect("the texture");
+    let out = &env.heap[&0];
+    let dword = |k: usize| u32::from_le_bytes(out[4 * k..4 * k + 4].try_into().expect("4 bytes"));
+    Ok(([dword(0), dword(1), dword(2), dword(3)], texels))
 }
 
 /// Lowers `native` (a compute program) as [`lower_valu`] does.

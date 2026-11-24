@@ -85,6 +85,10 @@ pub(crate) struct Env {
     pub root_srvs: HashMap<u32, Vec<u8>>,
     /// Buffers in the CBV/SRV/UAV heap by index, as bytes.
     pub heap: HashMap<u32, Vec<u8>>,
+    /// Of those, the typed texture UAVs: width, height, and depth or
+    /// layers. Their texels (4 bytes, or 8 for a 64-bit component type) lie
+    /// in `heap` row by row, slice by slice.
+    pub textures: HashMap<u32, [u32; 3]>,
     pub group_size: [u32; 3],
     pub group: [u32; 3],
     /// The id in its group of the wave's first thread; lane n is n further
@@ -108,6 +112,7 @@ impl Default for Env {
             root_cbvs: HashMap::new(),
             root_srvs: HashMap::new(),
             heap: HashMap::new(),
+            textures: HashMap::new(),
             group_size: [1, 1, 1],
             group: [0, 0, 0],
             thread: [0, 0, 0],
@@ -1019,39 +1024,111 @@ impl Exec<'_, '_> {
         Ok(())
     }
 
+    /// The byte offset and size of the texel a typed texture UAV access
+    /// addresses (coordinates by the resource kind: x, then y or the layer
+    /// of a 1D array, then z or the layer of a 2D array), or `None` outside
+    /// the texture.
+    fn texel(&self, h: &Handle, coords: &[Val]) -> Result<Option<(u64, u32)>, String> {
+        let (Some((kind, props)), Place::Heap { index, .. }) = (h.props, h.place) else {
+            return Err("a texture access through an unannotated handle".into());
+        };
+        let [w, height, depth] = *self
+            .env
+            .textures
+            .get(&index)
+            .ok_or(format!("heap index {index} holds no texture"))?;
+        // The component type: 4 and 5 are 32-bit integers, 6 and 7 64-bit.
+        let size = match props & 0xFF {
+            4 | 5 => 4,
+            6 | 7 => 8,
+            t => {
+                return Err(format!(
+                    "a texture atomic on component type {t} (properties {kind:#x}, {props:#x})"
+                ));
+            }
+        };
+        let c = |k: usize| match coords.get(k) {
+            Some(Val::Int(32, x)) => Ok(*x),
+            v => Err(format!("a texture coordinate {v:?}")),
+        };
+        let (x, y, z) = match kind & 0xFF {
+            1 => (c(0)?, 0, 0),
+            2 => (c(0)?, c(1)?, 0),
+            4 | 7 => (c(0)?, c(1)?, c(2)?),
+            6 => (c(0)?, 0, c(1)?),
+            k => return Err(format!("a texture atomic on resource kind {k}")),
+        };
+        if x >= u64::from(w) || y >= u64::from(height) || z >= u64::from(depth) {
+            return Ok(None);
+        }
+        let texel = (z * u64::from(height) + y) * u64::from(w) + x;
+        Ok(Some((texel * u64::from(size), size)))
+    }
+
     /// `atomicBinOp` (handle, op, c0, c1, c2, value) or
-    /// `atomicCompareExchange` (handle, c0, c1, c2, compare, new).
+    /// `atomicCompareExchange` (handle, c0, c1, c2, compare, new), on a raw
+    /// or structured buffer (32-bit) or a typed texture (32- or 64-bit).
     fn atomic(&mut self, cmpxchg: bool, a: &[Val]) -> Result<Val, String> {
         let Some(Val::Handle(h)) = a.first() else {
             return Err("an atomic without a handle".into());
         };
-        let word = |v: &Val| match v {
-            Val::Int(32, x) => Ok(*x as u32),
+        let int = |v: &Val| match v {
+            Val::Int(bits @ (32 | 64), x) => Ok((*bits, *x)),
             v => Err(format!("an atomic operand {v:?}")),
         };
         let coords = if cmpxchg { &a[1..4] } else { &a[2..5] };
-        let at = self.buffer_offset(h, &coords[0], &coords[1])?;
-        let old = self.read_dword(h, at)?;
+        let texture = h.props.is_some_and(|(k, _)| matches!(k & 0xFF, 1..=9));
+        let (at, size) = if texture {
+            match self.texel(h, coords)? {
+                Some(t) => t,
+                None => {
+                    // D3D drops atomics outside the resource.
+                    self.env.out_of_bounds += 1;
+                    let (bits, _) = int(&a[a.len() - 1])?;
+                    return Ok(Val::Int(bits, 0));
+                }
+            }
+        } else {
+            (self.buffer_offset(h, &coords[0], &coords[1])?, 4)
+        };
+        let bits = size * 8;
+        let (vbits, _) = int(&a[a.len() - 1])?;
+        if vbits != bits {
+            return Err(format!("an i{vbits} atomic on {bits}-bit data"));
+        }
+        let old = match size {
+            4 => u64::from(self.read_dword(h, at)?),
+            _ => {
+                let lo = self.read_dword(h, at)?;
+                let hi = self.read_dword(h, at + 4)?;
+                u64::from(hi) << 32 | u64::from(lo)
+            }
+        };
         let new = if cmpxchg {
-            let (cmp, new) = (word(&a[4])?, word(&a[5])?);
+            let (cmp, new) = (int(&a[4])?.1, int(&a[5])?.1);
             if old == cmp { new } else { old }
         } else {
-            let x = word(&a[5])?;
-            match word(&a[1])? {
+            let x = int(&a[5])?.1;
+            let (sold, sx) = (sext(bits, old), sext(bits, x));
+            let r = match int(&a[1])?.1 {
                 0 => old.wrapping_add(x),
                 1 => old & x,
                 2 => old | x,
                 3 => old ^ x,
-                4 => (old as i32).min(x as i32) as u32,
-                5 => (old as i32).max(x as i32) as u32,
+                4 => sold.min(sx) as u64,
+                5 => sold.max(sx) as u64,
                 6 => old.min(x),
                 7 => old.max(x),
                 8 => x,
                 op => return Err(format!("atomic operation {op}")),
-            }
+            };
+            mask(bits, r)
         };
-        self.write_dword(h, at, new)?;
-        Ok(Val::i32(old))
+        self.write_dword(h, at, new as u32)?;
+        if size == 8 {
+            self.write_dword(h, at + 4, (new >> 32) as u32)?;
+        }
+        Ok(Val::Int(bits, old))
     }
 }
 
