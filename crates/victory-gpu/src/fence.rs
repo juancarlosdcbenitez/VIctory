@@ -3,8 +3,9 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::c_void;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Condvar, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use crate::object::{self, E_NOTIMPL, FENCE, HRESULT, Iid, Object, S_OK, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
@@ -30,6 +31,9 @@ struct Fence {
     flags: u32,
     /// Events to set once the value reaches theirs (handles as integers).
     waiters: Mutex<Vec<(u64, usize)>>,
+    /// Woken (under `waiters`) when a signal moves the value, for threads
+    /// blocked in a wait without an event.
+    moved: Condvar,
 }
 
 fn fence<'a>(this: This) -> &'a Fence {
@@ -50,6 +54,7 @@ pub(crate) extern "system" fn create(
         value: AtomicU64::new(initial),
         flags,
         waiters: Mutex::new(Vec::new()),
+        moved: Condvar::new(),
     });
     object::hand_out(FENCE, fence, iid, &FENCE_IIDS, out)
 }
@@ -88,13 +93,49 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         return S_OK;
     }
     if event.is_null() {
-        // shortcut: a null event means "block until reached"; nothing can
-        // reach it while no GPU work runs, so fail instead of hanging.
-        tracing::warn!(value, "blocking fence wait not implemented");
+        // No event: block until the value is reached (another thread's
+        // submission or signal moves it).
+        // shortcut: a value nothing reaches within BLOCKING_WAIT fails the
+        // wait, as before blocking waits were implemented, rather than
+        // hang the thread forever.
+        if block_until(fence, waiters, value, BLOCKING_WAIT) {
+            return S_OK;
+        }
+        tracing::warn!(value, "a blocking fence wait was not reached in time");
         return E_NOTIMPL;
     }
     waiters.push((value, event as usize));
     S_OK
+}
+
+/// How long a wait without an event blocks for a value nothing reaches.
+const BLOCKING_WAIT: Duration = Duration::from_secs(5);
+
+/// Blocks (with `waiters` locked on entry) until `fence` reaches `value`;
+/// false if `limit` passes first. Woken by signals, and polling too: titles
+/// also write fence values from GPU commands, straight into memory.
+fn block_until(
+    fence: &Fence,
+    mut waiters: MutexGuard<'_, Vec<(u64, usize)>>,
+    value: u64,
+    limit: Duration,
+) -> bool {
+    const POLL: Duration = Duration::from_millis(1);
+    let started = Instant::now();
+    loop {
+        if fence.value.load(Ordering::Acquire) >= value {
+            return true;
+        }
+        let left = limit.saturating_sub(started.elapsed());
+        if left.is_zero() {
+            return false;
+        }
+        waiters = fence
+            .moved
+            .wait_timeout(waiters, left.min(POLL))
+            .unwrap_or_else(|e| e.into_inner())
+            .0;
+    }
 }
 pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
     let fence = fence(this);
@@ -107,6 +148,7 @@ pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
         }
         !reached
     });
+    fence.moved.notify_all();
     S_OK
 }
 
@@ -169,5 +211,54 @@ mod tests {
         // SAFETY: ours.
         unsafe { CloseHandle(event) };
         assert_eq!(slot::<extern "system" fn(This) -> u32>(f, 0x10)(f), 0);
+    }
+
+    /// A wait without an event blocks until another thread's signal
+    /// reaches its value (D3D12's contract); it used to fail at once.
+    #[test]
+    fn a_wait_without_an_event_blocks_until_a_signal_reaches_it() {
+        let mut f = std::ptr::null();
+        assert_eq!(create(std::ptr::null(), 1, 0, &FENCE_IIDS[0], &mut f), S_OK);
+        let wait = slot::<extern "system" fn(This, u64, *mut c_void) -> HRESULT>(f, 0x48);
+        let signal = slot::<extern "system" fn(This, u64) -> HRESULT>(f, 0x50);
+        let address = f as usize;
+        let signaller = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            assert_eq!(signal(address as This, 3), S_OK);
+            std::thread::sleep(Duration::from_millis(30));
+            assert_eq!(signal(address as This, 7), S_OK);
+        });
+        let started = Instant::now();
+        assert_eq!(wait(f, 7, std::ptr::null_mut()), S_OK);
+        assert!(
+            started.elapsed() >= Duration::from_millis(50),
+            "returned early"
+        );
+        assert_eq!(fence(f).value.load(Ordering::Acquire), 7);
+        signaller.join().unwrap();
+        // Reached already: no wait.
+        assert_eq!(wait(f, 7, std::ptr::null_mut()), S_OK);
+    }
+
+    /// A value written straight into the fence's memory (as GPU commands
+    /// do), without a signal, still ends the wait; one never reached ends
+    /// it at the limit, as a failure.
+    #[test]
+    fn blocking_waits_see_direct_writes_and_give_up_at_the_limit() {
+        let mut f = std::ptr::null();
+        assert_eq!(create(std::ptr::null(), 0, 0, &FENCE_IIDS[0], &mut f), S_OK);
+        let address = f as usize;
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            fence(address as This).value.store(9, Ordering::Release);
+        });
+        let fence = fence(f);
+        let guard = fence.waiters.lock().unwrap();
+        assert!(block_until(fence, guard, 9, Duration::from_secs(5)));
+        writer.join().unwrap();
+        let guard = fence.waiters.lock().unwrap();
+        let started = Instant::now();
+        assert!(!block_until(fence, guard, 10, Duration::from_millis(40)));
+        assert!(started.elapsed() >= Duration::from_millis(40));
     }
 }
