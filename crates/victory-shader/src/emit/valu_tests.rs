@@ -1069,3 +1069,125 @@ fn wide_image_atomics_on_the_host() {
         eprintln!("no SM 6.6 device with 64-bit typed atomics; nothing ran");
     }
 }
+
+/// Runs a lowered `synth::valu_program` on `host` for each input set: the
+/// four stored dwords (`v0, v5, v6, v7`) per set.
+fn run_lowered(host: &Host, l: &super::lower::Lowered, cases: &[[u32; 4]]) -> Vec<[u32; 4]> {
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: l.dxil.clone(),
+        user_data: l.user_data.clone(),
+        samplers: l.samplers.clone(),
+        static_samplers: Vec::new(),
+        root_cbvs: l.root_cbvs.clone(),
+        root_srvs: l.root_srvs.clone(),
+    };
+    let (root, pso) = host.compute_pipeline(&shader).expect("compute_pipeline");
+    cases
+        .iter()
+        .map(|&inputs| {
+            let ud = super::synth::user_data(l, inputs);
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[View::RawUav(4)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .expect("dispatch");
+            [out[0][0], out[0][1], out[0][2], out[0][3]]
+        })
+        .collect()
+}
+
+/// The first session's integer lowerings, checked until now on the
+/// evaluator only (SH-7), on each SM 6.6 device (WARP on CI): every stored
+/// dword matches the evaluator's for a spread of inputs. Integer
+/// operations only, so no choice D3D leaves to drivers (NaN payloads,
+/// signed zeros, float-to-integer saturation) can tell them apart.
+#[test]
+fn integer_lowerings_agree_with_the_evaluator_on_the_host() {
+    use super::synth::{eval_valu, lower_valu, vgpr, vop3, vop3b};
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    const NULL: u8 = 0x7D;
+    let v = |op| vop3(op, 0, vgpr(1), vgpr(2), vgpr(3)).to_vec();
+    let programs: Vec<(&str, Vec<u32>)> = vec![
+        ("v_mul_hi_u32_u24", v(0x10c)),
+        ("v_mul_hi_i32_i24", v(0x10a)),
+        ("v_add_nc_i32", v(0x37f)),
+        ("v_sub_nc_i32", v(0x376)),
+        ("v_mul_lo_i32", v(0x16b)),
+        ("v_mad_u32_u16", v(0x373)),
+        ("v_mad_i32_i16", v(0x375)),
+        ("v_cvt_pk_u16_u32", v(0x36a)),
+        ("v_cvt_pk_i16_i32", v(0x36b)),
+        ("v_sad_u8", v(0x15a)),
+        ("v_sad_hi_u8", v(0x15b)),
+        ("v_sad_u16", v(0x15c)),
+        ("v_sad_u32", v(0x15d)),
+        ("v_lerp_u8", v(0x14d)),
+        // v[6:7] = v1 * v2 + v[3:4], no carry out.
+        (
+            "v_mad_u64_u32",
+            vop3b(0x176, 6, NULL, vgpr(1), vgpr(2), vgpr(3)).to_vec(),
+        ),
+        (
+            "v_mad_i64_i32",
+            vop3b(0x177, 6, NULL, vgpr(1), vgpr(2), vgpr(3)).to_vec(),
+        ),
+    ];
+    let dwords = [
+        0u32,
+        1,
+        2,
+        0x7F,
+        0x80,
+        0xFF,
+        0x7FFF,
+        0x8000,
+        0xFFFF,
+        0x0001_0000,
+        0x00FF_FFFF,
+        0x0100_0000,
+        0x7FFF_FFFF,
+        0x8000_0000,
+        0xDEAD_BEEF,
+        0xFFFF_FFFF,
+    ];
+    let cases: Vec<[u32; 4]> = (0..dwords.len())
+        .map(|i| {
+            let d = |k: usize| dwords[(i * 7 + k * 5) % dwords.len()];
+            [d(0), d(1), d(2), d(3)]
+        })
+        .collect();
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let host = match Host::new(warp) {
+            Ok(host) => host,
+            Err(e) => {
+                eprintln!("{label}: skipped: {e}");
+                continue;
+            }
+        };
+        let kind = if host.adapter.1 {
+            "software"
+        } else {
+            "hardware"
+        };
+        eprintln!("{label}: on {} ({kind})", host.adapter.0);
+        for (name, body) in &programs {
+            let l = lower_valu(body).unwrap_or_else(|e| panic!("{name}: does not lower: {e}"));
+            let got = run_lowered(&host, &l, &cases);
+            for (inputs, got) in cases.iter().zip(got) {
+                let want = eval_valu(&l, *inputs).unwrap_or_else(|e| panic!("{name}: {e}"));
+                assert_eq!(got, want, "{label} {name}({inputs:08x?})");
+            }
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
