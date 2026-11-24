@@ -77,19 +77,35 @@ fn adapters(factory: &IDXGIFactory4) -> Vec<(IDXGIAdapter1, (String, bool))> {
         .collect()
 }
 
-/// An adapter's name, and whether it renders in software.
+/// An adapter's name, and whether it renders in software
+/// ([`super::renders_in_software`]: the software flag alone misses the
+/// primary adapter of a machine without a working display driver).
 fn describe(adapter: &IDXGIAdapter1) -> (String, bool) {
     // SAFETY: a plain query into a structure of ours.
     match unsafe { adapter.GetDesc1() } {
         Ok(d) => {
             let len = d.Description.iter().position(|&c| c == 0).unwrap_or(128);
             let name = String::from_utf16_lossy(&d.Description[..len]);
-            (name, d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0)
+            let software = super::renders_in_software(&name, d.Flags, d.VendorId, d.DeviceId);
+            (name, software)
         }
         Err(e) => (
             format!("an adapter that does not describe itself: {}", err(e)),
             false,
         ),
+    }
+}
+
+/// An adapter's vendor and device ids and flags, for reports.
+#[cfg(test)]
+fn ids(adapter: &IDXGIAdapter1) -> String {
+    // SAFETY: a plain query into a structure of ours.
+    match unsafe { adapter.GetDesc1() } {
+        Ok(d) => format!(
+            "vendor {:#06x}, device {:#06x}, flags {:#x}",
+            d.VendorId, d.DeviceId, d.Flags
+        ),
+        Err(e) => format!("no description: {}", err(e)),
     }
 }
 
@@ -1529,6 +1545,7 @@ mod capability_report {
             }
             for (adapter, (name, software)) in list {
                 let kind = if software { "software" } else { "hardware" };
+                let name = format!("{name} ({})", ids(&adapter));
                 let mut device: Option<ID3D12Device> = None;
                 match D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device) {
                     Ok(()) => match device {

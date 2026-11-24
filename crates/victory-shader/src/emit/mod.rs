@@ -103,6 +103,24 @@ use crate::{ShaderError, io, ir, resource, structure};
 pub use sampler::StaticSampler;
 pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
 
+/// Whether a DXGI adapter renders in software, from its description: the
+/// Basic Render Driver (WARP), which carries `DXGI_ADAPTER_FLAG_SOFTWARE`,
+/// and the primary adapter of a machine whose display driver is not
+/// working (every machine without a GPU, CI runners among them), which is
+/// the same renderer under the same name without the flag. DXGI's guide
+/// ("New info about enumerating adapters for Windows 8"): the Basic Render
+/// Driver has VendorId 0x1414 and DeviceID 0x8c; the primary adapter "might
+/// also be called 'Microsoft Basic Render Driver.' But this adapter has
+/// outputs and doesn't have the DXGI_ADAPTER_FLAG_SOFTWARE value set."
+pub fn renders_in_software(name: &str, flags: u32, vendor_id: u32, device_id: u32) -> bool {
+    const SOFTWARE: u32 = 2; // DXGI_ADAPTER_FLAG_SOFTWARE
+    const MICROSOFT: u32 = 0x1414;
+    const BASIC_RENDER_DRIVER: u32 = 0x8c;
+    flags & SOFTWARE != 0
+        || (vendor_id == MICROSOFT && device_id == BASIC_RENDER_DRIVER)
+        || name == "Microsoft Basic Render Driver"
+}
+
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 
@@ -426,6 +444,29 @@ mod tests {
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
+
+    /// The adapters a machine without a GPU enumerates (as a CI runner's
+    /// report shows them) all render in software; GPUs do not.
+    #[test]
+    fn basic_render_drivers_are_software_flag_or_not() {
+        let brd = "Microsoft Basic Render Driver";
+        let remotefx = "Microsoft RemoteFX Graphics Device";
+        // (name, flags, vendor, device, software)
+        let cases = [
+            (brd, 0, 0x1414, 0x8c, true), // the primary adapter
+            (brd, 2, 0x1414, 0x8c, true), // the render-only one
+            (brd, 0, 0, 0, true),         // by name alone
+            ("WARP", 2, 0, 0, true),      // by flag alone
+            ("", 0, 0x1414, 0x8c, true),  // by ids alone
+            ("AMD Radeon RX 6800", 0, 0x1002, 0x73bf, false),
+            // Microsoft's own virtual GPUs are other devices.
+            (remotefx, 0, 0x1414, 0x2c1, false),
+        ];
+        for (name, flags, vendor, device, software) in cases {
+            let got = super::renders_in_software(name, flags, vendor, device);
+            assert_eq!(got, software, "{name:?} {flags} {vendor:#x}:{device:#x}");
+        }
+    }
 
     #[test]
     fn the_loop_limit_switch_parses_or_falls_back() {

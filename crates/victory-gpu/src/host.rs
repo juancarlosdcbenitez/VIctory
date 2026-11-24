@@ -247,8 +247,9 @@ fn create() -> windows::core::Result<Host> {
 }
 
 /// The name of the adapter `device` was created on, and whether it renders
-/// in software (`DXGI_ADAPTER_FLAG_SOFTWARE`, as WARP and the Basic Render
-/// Driver do).
+/// in software: WARP and the Basic Render Driver, which is also the primary
+/// adapter, without the software flag, where no display driver works
+/// ([`victory_shader::emit::renders_in_software`]).
 fn adapter_of(device: &ID3D12Device) -> (String, bool) {
     // SAFETY: plain DXGI queries into structures of ours.
     let desc = unsafe {
@@ -261,7 +262,9 @@ fn adapter_of(device: &ID3D12Device) -> (String, bool) {
         Ok(d) => {
             let len = d.Description.iter().position(|&c| c == 0).unwrap_or(128);
             let name = String::from_utf16_lossy(&d.Description[..len]);
-            (name, d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0)
+            let software =
+                victory_shader::emit::renders_in_software(&name, d.Flags, d.VendorId, d.DeviceId);
+            (name, software)
         }
         Err(e) => (format!("an adapter DXGI does not describe ({e})"), false),
     }
