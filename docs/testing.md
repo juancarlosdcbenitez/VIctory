@@ -19,10 +19,12 @@ The evaluator makes the choices DXIL leaves to drivers one way (FMax/FMin
 of two zeros give the first operand, FMad is unfused, float-to-integer
 conversions saturate) and refuses what LLVM leaves undefined (shifts by
 the bit width, division by zero, branches on undefined values), so a
-lowering that leans on either fails there. It runs one thread; another
-lane's value (quad and wave reads) is undefined. The first evaluator
-tests replay the cases `valu_tests` checks on hardware, so its choices are
-known to agree with real drivers on those.
+lowering that leans on either fails there. It runs one thread, or a whole
+wave in lockstep (`Env::lanes`). Wave operations are evaluated across the
+lanes with all of them active, and lanes that branch different ways are
+an error, since divergence is not modelled. The first evaluator tests
+replay the cases `valu_tests` checks on hardware, so its choices are known
+to agree with real drivers on those.
 
 ## Commands
 
@@ -74,3 +76,12 @@ code: root constants arrive in `s0..s3` and are copied to `v1..v4`;
 `eval_cases(body, inputs)` lowers and runs it per input set and panics
 with the reason if either step fails. Compare with a reference written
 from the ISA description, not with what the lowering does.
+
+For cross-lane code, `synth::wave_program` builds one wave (32 or 64
+lanes) whose lanes load their own `v1` and `v2` from two arrays and store
+their own `v4`. `eval_wave(body, lanes, wave64, a, b, constants)` runs
+it and returns each lane's result.
+
+Benchmarks (ignored tests, release builds): `merge_speed` (victory-gpu,
+the copy-back merge), `detile_speed` (victory-formats), `bcpack_throughput`
+(victory-formats), `bench_write` (victory-shader, the bitcode writer).
