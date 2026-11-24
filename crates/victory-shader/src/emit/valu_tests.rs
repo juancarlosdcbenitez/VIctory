@@ -150,7 +150,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         root_srvs: lowered.root_srvs,
     };
 
-    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+    if let Some(mut v) = validator::Validator::for_tests() {
         let mut copy = shader.dxil.clone();
         let ours = copy[4..20].to_vec();
         v.validate(&mut copy).expect("DXIL validation failed");

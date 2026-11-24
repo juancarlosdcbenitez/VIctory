@@ -116,7 +116,32 @@ pub struct Validator {
 // thread affinity); calls are serialised by `&mut self`.
 unsafe impl Send for Validator {}
 
+/// Whether tests that validate must fail where the validator does not load,
+/// instead of skipping validation (`VICTORY_DXIL_REQUIRED=1`, which Windows
+/// validation CI sets once it has found the SDK's `dxil.dll`).
+pub fn required() -> bool {
+    std::env::var("VICTORY_DXIL_REQUIRED").is_ok_and(|v| v == "1")
+}
+
 impl Validator {
+    /// The validator for a test: `None` where `dxil.dll` does not load (the
+    /// test then goes without validation, and says so), unless [`required`],
+    /// when that fails the test.
+    #[cfg(test)]
+    pub(crate) fn for_tests() -> Option<Self> {
+        let path = Self::default_path();
+        match Self::load(path.as_deref()) {
+            Ok(v) => Some(v),
+            Err(e) if required() => {
+                panic!("VICTORY_DXIL_REQUIRED=1, but the validator ({path:?}) does not load: {e}")
+            }
+            Err(e) => {
+                eprintln!("no DXIL validation: {e}");
+                None
+            }
+        }
+    }
+
     /// Where `dxil.dll` is looked for.
     pub fn default_path() -> Option<PathBuf> {
         if let Some(p) = std::env::var_os("VICTORY_DXIL") {

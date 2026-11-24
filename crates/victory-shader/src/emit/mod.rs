@@ -481,9 +481,7 @@ mod tests {
         let out = emit(&c, &native, &p, &st, &io, &res).unwrap();
         // dxil.dll, where there is one, checks the flags against the module.
         #[cfg(windows)]
-        if let Ok(mut v) = super::validator::Validator::load(
-            super::validator::Validator::default_path().as_deref(),
-        ) {
+        if let Some(mut v) = super::validator::Validator::for_tests() {
             v.validate(&mut out.dxil.clone()).unwrap();
         }
         let host = Container::parse(&out.dxil).unwrap();
@@ -561,14 +559,17 @@ mod tests {
     #[cfg(windows)]
     fn stub_pipeline_is_created() {
         // Pipeline creation is checked on WARP where no GPU is present.
-        let host = match super::host::Host::new(false).or_else(|_| super::host::Host::new(true)) {
+        let host = match super::host::Host::any() {
             Ok(host) => host,
             Err(e) => {
                 eprintln!("no SM 6.6 device; skipped: {e}");
                 return;
             }
         };
-        eprintln!("pipelines on {} (software: {})", host.adapter.0, host.adapter.1);
+        eprintln!(
+            "pipelines on {} (software: {})",
+            host.adapter.0, host.adapter.1
+        );
         let ps = super::HostShader {
             stage: crate::HwStage::Ps,
             dxil: constant_color(),
@@ -592,9 +593,7 @@ mod tests {
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
         let vs = file("VICTORY_REF_VS", crate::HwStage::Vs)
             .unwrap_or_else(|| super::host::stub_vs(&ps).unwrap());
-        if let Ok(mut v) = super::validator::Validator::load(
-            super::validator::Validator::default_path().as_deref(),
-        ) {
+        if let Some(mut v) = super::validator::Validator::for_tests() {
             v.validate(&mut vs.dxil.clone()).unwrap();
         }
         host.pipeline(&vs, &ps).unwrap();
@@ -617,9 +616,7 @@ mod tests {
     #[cfg(windows)]
     fn constant_color_validates() {
         let mut c = constant_color();
-        let path = super::validator::Validator::default_path();
-        let Ok(mut v) = super::validator::Validator::load(path.as_deref()) else {
-            eprintln!("no dxil.dll; skipped");
+        let Some(mut v) = super::validator::Validator::for_tests() else {
             return;
         };
         let ours = c[4..20].to_vec();
@@ -689,9 +686,7 @@ mod tests {
             let out = super::emit(&c, &native, &p, &st, &io, &res).unwrap();
             // dxil.dll, where there is one, checks PSV0 against the module.
             #[cfg(windows)]
-            if let Ok(mut v) = super::validator::Validator::load(
-                super::validator::Validator::default_path().as_deref(),
-            ) {
+            if let Some(mut v) = super::validator::Validator::for_tests() {
                 v.validate(&mut out.dxil.clone()).unwrap();
             }
             let host = super::Container::parse(&out.dxil).unwrap();

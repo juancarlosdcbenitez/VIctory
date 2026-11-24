@@ -170,7 +170,10 @@ pub fn run(
         );
     }
     if pipelines {
-        Host::new(false).map_err(anyhow::Error::msg)?;
+        let host = Host::any().map_err(anyhow::Error::msg)?;
+        let (name, software) = &host.adapter;
+        let kind = if *software { "software" } else { "hardware" };
+        println!("pipelines    {name} ({kind})");
     }
     let pairs: Vec<(String, String)> = std::env::var("VICTORY_PAIRS")
         .unwrap_or_default()
@@ -209,7 +212,7 @@ pub fn run(
                                 .then(|| Validator::load(dll.as_deref()).ok())
                                 .flatten(),
                             host: pipelines
-                                .then(|| Host::new(false).ok().map(|h| (h, host::stub_ps())))
+                                .then(|| Host::any().ok().map(|h| (h, host::stub_ps())))
                                 .flatten(),
                         };
                         while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
@@ -271,7 +274,7 @@ pub fn run(
         t.ms_emitted, t.ms_programs, t.ms_validated, t.ms_pipelines
     );
     if !pairs.is_empty() {
-        let host = Host::new(false).map_err(anyhow::Error::msg)?;
+        let host = Host::any().map_err(anyhow::Error::msg)?;
         let kept = lock(&kept);
         let find = |name: &str| kept.iter().find(|(l, _)| l.contains(name));
         for (v, p) in &pairs {

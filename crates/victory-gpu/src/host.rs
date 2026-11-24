@@ -53,6 +53,8 @@ pub(crate) struct Host {
     messages: Option<ID3D12InfoQueue>,
     next_rtv: AtomicU32,
     presenter: Mutex<Option<Presenter>>,
+    /// The adapter the device is on, and whether it renders in software.
+    pub(crate) adapter: (String, bool),
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -92,12 +94,17 @@ pub fn on_failure(report: fn(&str) -> !) {
     let _ = ON_FAILURE.set(report);
 }
 
-/// Ends the run on a host GPU failure: what failed, the removal reason and
-/// the debug layer's first error, if any (`VICTORY_D3D12_DEBUG=1` in a
-/// diagnostics build names the command).
+/// Ends the run on a host GPU failure: what failed, on which adapter, the
+/// removal reason and the debug layer's first error, if any
+/// (`VICTORY_D3D12_DEBUG=1` in a diagnostics build names the command).
 pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
     let mut text = what.to_string();
     if let Some(host) = host() {
+        let (adapter, software) = &host.adapter;
+        text.push_str(&format!("; on {adapter}"));
+        if *software {
+            text.push_str(" (software)");
+        }
         // SAFETY: a plain query.
         if let Err(e) = unsafe { host.device.GetDeviceRemovedReason() } {
             text.push_str(&format!("; device removed: {e}"));
@@ -176,7 +183,9 @@ fn create() -> windows::core::Result<Host> {
         // Diagnostics: the software adapter, on which a shader's wild access
         // is an access violation in this process (a crash report with the
         // address and instruction) instead of a GPU fault and driver reset.
-        if cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_WARP").is_some() {
+        let on_warp =
+            cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_WARP").is_some();
+        if on_warp {
             let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
@@ -207,7 +216,17 @@ fn create() -> windows::core::Result<Host> {
                 ..Default::default()
             })?;
         let dsv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
-        tracing::info!("host D3D12 device ready");
+        let adapter = adapter_of(&device);
+        tracing::info!(adapter = %adapter.0, software = adapter.1, "host D3D12 device ready");
+        if adapter.1 && !on_warp {
+            // The system's default adapter renders in software when no GPU
+            // driver is working (the Basic Render Driver): every frame is
+            // drawn on the CPU, orders of magnitude slower.
+            tracing::warn!(
+                adapter = %adapter.0,
+                "the host device renders in software: is the GPU driver installed and working?"
+            );
+        }
         Ok(Host {
             device,
             queue,
@@ -222,7 +241,29 @@ fn create() -> windows::core::Result<Host> {
             messages,
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
+            adapter,
         })
+    }
+}
+
+/// The name of the adapter `device` was created on, and whether it renders
+/// in software (`DXGI_ADAPTER_FLAG_SOFTWARE`, as WARP and the Basic Render
+/// Driver do).
+fn adapter_of(device: &ID3D12Device) -> (String, bool) {
+    // SAFETY: plain DXGI queries into structures of ours.
+    let desc = unsafe {
+        let luid = device.GetAdapterLuid();
+        CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+            .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(luid))
+            .and_then(|a| a.GetDesc1())
+    };
+    match desc {
+        Ok(d) => {
+            let len = d.Description.iter().position(|&c| c == 0).unwrap_or(128);
+            let name = String::from_utf16_lossy(&d.Description[..len]);
+            (name, d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0)
+        }
+        Err(e) => (format!("an adapter DXGI does not describe ({e})"), false),
     }
 }
 
@@ -275,6 +316,22 @@ mod tests {
             warp_adapter().is_ok(),
             desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
         );
+    }
+
+    /// The adapter the GPU layer's device is on, for the log: on machines
+    /// without a GPU (CI runners) the default adapter is the Basic Render
+    /// Driver, which renders in software, and the tests that reach the
+    /// device run there.
+    #[test]
+    fn the_host_device_names_its_adapter() {
+        let Some(host) = host() else {
+            eprintln!("no host D3D12 device");
+            return;
+        };
+        let (name, software) = &host.adapter;
+        let kind = if *software { "software" } else { "hardware" };
+        eprintln!("GPU layer device: {name} ({kind})");
+        assert!(!name.is_empty());
     }
 }
 

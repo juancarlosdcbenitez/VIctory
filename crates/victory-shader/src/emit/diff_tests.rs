@@ -796,9 +796,7 @@ fn translated_shaders_draw_as_pc_ones() {
             .unwrap();
             std::fs::write(format!("{out}/{stem}.ps.dxil"), &ps_c.dxil).unwrap();
         }
-        if let Ok(mut v) = super::validator::Validator::load(
-            super::validator::Validator::default_path().as_deref(),
-        ) {
+        if let Some(mut v) = super::validator::Validator::for_tests() {
             for s in [&vs_c, &ps_c] {
                 v.validate(&mut s.dxil.clone())
                     .unwrap_or_else(|e| panic!("{name}: {e}"));
@@ -910,9 +908,7 @@ fn translated_mesh_shaders_draw_as_pc_ones() {
             std::fs::write(format!("{out}/{stem}.ms.cdxil"), &console_ms).unwrap();
             std::fs::write(format!("{out}/{stem}.ms.dxil"), &ms_c.dxil).unwrap();
         }
-        if let Ok(mut v) = super::validator::Validator::load(
-            super::validator::Validator::default_path().as_deref(),
-        ) {
+        if let Some(mut v) = super::validator::Validator::for_tests() {
             v.validate(&mut ms_c.dxil.clone())
                 .unwrap_or_else(|e| panic!("{name}: {e}"));
         }
@@ -1196,9 +1192,7 @@ fn translated_compute_matches_pc() {
             let stem = name.replace([' ', ','], "_");
             std::fs::write(format!("{out}/{stem}.cs.dxil"), &cs_c.dxil).unwrap();
         }
-        if let Ok(mut v) = super::validator::Validator::load(
-            super::validator::Validator::default_path().as_deref(),
-        ) {
+        if let Some(mut v) = super::validator::Validator::for_tests() {
             v.validate(&mut cs_c.dxil.clone())
                 .unwrap_or_else(|e| panic!("{name}: {e}"));
         }

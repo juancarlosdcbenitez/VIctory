@@ -199,11 +199,7 @@ fn validate(container: &[u8], body: &[u32]) {
     use super::validator::Validator;
     use std::sync::{Mutex, OnceLock};
     static VALIDATOR: OnceLock<Option<Mutex<Validator>>> = OnceLock::new();
-    let v = VALIDATOR.get_or_init(|| {
-        Validator::load(Validator::default_path().as_deref())
-            .ok()
-            .map(Mutex::new)
-    });
+    let v = VALIDATOR.get_or_init(|| Validator::for_tests().map(Mutex::new));
     if let Some(v) = v {
         let mut v = v.lock().unwrap_or_else(|e| e.into_inner());
         if let Err(e) = v.validate(&mut container.to_vec()) {

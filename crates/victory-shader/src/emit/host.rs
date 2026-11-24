@@ -195,6 +195,14 @@ impl Host {
         ))
     }
 
+    /// The first hardware adapter at shader model 6.6, else WARP: for
+    /// checks that the runtime and a driver accept a pipeline, which a
+    /// software adapter answers too. [`Host::adapter`] says which it is.
+    pub fn any() -> Result<Self, String> {
+        Self::new(false)
+            .or_else(|hardware| Self::new(true).map_err(|warp| format!("{hardware}; WARP: {warp}")))
+    }
+
     /// A device on `adapter` if it reaches shader model 6.6.
     fn on(adapter: &IDXGIAdapter1) -> Result<Self, String> {
         let described = describe(adapter);
