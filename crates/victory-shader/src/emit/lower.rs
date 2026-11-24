@@ -43,6 +43,9 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// The module the container holds, for [`super::bitcode::eval`].
+    #[cfg(test)]
+    pub module: super::bitcode::Module,
 }
 
 pub(crate) struct Parts<'a> {
@@ -902,15 +905,23 @@ impl<'a> Lower<'a> {
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
+        #[cfg(test)]
+        let (nonuniform_handles, wave_ops) = (
+            self.s.nonuniform_handles,
+            self.s.flags & flags::WAVE_OPS != 0,
+        );
+        let (dxil, _module) = self.s.finish();
         Ok(Lowered {
             cmp_samplers,
             root_cbvs,
             root_srvs,
             #[cfg(test)]
-            nonuniform_handles: self.s.nonuniform_handles,
+            nonuniform_handles,
             #[cfg(test)]
-            wave_ops: self.s.flags & flags::WAVE_OPS != 0,
-            dxil: self.s.finish(),
+            wave_ops,
+            #[cfg(test)]
+            module: _module,
+            dxil,
             user_data,
             samplers: self.samplers,
         })

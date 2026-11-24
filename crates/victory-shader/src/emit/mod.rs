@@ -79,11 +79,15 @@ mod bitcode;
 mod container;
 #[cfg(all(test, windows))]
 mod diff_tests;
+#[cfg(test)]
+mod eval_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lower;
 mod sampler;
 mod shader;
+#[cfg(test)]
+mod synth;
 #[cfg(windows)]
 pub mod validator;
 #[cfg(all(test, windows))]
@@ -404,6 +408,8 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
 
 #[cfg(test)]
 mod tests {
+    // The constant-colour shader and the pipeline tests are Windows-only.
+    #[cfg(windows)]
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
@@ -419,6 +425,7 @@ mod tests {
         }
     }
     use super::container::SigElement;
+    #[cfg(windows)]
     use super::shader::Shader;
     use super::*;
     use crate::native::{ComputeIo, StageIo};
@@ -547,7 +554,7 @@ mod tests {
             s.op(b, "storeOutput.f32", Attr::NoUnwind, s.t.void, 5, &args);
         }
         s.m.terminate(b, super::bitcode::Term::Ret);
-        s.finish()
+        s.finish().0
     }
 
     #[test]

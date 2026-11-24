@@ -304,8 +304,9 @@ impl Shader {
         self.annotate(block, h, props.0, props.1)
     }
 
-    /// The finished container.
-    pub fn finish(mut self) -> Vec<u8> {
+    /// The finished container, and the module it holds (which tests run,
+    /// [`super::bitcode::eval`]).
+    pub fn finish(mut self) -> (Vec<u8>, Module) {
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
         let mut resources = None;
@@ -611,7 +612,8 @@ impl Shader {
             parts.push((b"PSG1", &psg1));
         }
         parts.extend([(b"PSV0", &psv0[..]), (b"HASH", &hash), (b"DXIL", &dxil)]);
-        container::build(&parts)
+        let container = container::build(&parts);
+        (container, self.m)
     }
 
     /// The user-data buffer's annotation carries its size, known only now.
