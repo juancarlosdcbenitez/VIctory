@@ -833,6 +833,44 @@ mod tests {
         }
     }
 
+    /// Detiling throughput per swizzle mode and element size, with the
+    /// contiguous runs a row splits into. `cargo test --release -p
+    /// victory-formats detile_speed -- --ignored --nocapture`
+    #[test]
+    #[ignore = "benchmark"]
+    fn detile_speed() {
+        for swizzle in [
+            Swizzle::SW_64KB_S,
+            Swizzle::SW_64KB_D,
+            Swizzle::SW_4KB_S,
+            Swizzle::SW_256B_S,
+        ] {
+            for bpe in [4u32, 8, 16] {
+                let side = 2048 / bpe.isqrt();
+                let layout = Layout::new(&desc(side, side, 1, bpe, swizzle)).unwrap();
+                let tiled: Vec<u8> = (0..layout.size).map(|i| i as u8).collect();
+                let pitch = (side * bpe) as usize;
+                let mut linear = vec![0u8; pitch * side as usize];
+                let (mut runs, size) = (0usize, linear.len());
+                layout
+                    .walk(tiled.len(), 0, 0, size, pitch, size, |_, _, _| runs += 1)
+                    .unwrap();
+                let rounds = 20;
+                let start = std::time::Instant::now();
+                for _ in 0..rounds {
+                    layout
+                        .detile(std::hint::black_box(&tiled), 0, 0, &mut linear, pitch, size)
+                        .unwrap();
+                }
+                let gbps = (rounds * linear.len()) as f64 / start.elapsed().as_secs_f64() / 1e9;
+                eprintln!(
+                    "{swizzle:?} {bpe}-byte elements {side}x{side}: {:.1} bytes per run, {gbps:.2} GB/s",
+                    linear.len() as f64 / runs as f64
+                );
+            }
+        }
+    }
+
     /// Sizes past the hardware's 16384 texels per side are refused instead
     /// of overflowing the size arithmetic (found by random-input testing).
     #[test]
