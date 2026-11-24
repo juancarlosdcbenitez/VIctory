@@ -20,9 +20,11 @@ on:
 permissions:
   contents: read
 
+# A run in progress finishes: a newer push waits, and replaces any run
+# already waiting, so incremental pushes still get complete results.
 concurrency:
   group: windows-validation-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: never
