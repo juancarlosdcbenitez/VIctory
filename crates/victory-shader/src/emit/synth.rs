@@ -291,6 +291,11 @@ pub(super) const WAVE_OUT: u16 = 512;
 /// and stores `v4` into its dword of the result array. `v0` is the thread
 /// id, `v9` the lane's byte offset; `s[8:11]` hold the buffer descriptor.
 pub(super) fn wave_program(body: &[u32], lanes: u32, wave64: bool) -> NativeProgram {
+    wave_program_lds(body, lanes, wave64, 0)
+}
+
+/// [`wave_program`] with `lds` units of 512 bytes of group-shared memory.
+pub(super) fn wave_program_lds(body: &[u32], lanes: u32, wave64: bool, lds: u32) -> NativeProgram {
     let mut p = valu_program(&[]);
     let mut words = vec![s_mov_b32(5, 0x80)];
     words.extend_from_slice(&s_load_dwordx4(8, 4));
@@ -304,7 +309,7 @@ pub(super) fn wave_program(body: &[u32], lanes: u32, wave64: bool) -> NativeProg
     p.wave64 = wave64;
     p.vgprs = 16;
     p.io = StageIo::Cs(ComputeIo {
-        rsrc2: 5 << 1,
+        rsrc2: lds << 15 | 5 << 1,
         threads: [lanes, 1, 1],
     });
     p
@@ -343,8 +348,19 @@ pub(super) fn eval_wave(
     b: &[u32],
     k: [u32; 4],
 ) -> Result<Vec<u32>, String> {
-    let native = wave_program(body, lanes, wave64);
-    let l = lower_native(&native).map_err(|e| format!("does not lower: {e}"))?;
+    eval_native(&wave_program(body, lanes, wave64), lanes, a, b, k)
+}
+
+/// Runs a lowered [`wave_program`] (or [`wave_program_lds`]) as in
+/// [`eval_wave`].
+pub(super) fn eval_native(
+    native: &NativeProgram,
+    lanes: u32,
+    a: &[u32],
+    b: &[u32],
+    k: [u32; 4],
+) -> Result<Vec<u32>, String> {
+    let l = lower_native(native).map_err(|e| format!("does not lower: {e}"))?;
     let n = lanes as usize;
     let mut bytes = vec![0u8; 3 * 256];
     for (i, (&x, &y)) in a.iter().zip(b).take(n).enumerate() {

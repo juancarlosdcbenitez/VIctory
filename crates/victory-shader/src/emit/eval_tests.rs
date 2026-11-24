@@ -2305,3 +2305,156 @@ fn ds_bpermute_reads_the_addressed_lanes() {
         }
     }
 }
+
+#[test]
+fn packed_half_floats_round_each_half_as_the_isa() {
+    let halves = [
+        0x0000u16, 0x8000, 0x3C00, 0xBC00, 0x3555, 0x4248, 0x7BFF, 0x0001, 0x7C00, 0xFC00, 0x7E00,
+        0x1400,
+    ];
+    let mut cases = Vec::new();
+    for (i, &a) in halves.iter().enumerate() {
+        for (j, &b) in halves.iter().enumerate() {
+            let c = halves[(i + 2 * j) % halves.len()];
+            let pack = |lo: u16, hi: u16| u32::from(lo) | u32::from(hi) << 16;
+            cases.push([pack(a, b), pack(b, c), pack(c, a), 0]);
+        }
+    }
+    let h = |x: u32| f16_to_f32(x as u16);
+    let to_h = |x: f32| u32::from(super::bitcode::eval::f32_to_f16(x));
+    type PkF = (&'static str, fn(f32, f32, f32) -> f32);
+    let ops: &[PkF] = &[
+        ("v_pk_add_f16", |a, b, _| a + b),
+        ("v_pk_mul_f16", |a, b, _| a * b),
+        // Products of halves are exact in f32: one rounding to f16.
+        ("v_pk_fma_f16", |a, b, c| {
+            (f64::from(a) * f64::from(b) + f64::from(c)) as f32
+        }),
+    ];
+    // op_sel_hi as encoded by default (each source's high half for the high
+    // result), then with op_sel swapping which half each result reads.
+    for &(name, op) in ops {
+        let code = crate::gfx10::opcode(crate::gfx10::Encoding::Vop3p, name)
+            .unwrap_or_else(|| panic!("{name}")) as u8;
+        for (opsel, opsel_hi) in [(0u32, 7u32), (7, 0), (1, 7), (5, 2)] {
+            let [mut w0, mut w1] = vop3p(code, 0, vgpr(1), vgpr(2), vgpr(3));
+            // op_sel bits 11-13; op_sel_hi bit 14 (source 2) and word1 bits 27-28.
+            w0 = (w0 & !(0xF << 11)) | opsel << 11 | (opsel_hi >> 2 & 1) << 14;
+            w1 = (w1 & !(3 << 27)) | (opsel_hi & 3) << 27;
+            let got = eval_cases(&[w0, w1], &cases);
+            for (c, g) in cases.iter().zip(got) {
+                let half = |k: usize, high: bool| if high { c[k] >> 16 } else { c[k] & 0xFFFF };
+                let result = |sel: u32| {
+                    let x: Vec<f32> = (0..3).map(|k| h(half(k, sel >> k & 1 != 0))).collect();
+                    op(x[0], x[1], x[2])
+                };
+                for (part, sel) in [(0, opsel), (1, opsel_hi)] {
+                    let want = result(sel);
+                    let got = (g[0] >> (16 * part)) & 0xFFFF;
+                    if want.is_nan() {
+                        assert!(
+                            h(got).is_nan(),
+                            "{name} op_sel {opsel:03b}/{opsel_hi:03b}{c:08x?}"
+                        );
+                    } else {
+                        assert_eq!(
+                            got,
+                            to_h(want),
+                            "{name} op_sel {opsel:03b}/{opsel_hi:03b}{c:08x?} half {part}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// DS `op vdst, v[addr], v[data0], v[data1] offset0 offset1`.
+fn ds2(op: u8, vdst: u8, addr: u8, data0: u8, data1: u8, offset0: u8, offset1: u8) -> [u32; 2] {
+    [
+        0x36 << 26 | u32::from(op) << 18 | u32::from(offset1) << 8 | u32::from(offset0),
+        u32::from(addr) | u32::from(data0) << 8 | u32::from(data1) << 16 | u32::from(vdst) << 24,
+    ]
+}
+
+/// `body` as one wave with 2 KiB of group-shared memory: each lane's `v4`.
+fn run_lds(body: &[u32], wave64: bool, a: &[u32], b: &[u32], k: [u32; 4]) -> Vec<u32> {
+    let lanes = if wave64 { 64 } else { 32 };
+    let native = super::synth::wave_program_lds(body, lanes, wave64, 4);
+    super::synth::eval_native(&native, lanes, a, b, k)
+        .unwrap_or_else(|e| panic!("{body:08x?}: {e}"))
+}
+
+const S_BARRIER: u32 = 0xBF8A_0000;
+
+#[test]
+fn group_shared_memory_moves_data_between_lanes() {
+    let (a, b) = (lane_inputs(14), lane_inputs(15));
+    for wave64 in [false, true] {
+        let n = if wave64 { 64 } else { 32 };
+        // ds_write_b32 v9, v1 offset:16; s_barrier; v10 = ((lane + 1) % n) * 4;
+        // ds_read_b32 v4, v10 offset:16: the next lane's a.
+        let mut body = ds(0x0D, 0, 9, 1, 16).to_vec();
+        body.push(S_BARRIER);
+        body.push(vop2(0x25, 10, 0x84, 9)); // v_add_nc_u32 v10, 4, v9
+        body.extend([vop2(0x1B, 10, LITERAL, 10), 4 * n - 1]); // v_and_b32
+        body.extend(ds(0x36, 4, 10, 0, 16));
+        let got = run_lds(&body, wave64, &a, &b, [0; 4]);
+        for (l, g) in got.iter().enumerate() {
+            assert_eq!(
+                *g,
+                a[(l + 1) % n as usize],
+                "neighbour, wave64 {wave64}, lane {l}"
+            );
+        }
+        // write2: a at the lane's dword, b 64 dwords on; read2 back with the
+        // offsets swapped (v4 the second): b. Then the st64 forms (offsets
+        // in 64-dword units).
+        for (write, read, far) in [(0x0Eu8, 0x37u8, 64u8), (0x0F, 0x38, 1)] {
+            let mut body = ds2(write, 0, 9, 1, 2, 0, far).to_vec();
+            body.push(S_BARRIER);
+            body.extend(ds2(read, 4, 9, 0, 0, far, 0));
+            let got = run_lds(&body, wave64, &a, &b, [0; 4]);
+            assert_eq!(
+                got,
+                b[..n as usize].to_vec(),
+                "read2/write2 {write:#x}, wave64 {wave64}"
+            );
+        }
+    }
+}
+
+#[test]
+fn group_shared_atomics_combine_every_lane() {
+    let (a, b) = (lane_inputs(16), lane_inputs(17));
+    type Lds = (&'static str, u8, u32, fn(u32, u32) -> u32);
+    let ops: &[Lds] = &[
+        ("ds_add_u32", 0x00, 0x1234, u32::wrapping_add),
+        ("ds_max_u32", 0x08, 0, u32::max),
+        ("ds_min_i32", 0x05, 0x7FFF_FFFF, |x, y| {
+            (x as i32).min(y as i32) as u32
+        }),
+        ("ds_and_b32", 0x09, u32::MAX, |x, y| x & y),
+        ("ds_or_b32", 0x0A, 0, |x, y| x | y),
+        ("ds_xor_b32", 0x0B, 0x5555_AAAA, |x, y| x ^ y),
+    ];
+    for wave64 in [false, true] {
+        let n = if wave64 { 64 } else { 32 };
+        for &(name, op, init, combine) in ops {
+            // v11 = 0, v12 = s0 (the initial value); every lane writes it to
+            // dword 0, then applies the atomic with its a; then reads dword 0.
+            let mut body = vec![vop1(0x001, 11, 128), vop1(0x001, 12, sgpr(0))];
+            body.extend(ds(0x0D, 0, 11, 12, 0));
+            body.push(S_BARRIER);
+            body.extend(ds(op, 0, 11, 1, 0));
+            body.push(S_BARRIER);
+            body.extend(ds(0x36, 4, 11, 0, 0));
+            let got = run_lds(&body, wave64, &a, &b, [init, 0, 0, 0]);
+            let want = a[..n].iter().fold(init, |acc, &x| combine(acc, x));
+            assert!(
+                got.iter().all(|&g| g == want),
+                "{name}, wave64 {wave64}: {got:x?}, want {want:#x}"
+            );
+        }
+    }
+}
