@@ -946,3 +946,126 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+/// 64-bit image atomics (SH-1's lowering, behind its test switch) on an
+/// R32G32_UINT texture UAV, the format D3D12 gives them, on each SM 6.6
+/// device that supports them (WARP on CI): the texel each one changes and
+/// the old value it returns match the evaluator's, which the evaluator
+/// tests check against the ISA. Devices without the capability bits are
+/// skipped, and say so.
+#[test]
+fn wide_image_atomics_on_the_host() {
+    use super::synth::{eval_image, image_program, lower_native, mimg};
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let op = |name: &str| {
+        crate::gfx10::opcode(crate::gfx10::Encoding::Mimg, name).unwrap_or_else(|| panic!("{name}"))
+    };
+    // (op, x, y, value, compare): the texture starts zeroed.
+    let cases: [(&str, u32, u32, u64, u64); 6] = [
+        ("image_atomic_umax", 2, 3, 0xFEDC_BA98_7654_3210, 0),
+        ("image_atomic_add", 1, 0, 0x1_0000_0001, 0),
+        ("image_atomic_xor", 3, 3, 0x8000_0000_0000_0000, 0),
+        ("image_atomic_smin", 0, 2, 0x8000_0000_0000_0005, 0),
+        ("image_atomic_cmpswap", 2, 1, 0x1234_5678_9ABC_DEF0, 0),
+        ("image_atomic_cmpswap", 0, 0, 0x1234_5678_9ABC_DEF0, 1),
+    ];
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let host = match Host::new(warp) {
+            Ok(host) => host,
+            Err(e) => {
+                eprintln!("{label}: skipped: {e}");
+                continue;
+            }
+        };
+        let kind = if host.adapter.1 {
+            "software"
+        } else {
+            "hardware"
+        };
+        if !host.typed_atomics_64() {
+            eprintln!(
+                "{label}: skipped: {} ({kind}) has no 64-bit typed atomics",
+                host.adapter.0
+            );
+            continue;
+        }
+        eprintln!("{label}: on {} ({kind})", host.adapter.0);
+        for &(name, x, y, value, compare) in &cases {
+            let cmpswap = name.ends_with("cmpswap");
+            let mut body = vec![
+                vop1(0x001, 5, 128 + x as u16),
+                vop1(0x001, 6, 128 + y as u16),
+            ];
+            body.extend(mimg(
+                op(name),
+                1,
+                5,
+                12,
+                if cmpswap { 0xF } else { 0x3 },
+                1,
+                true,
+            ));
+            body.push(vop1(0x001, 0, 256 + 1));
+            body.push(vop1(0x001, 5, 256 + 2));
+            super::TEST_IMAGE_ATOMICS_64.set(true);
+            let lowered = lower_native(&image_program(&body));
+            super::TEST_IMAGE_ATOMICS_64.set(false);
+            let l = lowered.unwrap_or_else(|e| panic!("{name}: does not lower: {e}"));
+            let k = [
+                value as u32,
+                (value >> 32) as u32,
+                compare as u32,
+                (compare >> 32) as u32,
+            ];
+            let (want_out, want_texels) = eval_image(&l, k, [4, 4, 1], vec![0; 16 * 8])
+                .unwrap_or_else(|e| panic!("{name}: evaluator: {e}"));
+            let shader = HostShader {
+                stage: HwStage::Cs,
+                dxil: l.dxil.clone(),
+                user_data: l.user_data.clone(),
+                samplers: l.samplers.clone(),
+                static_samplers: Vec::new(),
+                root_cbvs: l.root_cbvs.clone(),
+                root_srvs: l.root_srvs.clone(),
+            };
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                ud[u.index as usize] = match (u.root, u.slot) {
+                    (RootType::Constants, 0) => k[u.dword as usize],
+                    (RootType::Table, 1) => 0,
+                    other => panic!("unexpected user data {other:?}"),
+                };
+            }
+            let (root, pso) = host
+                .compute_pipeline(&shader)
+                .unwrap_or_else(|e| panic!("{label} {name}: compute_pipeline failed: {e}"));
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[View::RawUav(4), View::Uint2TextureUav(4, 4)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label} {name}: dispatch failed: {e}"));
+            let texels: Vec<u8> = out[1].iter().flat_map(|w| w.to_le_bytes()).collect();
+            assert_eq!(
+                texels, want_texels,
+                "{label} {name} at ({x}, {y}): the texture"
+            );
+            assert_eq!(
+                out[0][..2],
+                want_out[..2],
+                "{label} {name}: the returned value"
+            );
+        }
+        ran += 1;
+    }
+    if ran == 0 {
+        eprintln!("no SM 6.6 device with 64-bit typed atomics; nothing ran");
+    }
+}

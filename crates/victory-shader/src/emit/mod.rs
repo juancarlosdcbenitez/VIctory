@@ -121,6 +121,26 @@ pub fn renders_in_software(name: &str, flags: u32, vendor_id: u32, device_id: u3
         || name == "Microsoft Basic Render Driver"
 }
 
+/// Whether 64-bit image atomics (dmask 0x3; cmpswap 0xF) are translated.
+/// Not in a run yet: the GPU layer must first refuse their pipelines on
+/// devices without 64-bit atomics on typed heap resources, and check that
+/// their views are R32G32_UINT, the format D3D12 gives them (SH-1). Only
+/// tests turn them on.
+pub(crate) fn image_atomics_64() -> bool {
+    #[cfg(test)]
+    if TEST_IMAGE_ATOMICS_64.get() {
+        return true;
+    }
+    false
+}
+
+// 64-bit image atomics for lowerings on this thread, for tests.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TEST_IMAGE_ATOMICS_64: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 

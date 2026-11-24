@@ -211,6 +211,19 @@ impl Host {
         ))
     }
 
+    /// Whether the device runs 64-bit atomics on typed resources from the
+    /// descriptor heap (OPTIONS9 AtomicInt64OnTypedResourceSupported and
+    /// OPTIONS11 AtomicInt64OnDescriptorHeapResourceSupported), as
+    /// translated 64-bit image atomics need.
+    pub fn typed_atomics_64(&self) -> bool {
+        let o9: Option<D3D12_FEATURE_DATA_D3D12_OPTIONS9> =
+            feature(&self.device, D3D12_FEATURE_D3D12_OPTIONS9);
+        let o11: Option<D3D12_FEATURE_DATA_D3D12_OPTIONS11> =
+            feature(&self.device, D3D12_FEATURE_D3D12_OPTIONS11);
+        o9.is_some_and(|o| o.AtomicInt64OnTypedResourceSupported.as_bool())
+            && o11.is_some_and(|o| o.AtomicInt64OnDescriptorHeapResourceSupported.as_bool())
+    }
+
     /// The first hardware adapter at shader model 6.6, else WARP: for
     /// checks that the runtime and a driver accept a pipeline, which a
     /// software adapter answers too. [`Host::adapter`] says which it is.
@@ -1058,6 +1071,11 @@ pub enum View<'a> {
     TextureUav(u32, u32),
     /// An R32_UINT texture UAV (width, height), zeroed (atomics).
     UintTextureUav(u32, u32),
+    /// An R32G32_UINT texture UAV (width, height), zeroed: the format SM
+    /// 6.6's 64-bit typed atomics take ("Typed resources used in 64-bit
+    /// integer operations must be declared with HLSL type int64_t or
+    /// uint64_t and have format R32G32_UINT").
+    Uint2TextureUav(u32, u32),
     /// A typed RGBA16F buffer UAV of this many elements, zeroed.
     HalfUav(u32),
     /// A constant buffer of these dwords.
@@ -1167,10 +1185,10 @@ impl Host {
                         PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
                             Offset: 0,
                             Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
-                                Format: if words == 1 {
-                                    DXGI_FORMAT_R32_UINT
-                                } else {
-                                    DXGI_FORMAT_R32G32B32A32_FLOAT
+                                Format: match words {
+                                    1 => DXGI_FORMAT_R32_UINT,
+                                    2 => DXGI_FORMAT_R32G32_UINT,
+                                    _ => DXGI_FORMAT_R32G32B32A32_FLOAT,
                                 },
                                 Width: w,
                                 Height: h,
@@ -1365,6 +1383,26 @@ impl Host {
                             D3D12_RESOURCE_STATE_COPY_DEST,
                         )?;
                         uavs.push((t, Some((w, h)), 1, rb));
+                    }
+                    View::Uint2TextureUav(w, h) => {
+                        let t = make(
+                            D3D12_HEAP_TYPE_DEFAULT,
+                            &texture_as(
+                                w,
+                                h,
+                                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                DXGI_FORMAT_R32G32_UINT,
+                            ),
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        )?;
+                        dev.CreateUnorderedAccessView(&t, None, None, at);
+                        let pitch = (w * 8).next_multiple_of(256);
+                        let rb = make(
+                            D3D12_HEAP_TYPE_READBACK,
+                            &buffer(u64::from(pitch * h), D3D12_RESOURCE_FLAG_NONE),
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                        )?;
+                        uavs.push((t, Some((w, h)), 2, rb));
                     }
                     View::Cbv(data) => {
                         let b = upload(data)?;

@@ -2687,3 +2687,104 @@ fn image_atomics_on_a_typed_texture() {
         }
     }
 }
+
+/// 64-bit image atomics (dmask 0x3; cmpswap 0xF) on a 4x4 R64 texture UAV,
+/// translated only with the test switch: the data VGPRs hold the value's
+/// low then high dword (cmpswap: new, then compare), and with glc the old
+/// value comes back in the first two. Root constants: the value (or new)
+/// in s[0:1], cmpswap's compare in s[2:3]; the coordinates are constants.
+#[test]
+fn wide_image_atomics_on_a_typed_texture() {
+    let texels: Vec<u64> = (0..16u64)
+        .map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+        .collect();
+    let bytes = |t: &[u64]| -> Vec<u8> { t.iter().flat_map(|t| t.to_le_bytes()).collect() };
+    for &(name, reference) in IMAGE_ATOMICS {
+        let cmpswap = name.ends_with("cmpswap");
+        let dmask = if cmpswap { 0xF } else { 0x3 };
+        for (x, y) in [(2u32, 3u32), (0, 0), (3, 1)] {
+            let i = (y * 4 + x) as usize;
+            // v[5:6] = (x, y); the atomic on v[1:2] (cmpswap v[1:4]); the
+            // returned value from v[1:2] into v0 and v5.
+            let mut body = vec![
+                vop1(0x001, 5, 128 + x as u16),
+                vop1(0x001, 6, 128 + y as u16),
+            ];
+            body.extend(super::synth::mimg(mimg_op(name), 1, 5, 12, dmask, 1, true));
+            body.push(vop1(0x001, 0, vgpr(1)));
+            body.push(vop1(0x001, 5, vgpr(2)));
+            super::TEST_IMAGE_ATOMICS_64.set(true);
+            let lowered = super::synth::lower_native(&super::synth::image_program(&body));
+            super::TEST_IMAGE_ATOMICS_64.set(false);
+            let l = lowered.unwrap_or_else(|e| panic!("{name}: does not lower: {e}"));
+            for value in [5u64, 0x8000_0000_0000_0001, u64::MAX, 0x1_0000_0000] {
+                for cmp in [texels[i], texels[i] ^ 1 << 40] {
+                    let k = [
+                        value as u32,
+                        (value >> 32) as u32,
+                        cmp as u32,
+                        (cmp >> 32) as u32,
+                    ];
+                    let (out, after) = super::synth::eval_image(&l, k, [4, 4, 1], bytes(&texels))
+                        .unwrap_or_else(|e| panic!("{name}: does not run: {e}"));
+                    let old = texels[i];
+                    let mut want = texels.clone();
+                    want[i] = reference(old, value, cmp, 64);
+                    assert_eq!(
+                        after,
+                        bytes(&want),
+                        "{name} at ({x}, {y}) with {value:#x}, compare {cmp:#x}"
+                    );
+                    let back = u64::from(out[1]) << 32 | u64::from(out[0]);
+                    assert_eq!(back, old, "{name}: returned");
+                }
+            }
+        }
+    }
+}
+
+/// A 64-bit image atomic declares what it needs (DXC's rules): 64-bit
+/// integer operations, 64-bit atomics on a typed resource and on a
+/// descriptor-heap resource, in the shader flags and SFI0. Without the
+/// test switch it is refused, as before.
+#[test]
+fn wide_image_atomics_declare_their_features() {
+    let mut body =
+        super::synth::mimg(mimg_op("image_atomic_umax"), 1, 5, 12, 0x3, 1, true).to_vec();
+    body.push(vop1(0x001, 0, vgpr(1)));
+    let native = super::synth::image_program(&body);
+    let refused = super::synth::lower_native(&native).map(|_| ()).unwrap_err();
+    assert!(
+        refused.to_string().contains("a 64-bit image atomic"),
+        "{refused}"
+    );
+    super::TEST_IMAGE_ATOMICS_64.set(true);
+    let lowered = super::synth::lower_native(&native);
+    super::TEST_IMAGE_ATOMICS_64.set(false);
+    let l = lowered.expect("lowers with the switch");
+    let container = crate::dxbc::Container::parse(&l.dxil).expect("a container");
+    let sfi0 = container
+        .part(crate::dxbc::FourCC::SFI0)
+        .expect("SFI0")
+        .data;
+    let features = u64::from_le_bytes(sfi0.try_into().expect("8 bytes"));
+    for (bit, what) in [
+        (0x8000, "Int64Ops"),
+        (0x40_0000, "AtomicInt64OnTypedResource"),
+        (0x1000_0000, "AtomicInt64OnHeapResource"),
+    ] {
+        assert_ne!(features & bit, 0, "SFI0 {features:#x}: no {what}");
+    }
+    // A 32-bit atomic needs none of them.
+    let mut narrow =
+        super::synth::mimg(mimg_op("image_atomic_umax"), 1, 5, 12, 0x1, 1, true).to_vec();
+    narrow.push(vop1(0x001, 0, vgpr(1)));
+    let l = super::synth::lower_native(&super::synth::image_program(&narrow)).expect("lowers");
+    let container = crate::dxbc::Container::parse(&l.dxil).expect("a container");
+    let sfi0 = container
+        .part(crate::dxbc::FourCC::SFI0)
+        .expect("SFI0")
+        .data;
+    let features = u64::from_le_bytes(sfi0.try_into().expect("8 bytes"));
+    assert_eq!(features & 0x1040_8000, 0, "SFI0 {features:#x}");
+}
