@@ -37,8 +37,8 @@ pub(crate) fn counts() -> (u64, u64) {
 }
 
 /// What identifies this build: the BLAKE3 of our executable file and of
-/// the translation settings it runs with (the loop limit, which a
-/// diagnostics build can change at run time).
+/// the translation settings it runs with (the loop limit and 64-bit image
+/// atomics, which a diagnostics build can change at run time).
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
@@ -50,9 +50,17 @@ fn build() -> &'static [u8; 32] {
                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
         }
+        let atomics_64 = victory_shader::emit::image_atomics_64();
+        if atomics_64 {
+            tracing::warn!(
+                "VICTORY_SHADER_IMAGE_ATOMICS_64: 64-bit image atomics are translated \
+                 (not checked in a world run yet)"
+            );
+        }
         match exe {
             Ok(mut bytes) => {
                 bytes.extend_from_slice(&limit.to_le_bytes());
+                bytes.push(u8::from(atomics_64));
                 *blake3::hash(&bytes).as_bytes()
             }
             Err(e) => {

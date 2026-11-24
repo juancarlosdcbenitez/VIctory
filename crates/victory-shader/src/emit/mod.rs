@@ -122,16 +122,28 @@ pub fn renders_in_software(name: &str, flags: u32, vendor_id: u32, device_id: u3
 }
 
 /// Whether 64-bit image atomics (dmask 0x3; cmpswap 0xF) are translated.
-/// Not in a run yet: the GPU layer must first refuse their pipelines on
-/// devices without 64-bit atomics on typed heap resources, and check that
-/// their views are R32G32_UINT, the format D3D12 gives them (SH-1). Only
-/// tests turn them on.
-pub(crate) fn image_atomics_64() -> bool {
+/// Not by default yet (SH-1): they are checked on WARP, not in a world run,
+/// where their views must turn out R32G32_UINT, the format D3D12 gives
+/// them. With the `diagnostics` feature, `VICTORY_SHADER_IMAGE_ATOMICS_64=1`
+/// turns them on for such a run; the GPU layer refuses their pipelines on
+/// devices without 64-bit atomics on typed heap resources
+/// ([`HostShader::needs_typed_atomics_64`]). The switch is part of the
+/// translation, so the shader cache keys on it.
+pub fn image_atomics_64() -> bool {
     #[cfg(test)]
     if TEST_IMAGE_ATOMICS_64.get() {
         return true;
     }
-    false
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let value = std::env::var("VICTORY_SHADER_IMAGE_ATOMICS_64").ok();
+        cfg!(feature = "diagnostics") && switched_on(value.as_deref())
+    })
+}
+
+/// Whether a switch's value turns it on: `1`. Pure, for testing.
+fn switched_on(value: Option<&str>) -> bool {
+    value.map(str::trim) == Some("1")
 }
 
 // 64-bit image atomics for lowerings on this thread, for tests.
@@ -214,6 +226,19 @@ pub struct HostShader {
 }
 
 impl HostShader {
+    /// Whether the shader needs 64-bit atomics on typed resources from the
+    /// descriptor heap (its SFI0 says AtomicInt64OnTypedResource or
+    /// AtomicInt64OnHeapResource): a device without them (D3D12 OPTIONS9,
+    /// OPTIONS11) must not get its pipeline.
+    pub fn needs_typed_atomics_64(&self) -> bool {
+        const TYPED_OR_HEAP: u64 = 0x40_0000 | 0x1000_0000;
+        Container::parse(&self.dxil)
+            .ok()
+            .and_then(|c| c.part(FourCC::SFI0).map(|p| p.data.to_vec()))
+            .and_then(|d| d.try_into().ok().map(u64::from_le_bytes))
+            .is_some_and(|features| features & TYPED_OR_HEAP != 0)
+    }
+
     /// Size of the user-data buffer the shader declares, in dwords (a
     /// multiple of 4; 0 when it reads none). Root constants must cover it.
     pub fn user_data_dwords(&self) -> u32 {
@@ -485,6 +510,17 @@ mod tests {
         for (name, flags, vendor, device, software) in cases {
             let got = super::renders_in_software(name, flags, vendor, device);
             assert_eq!(got, software, "{name:?} {flags} {vendor:#x}:{device:#x}");
+        }
+    }
+
+    #[test]
+    fn switches_turn_on_with_1_only() {
+        use super::switched_on;
+        assert!(switched_on(Some("1")) && switched_on(Some(" 1 ")));
+        let off = ["", "0", "yes", "true", "11"];
+        assert!(!switched_on(None));
+        for value in off {
+            assert!(!switched_on(Some(value)), "{value:?}");
         }
     }
 

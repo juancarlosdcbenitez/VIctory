@@ -246,6 +246,40 @@ fn create() -> windows::core::Result<Host> {
     }
 }
 
+/// Whether the host device runs 64-bit atomics on typed resources from the
+/// descriptor heap (OPTIONS9 AtomicInt64OnTypedResourceSupported and
+/// OPTIONS11 AtomicInt64OnDescriptorHeapResourceSupported), which
+/// translated 64-bit image atomics need. Asked once.
+pub(crate) fn typed_atomics_64() -> bool {
+    static SUPPORTED: OnceLock<bool> = OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        let Some(host) = host() else { return false };
+        let mut o9 = D3D12_FEATURE_DATA_D3D12_OPTIONS9::default();
+        let mut o11 = D3D12_FEATURE_DATA_D3D12_OPTIONS11::default();
+        // SAFETY: plain queries into structures of ours, of their sizes.
+        let (a, b) = unsafe {
+            (
+                host.device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS9,
+                    (&raw mut o9).cast(),
+                    size_of_val(&o9) as u32,
+                ),
+                host.device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS11,
+                    (&raw mut o11).cast(),
+                    size_of_val(&o11) as u32,
+                ),
+            )
+        };
+        let supported = a.is_ok()
+            && b.is_ok()
+            && o9.AtomicInt64OnTypedResourceSupported.as_bool()
+            && o11.AtomicInt64OnDescriptorHeapResourceSupported.as_bool();
+        tracing::info!(supported, "64-bit atomics on typed heap resources");
+        supported
+    })
+}
+
 /// The name of the adapter `device` was created on, and whether it renders
 /// in software: WARP and the Basic Render Driver, which is also the primary
 /// adapter, without the software flag, where no display driver works

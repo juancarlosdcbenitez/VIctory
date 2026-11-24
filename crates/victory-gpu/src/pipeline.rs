@@ -133,6 +133,9 @@ impl Shader {
 fn translate(container: &[u8]) -> Result<Translated, String> {
     use victory_shader::{Container, FourCC, HwStage};
     let host = crate::shader_cache::host_shader(container)?;
+    if host.needs_typed_atomics_64() && !crate::host::typed_atomics_64() {
+        return Err("64-bit atomics on typed heap resources, which the host device lacks".into());
+    }
     let c = Container::parse(container).map_err(|e| e.to_string())?;
     let used = match c.part(FourCC::DXIL) {
         Some(part) => victory_shader::native_programs(part.data)

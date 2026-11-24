@@ -2775,6 +2775,17 @@ fn wide_image_atomics_declare_their_features() {
     ] {
         assert_ne!(features & bit, 0, "SFI0 {features:#x}: no {what}");
     }
+    // The GPU layer refuses such a pipeline on a device without them.
+    let shader = |l: &super::lower::Lowered| super::HostShader {
+        stage: crate::HwStage::Cs,
+        dxil: l.dxil.clone(),
+        user_data: l.user_data.clone(),
+        samplers: l.samplers.clone(),
+        static_samplers: Vec::new(),
+        root_cbvs: l.root_cbvs.clone(),
+        root_srvs: l.root_srvs.clone(),
+    };
+    assert!(shader(&l).needs_typed_atomics_64());
     // A 32-bit atomic needs none of them.
     let mut narrow =
         super::synth::mimg(mimg_op("image_atomic_umax"), 1, 5, 12, 0x1, 1, true).to_vec();
@@ -2787,4 +2798,5 @@ fn wide_image_atomics_declare_their_features() {
         .data;
     let features = u64::from_le_bytes(sfi0.try_into().expect("8 bytes"));
     assert_eq!(features & 0x1040_8000, 0, "SFI0 {features:#x}");
+    assert!(!shader(&l).needs_typed_atomics_64());
 }
