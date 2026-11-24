@@ -116,6 +116,10 @@ pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 /// such loops are what makes a frame slow. The value is part of the
 /// translation, so the shader cache must key on it (`victory-gpu`'s does).
 pub fn loop_limit() -> u32 {
+    #[cfg(test)]
+    if let Some(limit) = TEST_LOOP_LIMIT.get() {
+        return limit;
+    }
     static LIMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *LIMIT.get_or_init(|| {
         if cfg!(feature = "diagnostics") {
@@ -124,6 +128,15 @@ pub fn loop_limit() -> u32 {
             lower::LOOP_LIMIT
         }
     })
+}
+
+// A loop limit for lowerings on this thread, for tests: a few iterations
+// show where the limit stops a loop, which at 2^20 would take the
+// evaluator seconds.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TEST_LOOP_LIMIT: std::cell::Cell<Option<u32>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,

@@ -7720,27 +7720,58 @@ impl<'a> Lower<'a> {
                 let back =
                     |l: &Self, to: usize| l.counters.contains_key(&to) && l.rpo[to] <= l.rpo[b];
                 // (No `xor` of a compare: a loop exit testing one hung the
-                // AMD driver.)
-                let cond = if back(self, taken) {
+                // AMD driver.) `limit`: whether the back edge is the taken
+                // side, and the condition with the count folded in.
+                let limit = if back(self, taken) {
                     let ok = self.count_iteration(taken, pred::IULT);
-                    self.s.m.bin(self.cur, Bin::And, cond, ok)
+                    Some((true, self.s.m.bin(self.cur, Bin::And, cond, ok)))
                 } else if back(self, not_taken) {
                     let stop = self.count_iteration(not_taken, pred::IUGE);
-                    self.s.m.bin(self.cur, Bin::Or, cond, stop)
+                    Some((false, self.s.m.bin(self.cur, Bin::Or, cond, stop)))
                 } else {
-                    cond
+                    None
                 };
                 // Critical edges get a block of their own, so loops have
                 // dedicated exits and preheaders as DXC emits them.
-                let (t, f) = (self.edge(b, taken), self.edge(b, not_taken));
-                for (to, via) in [(taken, t), (not_taken, f)] {
-                    if !back(self, to) {
-                        // From an edge block, or from here.
-                        let from = if Some(via) == self.block[to] {
-                            self.cur
+                let (mut t, mut f) = (self.edge(b, taken), self.edge(b, not_taken));
+                // Past the limit a lane leaves the program, as at a back
+                // edge without a condition: the loop's exit goes through a
+                // block that sends the lanes the limit stopped to the abort
+                // block, and the rest on to the exit. (Taking the exit
+                // instead ran the code after the loop on what the cut-short
+                // loop left.) That block is the exit edge's block for the
+                // exit's phis where the edge had none of its own.
+                let cond = match limit {
+                    None => cond,
+                    Some((back_taken, folded)) => {
+                        let (exit, via) = if back_taken {
+                            (not_taken, f)
                         } else {
-                            via
+                            (taken, t)
                         };
+                        let check = self.s.m.new_block();
+                        let abort = self.abort_block();
+                        let term = if back_taken {
+                            Term::CondBr(cond, abort, via)
+                        } else {
+                            Term::CondBr(cond, via, abort)
+                        };
+                        self.s.m.terminate(check, term);
+                        if Some(via) == self.block[exit] {
+                            self.edges.insert((b, exit), check);
+                        }
+                        if back_taken {
+                            f = check
+                        } else {
+                            t = check
+                        }
+                        folded
+                    }
+                };
+                for to in [taken, not_taken] {
+                    if !back(self, to) {
+                        // From the edge's own block, or from here.
+                        let from = self.edges.get(&(b, to)).copied().unwrap_or(self.cur);
                         self.enter_loop(b, to, from);
                     }
                 }

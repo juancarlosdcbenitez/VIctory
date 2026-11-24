@@ -85,6 +85,12 @@ pub(super) const fn sopk(op: u8, sdst: u8, imm: u16) -> u32 {
     0xB000_0000 | (op as u32 & 0x1F) << 23 | (sdst as u32 & 0x7F) << 16 | imm as u32
 }
 
+/// SOPP `op simm16`: for branches, a dword offset from the next
+/// instruction.
+pub(super) const fn sopp(op: u8, simm16: i16) -> u32 {
+    0xBF80_0000 | (op as u32 & 0x7F) << 16 | simm16 as u16 as u32
+}
+
 /// SOPC `op src0, src1`.
 pub(super) const fn sopc(op: u8, src0: u8, src1: u8) -> u32 {
     0xBF00_0000 | (op as u32 & 0x7F) << 16 | (src1 as u32) << 8 | src0 as u32

@@ -9,8 +9,8 @@
 
 use super::bitcode::eval::f16_to_f32;
 use super::synth::{
-    LITERAL, eval_cases, eval_wave, lower_valu, sgpr, sop1, sop2, sopc, sopk, vgpr, vop1, vop2,
-    vop3, vop3b, vop3p,
+    LITERAL, eval_cases, eval_valu, eval_wave, lower_valu, s_mov_b32, sgpr, sop1, sop2, sopc, sopk,
+    sopp, vgpr, vop1, vop2, vop3, vop3b, vop3p,
 };
 
 /// A named instruction with its opcode and a reference, in test tables.
@@ -2457,4 +2457,147 @@ fn group_shared_atomics_combine_every_lane() {
             );
         }
     }
+}
+
+/// Lowers `body` with the loop limit at `limit` (on this thread) and runs
+/// it per case, as [`eval_cases`] does.
+fn eval_cases_limited(body: &[u32], limit: Option<u32>, cases: &[[u32; 4]]) -> Vec<[u32; 4]> {
+    super::TEST_LOOP_LIMIT.set(limit);
+    let lowered = lower_valu(body);
+    super::TEST_LOOP_LIMIT.set(None);
+    let l = lowered.unwrap_or_else(|e| panic!("{body:08x?} does not lower: {e}"));
+    cases
+        .iter()
+        .map(|&inputs| {
+            eval_valu(&l, inputs)
+                .unwrap_or_else(|e| panic!("{body:08x?} on {inputs:08x?} does not run: {e}"))
+        })
+        .collect()
+}
+
+/// The result store did not happen: the program left before it (a lane
+/// stopped by the loop limit leaves the program; in compute nothing more
+/// is stored).
+const NOT_STORED: u32 = 0xDEAD_BEEF;
+
+const S_CBRANCH_SCC1: u8 = 0x05;
+const S_SUB_U32: u8 = 0x01;
+const S_CMP_LG_U32: u8 = 0x07;
+const V_ADD_NC_U32: u8 = 0x25;
+
+/// `v0 = 0; do { v0 += 1; s12 -= 1 } while (s12 != 0)` with `s12 = s0`:
+/// s0 iterations, and 2^32 for s0 = 0 (the count wraps), as a count read
+/// from memory that holds zeros makes the console run.
+fn counted_loop() -> Vec<u32> {
+    vec![
+        s_mov_b32(12, 0),              // s12 = s0
+        vop1(0x001, 0, 128),           // v0 = 0
+        vop2(V_ADD_NC_U32, 0, 129, 0), // L: v0 += 1
+        sop2(S_SUB_U32, 12, 12, 129),  // s12 -= 1
+        sopc(S_CMP_LG_U32, 12, 128),   // scc = s12 != 0
+        sopp(S_CBRANCH_SCC1, -4),      // to L
+    ]
+}
+
+/// Loops run their exact count; the limit lets a loop of `limit`
+/// iterations finish and stops the next one, whose lane leaves the
+/// program. (The ISA's loop is a back edge taken while SCC holds; the
+/// limit counts back edges per entry into the loop.)
+#[test]
+fn loops_run_their_count_and_stop_at_the_limit() {
+    let body = counted_loop();
+    for (n, want) in [(1, 1), (2, 2), (7, 7), (8, 8)] {
+        let got = eval_cases_limited(&body, Some(8), &[[n, 0, 0, 0]]);
+        assert_eq!(got[0][0], want, "{n} iterations under a limit of 8");
+    }
+    for n in [9, 100, 0] {
+        let got = eval_cases_limited(&body, Some(8), &[[n, 0, 0, 0]]);
+        assert_eq!(got[0], [NOT_STORED; 4], "{n} iterations under a limit of 8");
+    }
+    // Without the test limit, the default one: counts far below it run.
+    let got = eval_cases_limited(&body, None, &[[1000, 0, 0, 0]]);
+    assert_eq!(got[0][0], 1000);
+}
+
+/// The limit counts per entry into a loop: an inner loop entered many
+/// times runs its count each time, however many iterations it adds up to.
+#[test]
+fn the_loop_limit_counts_per_entry() {
+    // s13 = s1; v0 = 0; O: s12 = s0; I: v0 += 1; s12 -= 1; while s12;
+    // s13 -= 1; while s13: v0 = s0 * s1.
+    let body = [
+        s_mov_b32(13, 1),
+        vop1(0x001, 0, 128),
+        s_mov_b32(12, 0),              // O:
+        vop2(V_ADD_NC_U32, 0, 129, 0), // I:
+        sop2(S_SUB_U32, 12, 12, 129),
+        sopc(S_CMP_LG_U32, 12, 128),
+        sopp(S_CBRANCH_SCC1, -4), // to I
+        sop2(S_SUB_U32, 13, 13, 129),
+        sopc(S_CMP_LG_U32, 13, 128),
+        sopp(S_CBRANCH_SCC1, -8), // to O
+    ];
+    for (inner, outer) in [(6, 4), (8, 8), (1, 8), (3, 1)] {
+        let got = eval_cases_limited(&body, Some(8), &[[inner, outer, 0, 0]]);
+        assert_eq!(got[0][0], inner * outer, "{inner} x {outer}");
+    }
+    for (inner, outer) in [(9, 2), (2, 9)] {
+        let got = eval_cases_limited(&body, Some(8), &[[inner, outer, 0, 0]]);
+        assert_eq!(got[0], [NOT_STORED; 4], "{inner} x {outer}");
+    }
+}
+
+/// The case the limit is for, at its real value: a count of zero read
+/// from memory that is not mirrored yet would run 2^32 times; the
+/// translation leaves the loop after 2^20 and the lane leaves the program.
+#[test]
+fn a_wrapped_count_stops_at_the_default_limit() {
+    assert_eq!(super::loop_limit(), 1 << 20);
+    let got = eval_cases_limited(&counted_loop(), None, &[[0, 0, 0, 0]]);
+    assert_eq!(got[0], [NOT_STORED; 4]);
+}
+
+const S_CBRANCH_SCC0: u8 = 0x04;
+const S_CMP_EQ_U32: u8 = 0x06;
+
+/// The counted loop with its back edge on the branch's other side
+/// (`s_cbranch_scc0` on `s12 == 0`), and one that a branch can skip, so
+/// that its exit is a join with a block of its own: both run their count
+/// and are stopped at the limit the same way.
+#[test]
+fn loops_of_other_shapes_stop_at_the_limit_too() {
+    let inverted = [
+        s_mov_b32(12, 0),
+        vop1(0x001, 0, 128),
+        vop2(V_ADD_NC_U32, 0, 129, 0), // L:
+        sop2(S_SUB_U32, 12, 12, 129),
+        sopc(S_CMP_EQ_U32, 12, 128),
+        sopp(S_CBRANCH_SCC0, -4), // to L while s12 != 0
+    ];
+    // v0 = 0; if (s0 != 0) do { v0 += 1 } while (--s12); v0 += 64.
+    let skippable = [
+        s_mov_b32(12, 0),
+        vop1(0x001, 0, 128),
+        sopc(S_CMP_EQ_U32, 12, 128),
+        sopp(S_CBRANCH_SCC1, 4),       // to J
+        vop2(V_ADD_NC_U32, 0, 129, 0), // L:
+        sop2(S_SUB_U32, 12, 12, 129),
+        sopc(S_CMP_LG_U32, 12, 128),
+        sopp(S_CBRANCH_SCC1, -4),      // to L
+        vop2(V_ADD_NC_U32, 0, 192, 0), // J: v0 += 64
+    ];
+    for (n, want) in [(1, 1), (5, 5), (8, 8)] {
+        let got = eval_cases_limited(&inverted, Some(8), &[[n, 0, 0, 0]]);
+        assert_eq!(got[0][0], want, "inverted, {n} iterations");
+        let got = eval_cases_limited(&skippable, Some(8), &[[n, 0, 0, 0]]);
+        assert_eq!(got[0][0], want + 64, "skippable, {n} iterations");
+    }
+    let got = eval_cases_limited(&skippable, Some(8), &[[0, 0, 0, 0]]);
+    assert_eq!(got[0][0], 64, "skipped");
+    for n in [9, 0] {
+        let got = eval_cases_limited(&inverted, Some(8), &[[n, 0, 0, 0]]);
+        assert_eq!(got[0], [NOT_STORED; 4], "inverted, {n} iterations");
+    }
+    let got = eval_cases_limited(&skippable, Some(8), &[[9, 0, 0, 0]]);
+    assert_eq!(got[0], [NOT_STORED; 4], "skippable, 9 iterations");
 }
