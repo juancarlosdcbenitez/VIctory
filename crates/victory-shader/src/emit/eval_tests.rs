@@ -2226,3 +2226,82 @@ fn permlane16_gathers_within_rows_as_the_isa() {
         }
     }
 }
+
+/// DS `op vdst, v[addr], v[data0] offset:offset` (offset0 and offset1 as
+/// one 16-bit offset).
+fn ds(op: u8, vdst: u8, addr: u8, data0: u8, offset: u16) -> [u32; 2] {
+    [
+        0x36 << 26 | u32::from(op) << 18 | u32::from(offset),
+        u32::from(addr) | u32::from(data0) << 8 | u32::from(vdst) << 24,
+    ]
+}
+
+#[test]
+fn ds_swizzle_reads_the_isa_lanes() {
+    let (a, b) = (lane_inputs(11), lane_inputs(12));
+    let quads = [0x80E4u16, 0x801B, 0x8000, 0x80FF, 0x8039];
+    // and, or, xor masks (5 bits each) packed as bits 0-4, 5-9, 10-14.
+    let masks = [
+        (0x1F, 0, 1),
+        (0x1F, 0, 0x10),
+        (0x10, 0x03, 0),
+        (0x00, 0x1F, 0),
+        (0x1C, 0, 3),
+        (0x15, 0x0A, 0x11),
+    ];
+    for wave64 in [false, true] {
+        for q in quads {
+            // ds_swizzle_b32 v4, v1 offset:q.
+            let got = run_wave(&ds(0x35, 4, 1, 0, q), wave64, &a, &b, [0; 4]);
+            for (l, g) in got.iter().enumerate() {
+                let src = (l & !3) | (usize::from(q) >> (2 * (l & 3)) & 3);
+                assert_eq!(*g, a[src], "swizzle {q:#06x}, wave64 {wave64}, lane {l}");
+            }
+        }
+        for (and, or, xor) in masks {
+            let offset = and | or << 5 | xor << 10;
+            let got = run_wave(&ds(0x35, 4, 1, 0, offset), wave64, &a, &b, [0; 4]);
+            for (l, g) in got.iter().enumerate() {
+                let j = (((l & 0x1F) & usize::from(and)) | usize::from(or)) ^ usize::from(xor);
+                let src = j | (l & 0x20);
+                assert_eq!(
+                    *g, a[src],
+                    "swizzle {offset:#06x}, wave64 {wave64}, lane {l}"
+                );
+            }
+        }
+    }
+    // Rotate and FFT modes are refused, not taken for quad permutes.
+    for offset in [0xC000u16, 0xC421, 0xE000, 0xFFFF] {
+        let e = eval_wave(&ds(0x35, 4, 1, 0, offset), 32, false, &a, &b, [0; 4]).unwrap_err();
+        assert!(e.contains("rotate or FFT"), "{offset:#06x}: {e}");
+    }
+}
+
+#[test]
+fn ds_bpermute_reads_the_addressed_lanes() {
+    let a = lane_inputs(13);
+    for wave64 in [false, true] {
+        let n = if wave64 { 64 } else { 32 };
+        for offset in [0u16, 4, 0x100] {
+            // Byte addresses in v2: a lane pattern (reversed, rotated and
+            // repeated), past the wave too (they wrap).
+            let addresses: Vec<u32> = (0..64u32)
+                .map(|l| match l % 3 {
+                    0 => 4 * (n - 1 - l % n),
+                    1 => 4 * ((l + 5) % n) + 2,
+                    _ => 4 * (l + 70),
+                })
+                .collect();
+            // ds_bpermute_b32 v4, v2, v1 offset:offset.
+            let got = run_wave(&ds(0xB3, 4, 2, 1, offset), wave64, &a, &addresses, [0; 4]);
+            for (l, g) in got.iter().enumerate() {
+                let src = ((addresses[l] + u32::from(offset)) / 4 % n) as usize;
+                assert_eq!(
+                    *g, a[src],
+                    "bpermute offset {offset}, wave64 {wave64}, lane {l}"
+                );
+            }
+        }
+    }
+}

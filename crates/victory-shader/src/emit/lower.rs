@@ -2102,6 +2102,33 @@ impl<'a> Lower<'a> {
             Some(Operand::Vector { reg, .. }) => Some(*reg),
             _ => None,
         };
+        if name == "ds_bpermute_b32" {
+            // Backward permute (no LDS memory): each lane reads the data of
+            // lane ((address + offset) / 4) of the wave, the index wrapping
+            // at the wave's size (the ISA's six bits in wave64; taken as
+            // five in wave32).
+            // shortcut: an inactive source lane gives 0 on the console, an
+            // undefined value here.
+            self.cross_lane(false)?;
+            let a = self.vgprs(inst, addr.as_ref().ok_or("a permute address")?, 1)?[0];
+            let x = self.vgprs(inst, data.first().ok_or("permute data")?, 1)?[0];
+            let (o, two, m) = (
+                self.s.m.i32(offset),
+                self.s.m.i32(2),
+                self.s.m.i32(self.wave() - 1),
+            );
+            let at = self.s.m.bin(c, Bin::Add, a, o);
+            let lane = self.s.m.bin(c, Bin::LShr, at, two);
+            let lane = self.s.m.bin(c, Bin::And, lane, m);
+            let r = self.read_lane(x, lane);
+            let reg = dst_reg.ok_or("a permute result")?;
+            self.write(inst, Reg::V(reg), r, guard);
+            return Ok(());
+        }
+        if name == "ds_swizzle_b32" && offset >= 0xC000 {
+            // Rotate (0xC000) and FFT (0xE000) modes, not quad permutes.
+            return Err("a ds_swizzle rotate or FFT mode");
+        }
         if name == "ds_swizzle_b32" {
             // Bit 15 set: each lane of a quad picks a lane of it; else lanes
             // of each group of 32 combine their index with and/or/xor masks.
