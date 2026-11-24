@@ -1839,3 +1839,41 @@ fn f16_arithmetic_rounds_once_as_the_isa() {
         }
     }
 }
+
+#[test]
+fn multiply_add_operand_orders_match_the_isa() {
+    // Small integers, so products and sums are exact.
+    let k = 7.0f32;
+    let cases: Vec<[u32; 4]> = [
+        (2.0f32, 3.0f32, 5.0f32),
+        (-4.0, 0.5, 1.0),
+        (10.0, -3.0, -2.0),
+    ]
+    .iter()
+    .map(|&(a, b, c)| [a.to_bits(), b.to_bits(), c.to_bits(), 0])
+    .collect();
+    let vop2_op = |name: &str| {
+        crate::gfx10::opcode(crate::gfx10::Encoding::Vop2, name).unwrap_or_else(|| panic!("{name}"))
+            as u8
+    };
+    // op v0, v1, v2, K: madmk/fmamk compute v1 * K + v2, madak/fmaak v1 * v2 + K.
+    for (name, k_multiplies) in [
+        ("v_madmk_f32", true),
+        ("v_fmamk_f32", true),
+        ("v_madak_f32", false),
+        ("v_fmaak_f32", false),
+    ] {
+        let body = [vop2(vop2_op(name), 0, vgpr(1), 2), k.to_bits()];
+        check_v0(name, &body, &cases, |[a, b, ..]| {
+            let (a, b) = (f32::from_bits(a), f32::from_bits(b));
+            if k_multiplies { a * k + b } else { a * b + k }.to_bits()
+        });
+    }
+    // v_mov_b32 v0, v3; op v0, v1, v2: v0 accumulates v1 * v2.
+    for name in ["v_mac_f32", "v_fmac_f32"] {
+        let body = [vop1(0x001, 0, vgpr(3)), vop2(vop2_op(name), 0, vgpr(1), 2)];
+        check_v0(name, &body, &cases, |[a, b, c, _]| {
+            (f32::from_bits(a) * f32::from_bits(b) + f32::from_bits(c)).to_bits()
+        });
+    }
+}
