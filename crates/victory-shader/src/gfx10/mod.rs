@@ -290,6 +290,13 @@ fn instruction(code: &[u8], offset: usize) -> Result<Instruction, ShaderError> {
     })
 }
 
+/// The opcode `name` has in `encoding` (in VOP3, the VOP3 number of a VOPC,
+/// VOP2 or VOP1 operation), for tests that write instructions by name.
+#[cfg(test)]
+pub(crate) fn opcode(encoding: Encoding, name: &str) -> Option<u16> {
+    (0..0x400).find(|&op| self::name(encoding, op) == Some(name))
+}
+
 fn name(encoding: Encoding, opcode: u16) -> Option<&'static str> {
     use opcodes as t;
     let (table, op) = match encoding {

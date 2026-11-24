@@ -1072,3 +1072,671 @@ fn scalar_scc_follows_the_isa() {
         });
     }
 }
+
+// --- Sweeps of existing instructions against the ISA ----------------------
+
+/// The VOP3 opcode of `name` (VOPC, VOP2 and VOP1 operations included).
+fn vop3_op(name: &str) -> u16 {
+    crate::gfx10::opcode(crate::gfx10::Encoding::Vop3, name)
+        .unwrap_or_else(|| panic!("{name} is not in the VOP3 table"))
+}
+
+/// `name` writes lane mask s20 from v1, v2 (64-bit forms: v[1:2], v[3:4]);
+/// v_cndmask_b32 turns it into v0.
+fn compare_body(name: &str, wide: bool) -> Vec<u32> {
+    let b = if wide { vgpr(3) } else { vgpr(2) };
+    let mut body = vop3(vop3_op(name), 20, vgpr(1), b, 0).to_vec();
+    body.extend_from_slice(&vop3(0x101, 0, 0x80, 0x81, sgpr(20)));
+    body
+}
+
+/// What predicate `p` (AMD's names) says for an ordering of two values:
+/// `ord` is `None` when they are unordered (a NaN).
+fn predicate(p: &str, ord: Option<std::cmp::Ordering>) -> bool {
+    use std::cmp::Ordering::*;
+    let is = |o: &[std::cmp::Ordering]| ord.is_some_and(|x| o.contains(&x));
+    match p {
+        "f" => false,
+        "t" | "tru" => true,
+        "lt" => is(&[Less]),
+        "eq" => is(&[Equal]),
+        "le" => is(&[Less, Equal]),
+        "gt" => is(&[Greater]),
+        "lg" => is(&[Less, Greater]),
+        "ne" => !is(&[Equal]),
+        "ge" => is(&[Greater, Equal]),
+        "o" => ord.is_some(),
+        "u" => ord.is_none(),
+        "nge" => !is(&[Greater, Equal]),
+        "nlg" => !is(&[Less, Greater]),
+        "ngt" => !is(&[Greater]),
+        "nle" => !is(&[Less, Equal]),
+        "neq" => !is(&[Equal]),
+        "nlt" => !is(&[Less]),
+        p => panic!("predicate {p}"),
+    }
+}
+
+const FLOAT_PREDICATES: [&str; 16] = [
+    "f", "lt", "eq", "le", "gt", "lg", "ge", "o", "u", "nge", "nlg", "ngt", "nle", "neq", "nlt",
+    "tru",
+];
+const INT_PREDICATES: [&str; 8] = ["f", "lt", "eq", "le", "gt", "ne", "ge", "t"];
+
+#[test]
+fn float_compares_match_the_isa() {
+    let f32s = [
+        0u32,
+        0x8000_0000,
+        0x3F80_0000,
+        0xBF80_0000,
+        0x0000_0001,
+        0x7F80_0000,
+        0xFF80_0000,
+        0x7FC0_0000,
+        0x7F80_0001,
+        0x4049_0FDB,
+    ];
+    let f16s = [
+        0u32, 0x8000, 0x3C00, 0xBC00, 0x0001, 0x7C00, 0xFC00, 0x7E00, 0x7C01, 0x4248,
+    ];
+    let f16 = |h: u32| f16_to_f32(h as u16);
+    for (ty, values, as_f) in [
+        ("f32", &f32s, (|x: u32| f32::from_bits(x)) as fn(u32) -> f32),
+        ("f16", &f16s, f16),
+    ] {
+        let mut cases = Vec::new();
+        for &a in values {
+            for &b in values {
+                // High halves set, which 16-bit compares must ignore.
+                let junk = if ty == "f16" { 0xA5A5_0000 } else { 0 };
+                cases.push([a | junk, b | junk, 0, 0]);
+            }
+        }
+        for p in FLOAT_PREDICATES {
+            let name = format!("v_cmp_{p}_{ty}");
+            check_v0(&name, &compare_body(&name, false), &cases, |[a, b, ..]| {
+                let (x, y) = (
+                    as_f(a & if ty == "f16" { 0xFFFF } else { !0 }),
+                    as_f(b & if ty == "f16" { 0xFFFF } else { !0 }),
+                );
+                u32::from(predicate(p, x.partial_cmp(&y)))
+            });
+        }
+    }
+}
+
+#[test]
+fn integer_compares_match_the_isa() {
+    let cases = pairs();
+    for (ty, bits, signed) in [
+        ("i32", 32, true),
+        ("u32", 32, false),
+        ("i16", 16, true),
+        ("u16", 16, false),
+    ] {
+        for p in INT_PREDICATES {
+            let name = format!("v_cmp_{p}_{ty}");
+            // The 16-bit forms have no f and t.
+            if crate::gfx10::opcode(crate::gfx10::Encoding::Vop3, &name).is_none() {
+                assert_eq!(bits, 16, "{name}");
+                continue;
+            }
+            check_v0(&name, &compare_body(&name, false), &cases, |[a, b, ..]| {
+                let ord = if signed {
+                    sext(bits, a).cmp(&sext(bits, b))
+                } else {
+                    let m = if bits == 32 { !0 } else { (1 << bits) - 1 };
+                    (a & m).cmp(&(b & m))
+                };
+                u32::from(predicate(p, Some(ord)))
+            });
+        }
+    }
+}
+
+#[test]
+fn wide_integer_compares_match_the_isa() {
+    // v[1:2] against v[3:4].
+    let mut cases = Vec::new();
+    for &a in &[
+        0u64,
+        1,
+        u64::MAX,
+        1 << 63,
+        (1 << 32) - 1,
+        1 << 32,
+        0x1234_5678_9ABC_DEF0,
+    ] {
+        for &b in &[0u64, 1, u64::MAX, 1 << 63, 1 << 32, 0x1234_5678_0000_0000] {
+            cases.push([a as u32, (a >> 32) as u32, b as u32, (b >> 32) as u32]);
+        }
+    }
+    for (ty, signed) in [("i64", true), ("u64", false)] {
+        for p in INT_PREDICATES {
+            let name = format!("v_cmp_{p}_{ty}");
+            let l = match lower_valu(&compare_body(&name, true)) {
+                Ok(l) => l,
+                // A refusal is an honest answer; a wrong result is not.
+                Err(e) => {
+                    eprintln!("{name}: {e}");
+                    continue;
+                }
+            };
+            for c in &cases {
+                let a = u64::from(c[0]) | u64::from(c[1]) << 32;
+                let b = u64::from(c[2]) | u64::from(c[3]) << 32;
+                let ord = if signed {
+                    (a as i64).cmp(&(b as i64))
+                } else {
+                    a.cmp(&b)
+                };
+                let got = super::synth::eval_valu(&l, *c).expect("runs");
+                assert_eq!(
+                    got[0],
+                    u32::from(predicate(p, Some(ord))),
+                    "{name}({a:#x}, {b:#x})"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn v_cmp_class_f32_matches_the_isa() {
+    let classes: &[(u32, u32)] = &[
+        (0x7F80_0001, 0), // signalling NaN
+        (0xFFBF_FFFF, 0),
+        (0x7FC0_0000, 1), // quiet NaN
+        (0xFFC0_0001, 1),
+        (0xFF80_0000, 2),
+        (0xBF80_0000, 3),
+        (0x8000_0001, 4),
+        (0x8000_0000, 5),
+        (0x0000_0000, 6),
+        (0x0000_0001, 7),
+        (0x3F80_0000, 8),
+        (0x7F80_0000, 9),
+    ];
+    let mut cases = Vec::new();
+    for &(bits, class) in classes {
+        cases.push([bits, 1 << class, 0, 0]);
+        cases.push([bits, 0x3FF & !(1 << class), 0, 0]);
+    }
+    check_v0(
+        "v_cmp_class_f32",
+        &compare_body("v_cmp_class_f32", false),
+        &cases,
+        |[x, mask, ..]| {
+            let class = classes.iter().find(|c| c.0 == x).expect("listed").1;
+            u32::from(mask >> class & 1 != 0)
+        },
+    );
+}
+
+/// `f32` to binary16 bits rounded toward zero: magnitudes past the largest
+/// finite half give it, infinities and NaNs stay.
+fn f16_toward_zero(x: f32) -> u32 {
+    let b = x.to_bits();
+    let sign = (b >> 16) & 0x8000;
+    if x.is_nan() {
+        return sign | 0x7E00 | ((b >> 13) & 0x3FF);
+    }
+    if x.is_infinite() {
+        return sign | 0x7C00;
+    }
+    let a = x.abs();
+    if a >= 65520.0 || f64::from(a) > 65504.0 {
+        return sign | 0x7BFF;
+    }
+    // The largest half not above |x|, by search over the ordered encodings.
+    let (mut lo, mut hi) = (0u32, 0x7BFF);
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if f16_to_f32(mid as u16) <= a {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    sign | lo
+}
+
+#[test]
+fn conversions_match_the_isa() {
+    let cases: Vec<[u32; 4]> = FLOATS
+        .iter()
+        .chain(&[
+            0x4F00_0000u32, // 2^31
+            0xCF00_0001,    // just below -2^31
+            0x4F80_0000,    // 2^32
+            0x3F00_0000,    // 0.5
+            0xBF00_0000,    // -0.5
+            0x3FC0_0000,    // 1.5
+            0xC020_0000,    // -2.5
+            0x4B7F_FFFF,    // 2^24 - 0.5
+        ])
+        .map(|&x| [x, x.rotate_left(7), 0, 0])
+        .collect();
+    fn f(x: u32) -> f32 {
+        f32::from_bits(x)
+    }
+    let ops: &[Op1] = &[
+        ("v_cvt_i32_f32", 0, |x| f(x) as i32 as u32),
+        ("v_cvt_u32_f32", 0, |x| f(x) as u32),
+        ("v_cvt_flr_i32_f32", 0, |x| f(x).floor() as i32 as u32),
+        ("v_cvt_rpi_i32_f32", 0, |x| {
+            (f(x) + 0.5).floor() as i32 as u32
+        }),
+        ("v_cvt_f32_i32", 0, |x| (x as i32 as f32).to_bits()),
+        ("v_cvt_f32_u32", 0, |x| (x as f32).to_bits()),
+        ("v_cvt_f32_ubyte0", 0, |x| ((x & 0xFF) as f32).to_bits()),
+        ("v_cvt_f32_ubyte1", 0, |x| {
+            ((x >> 8 & 0xFF) as f32).to_bits()
+        }),
+        ("v_cvt_f32_ubyte2", 0, |x| {
+            ((x >> 16 & 0xFF) as f32).to_bits()
+        }),
+        ("v_cvt_f32_ubyte3", 0, |x| ((x >> 24) as f32).to_bits()),
+        ("v_cvt_f16_f32", 0, |x| {
+            u32::from(super::bitcode::eval::f32_to_f16(f(x)))
+        }),
+        ("v_trunc_f32", 0, |x| f(x).trunc().to_bits()),
+        ("v_floor_f32", 0, |x| f(x).floor().to_bits()),
+        ("v_ceil_f32", 0, |x| f(x).ceil().to_bits()),
+        ("v_rndne_f32", 0, |x| f(x).round_ties_even().to_bits()),
+    ];
+    for &(name, _, reference) in ops {
+        let body = vop3(vop3_op(name), 0, vgpr(1), 0, 0);
+        for (c, got) in cases.iter().zip(eval_cases(&body, &cases)) {
+            let want = reference(c[0]);
+            let (gf, wf) = (f32::from_bits(got[0]), f32::from_bits(want));
+            let float_out =
+                !name.contains("_i32_") && !name.contains("_u32_") && name != "v_cvt_f16_f32";
+            if float_out && gf.is_nan() && wf.is_nan() {
+                continue;
+            }
+            assert_eq!(got[0], want, "{name}({:#010x} = {:e})", c[0], f(c[0]));
+        }
+    }
+    // v_cvt_pkrtz_f16_f32 v0, v1, v2: both toward zero, v1 in the low half.
+    check_v0(
+        "v_cvt_pkrtz_f16_f32",
+        &vop3(vop3_op("v_cvt_pkrtz_f16_f32"), 0, vgpr(1), vgpr(2), 0),
+        &cases,
+        |[a, b, ..]| f16_toward_zero(f(a)) | f16_toward_zero(f(b)) << 16,
+    );
+}
+
+#[test]
+fn float_output_modifiers_match_the_isa() {
+    let mut cases = Vec::new();
+    for &a in &FLOATS {
+        for &b in &[0x3F80_0000u32, 0xBF00_0000, 0x3E80_0000, 0x7FC0_0000] {
+            cases.push([a, b, 0, 0]);
+        }
+    }
+    for (omod, factor) in [(0u32, 1.0f32), (1, 2.0), (2, 4.0), (3, 0.5)] {
+        for clamp in [false, true] {
+            // v_add_f32_e64 v0, v1, v2 with omod and clamp.
+            let [mut w0, mut w1] = vop3(vop3_op("v_add_f32"), 0, vgpr(1), vgpr(2), 0);
+            w0 |= u32::from(clamp) << 15;
+            w1 |= omod << 27;
+            check_v0(
+                &format!("v_add_f32 omod {omod} clamp {clamp}"),
+                &[w0, w1],
+                &cases,
+                |[a, b, ..]| {
+                    let mut r = (f32::from_bits(a) + f32::from_bits(b)) * factor;
+                    if clamp {
+                        r = if r.is_nan() || r <= 0.0 {
+                            0.0
+                        } else {
+                            r.min(1.0)
+                        };
+                    }
+                    if r.is_nan() { 0x7FC0_0000 } else { r.to_bits() }
+                },
+            );
+        }
+    }
+}
+
+#[test]
+fn vector_carries_match_the_isa() {
+    let cases = pairs();
+    // op v0, s20, v1, v2; v_cndmask_b32 v5, 0, 1, s20.
+    for (name, add, rev) in [
+        ("v_add_co_u32", true, false),
+        ("v_sub_co_u32", false, false),
+        ("v_subrev_co_u32", false, true),
+    ] {
+        let mut body = vop3b(vop3_op(name), 0, 20, vgpr(1), vgpr(2), 0).to_vec();
+        body.extend_from_slice(&vop3(0x101, 5, 0x80, 0x81, sgpr(20)));
+        for (c, got) in cases.iter().zip(eval_cases(&body, &cases)) {
+            let (a, b) = if rev { (c[1], c[0]) } else { (c[0], c[1]) };
+            let (r, carry) = if add {
+                a.overflowing_add(b)
+            } else {
+                a.overflowing_sub(b)
+            };
+            assert_eq!([got[0], got[1]], [r, u32::from(carry)], "{name}{c:08x?}");
+        }
+    }
+    // v_cmp_ne_u32 s22, v3, 0 (carry in: v3 != 0); op v0, s20, v1, v2, s22.
+    for (name, add, rev) in [
+        ("v_add_co_ci_u32", true, false),
+        ("v_sub_co_ci_u32", false, false),
+        ("v_subrev_co_ci_u32", false, true),
+    ] {
+        let mut body = vop3(vop3_op("v_cmp_ne_u32"), 22, vgpr(3), 0x80, 0).to_vec();
+        body.extend_from_slice(&vop3b(vop3_op(name), 0, 20, vgpr(1), vgpr(2), sgpr(22)));
+        body.extend_from_slice(&vop3(0x101, 5, 0x80, 0x81, sgpr(20)));
+        for (c, got) in cases.iter().zip(eval_cases(&body, &cases)) {
+            let (a, b) = if rev { (c[1], c[0]) } else { (c[0], c[1]) };
+            let cin = u64::from(c[2] != 0);
+            let (wide, r) = if add {
+                let s = u64::from(a) + u64::from(b) + cin;
+                (s > 0xFFFF_FFFF, s as u32)
+            } else {
+                let borrow = u64::from(b) + cin > u64::from(a);
+                (borrow, a.wrapping_sub(b).wrapping_sub(cin as u32))
+            };
+            assert_eq!([got[0], got[1]], [r, u32::from(wide)], "{name}{c:08x?}");
+        }
+    }
+}
+
+#[test]
+fn scalar_64_bit_operations_match_the_isa() {
+    // s[0:1] and s[2:3] are the inputs; results in s[6:7], SCC in s12
+    // (s[8:11] hold the harness's buffer descriptor).
+    let mut cases = Vec::new();
+    for &a in &[
+        0u64,
+        1,
+        u64::MAX,
+        1 << 63,
+        0xFFFF_FFFF,
+        1 << 32,
+        0x1234_5678_9ABC_DEF0,
+    ] {
+        for &b in &[0u64, 1, 31, 32, 33, 63, u64::MAX, 0x0F0F_0F0F_F0F0_F0F0] {
+            cases.push([a as u32, (a >> 32) as u32, b as u32, (b >> 32) as u32]);
+        }
+    }
+    let read = |r: [u32; 4]| (u64::from(r[2]) | u64::from(r[3]) << 32, r[1]);
+    let tail = [
+        sop2(0x0a, 12, 0x81, 0x80), // s_cselect_b32 s12, 1, 0
+        vop1(0x001, 5, sgpr(12)),
+        vop1(0x001, 6, sgpr(6)),
+        vop1(0x001, 7, sgpr(7)),
+    ];
+    type Op64 = (&'static str, u8, bool, fn(u64, u64) -> u64);
+    let ops: &[Op64] = &[
+        ("s_and_b64", 0x0f, true, |a, b| a & b),
+        ("s_or_b64", 0x11, true, |a, b| a | b),
+        ("s_xor_b64", 0x13, true, |a, b| a ^ b),
+        ("s_andn2_b64", 0x15, true, |a, b| a & !b),
+        ("s_orn2_b64", 0x17, true, |a, b| a | !b),
+        ("s_nand_b64", 0x19, true, |a, b| !(a & b)),
+        ("s_nor_b64", 0x1b, true, |a, b| !(a | b)),
+        ("s_xnor_b64", 0x1d, true, |a, b| !(a ^ b)),
+        ("s_lshl_b64", 0x1f, false, |a, b| a << (b & 63)),
+        ("s_lshr_b64", 0x21, false, |a, b| a >> (b & 63)),
+        ("s_ashr_i64", 0x23, false, |a, b| {
+            ((a as i64) >> (b & 63)) as u64
+        }),
+    ];
+    for &(name, op, pair, reference) in ops {
+        // The shifts' amount is the 32-bit s2.
+        let mut body = vec![sop2(op, 6, 0, 2)];
+        body.extend(tail);
+        for (c, got) in cases.iter().zip(eval_cases(&body, &cases)) {
+            let a = u64::from(c[0]) | u64::from(c[1]) << 32;
+            let b = if pair {
+                u64::from(c[2]) | u64::from(c[3]) << 32
+            } else {
+                u64::from(c[2])
+            };
+            let want = reference(a, b);
+            assert_eq!(
+                read(got),
+                (want, u32::from(want != 0)),
+                "{name}({a:#x}, {b:#x})"
+            );
+        }
+    }
+    // A 64-bit add and subtract through the carry: s_add_u32 s6, s0, s2;
+    // s_addc_u32 s7, s1, s3 (and s_sub_u32 / s_subb_u32); SCC: the carry out.
+    for (name, lo, hi, add) in [("add", 0x00u8, 0x04u8, true), ("sub", 0x01, 0x05, false)] {
+        let mut body = vec![sop2(lo, 6, 0, 2), sop2(hi, 7, 1, 3)];
+        body.extend(tail);
+        for (c, got) in cases.iter().zip(eval_cases(&body, &cases)) {
+            let a = u64::from(c[0]) | u64::from(c[1]) << 32;
+            let b = u64::from(c[2]) | u64::from(c[3]) << 32;
+            let (r, carry) = if add {
+                a.overflowing_add(b)
+            } else {
+                a.overflowing_sub(b)
+            };
+            assert_eq!(
+                read(got),
+                (r, u32::from(carry)),
+                "64-bit {name}({a:#x}, {b:#x})"
+            );
+        }
+    }
+    // s_cmp_eq_u32 s0, s2; s_cselect_b64 s[6:7], s[0:1], s[2:3].
+    let mut body = vec![sopc(0x06, 0, 2), sop2(0x0b, 6, 0, 2)];
+    body.extend(tail);
+    for (c, got) in cases.iter().zip(eval_cases(&body, &cases)) {
+        let a = u64::from(c[0]) | u64::from(c[1]) << 32;
+        let b = u64::from(c[2]) | u64::from(c[3]) << 32;
+        let want = if c[0] == c[2] { a } else { b };
+        assert_eq!(read(got).0, want, "s_cselect_b64({a:#x}, {b:#x})");
+    }
+    // s_bitcmp0/1_b32 s0, s2 and _b64 s[0:1], s2: SCC is the bit's test.
+    for (name, op, wide, set) in [
+        ("s_bitcmp0_b32", 0x0cu8, false, false),
+        ("s_bitcmp1_b32", 0x0d, false, true),
+        ("s_bitcmp0_b64", 0x0e, true, false),
+        ("s_bitcmp1_b64", 0x0f, true, true),
+    ] {
+        let mut body = vec![sopc(op, 0, 2)];
+        body.extend(tail);
+        for (c, got) in cases.iter().zip(eval_cases(&body, &cases)) {
+            let a = u64::from(c[0]) | u64::from(c[1]) << 32;
+            let bit = if wide { c[2] & 63 } else { c[2] & 31 };
+            let want = (a >> bit & 1 != 0) == set;
+            assert_eq!(got[1], u32::from(want), "{name}({a:#x}, {})", c[2]);
+        }
+    }
+}
+
+/// VOP2 with SDWA (src0 = 0xF9): `op vdst, v[src0], v[vsrc1]` and the SDWA
+/// dword: selects (0-3 byte, 4-5 word, 6 dword), destination padding (0
+/// zeros, 1 sign, 2 keep) and source sign extension.
+fn vop2_sdwa(
+    op: u8,
+    vdst: u8,
+    src0: u8,
+    vsrc1: u8,
+    dst: (u8, u8),
+    sel0: (u8, bool),
+    sel1: (u8, bool),
+) -> [u32; 2] {
+    [
+        vop2(op, vdst, 0xF9, vsrc1),
+        u32::from(src0)
+            | u32::from(dst.0) << 8
+            | u32::from(dst.1) << 11
+            | u32::from(sel0.0) << 16
+            | u32::from(sel0.1) << 19
+            | u32::from(sel1.0) << 24
+            | u32::from(sel1.1) << 27,
+    ]
+}
+
+/// The field `sel` of `x`, zero- or sign-extended.
+fn sdwa_field(x: u32, sel: u8, sext: bool) -> u32 {
+    let (width, at) = match sel {
+        0..=3 => (8, 8 * u32::from(sel)),
+        4 | 5 => (16, 16 * u32::from(sel - 4)),
+        _ => return x,
+    };
+    let f = (x >> at) & ((1 << width) - 1);
+    if sext {
+        (((f << (32 - width)) as i32) >> (32 - width)) as u32
+    } else {
+        f
+    }
+}
+
+#[test]
+fn sdwa_selects_match_the_isa() {
+    let cases: Vec<[u32; 4]> = [0x8081_7F01u32, 0xFFFF_0000, 0x1234_ABCD, 0x0000_8000]
+        .iter()
+        .flat_map(|&a| [0x8000_00FFu32, 0x7FFF_7FFF, 0x0102_0304].map(|b| [a, b, 0xCAFE_F00D, 0]))
+        .collect();
+    // v_mov_b32 v0, v3 first, so a kept destination has old bits to keep.
+    for dst_sel in [0u8, 1, 3, 4, 5, 6] {
+        for unused in [0u8, 1, 2] {
+            for (s0, x0) in [(0u8, false), (1, true), (5, true), (4, false), (6, false)] {
+                for (s1, x1) in [(2u8, true), (4, false), (6, false)] {
+                    let mut body = vec![vop1(0x001, 0, vgpr(3))];
+                    // v_add_nc_u32 (VOP2 0x25) v0, v1, v2 with SDWA.
+                    body.extend(vop2_sdwa(
+                        0x25,
+                        0,
+                        1,
+                        2,
+                        (dst_sel, unused),
+                        (s0, x0),
+                        (s1, x1),
+                    ));
+                    let what = format!("SDWA dst {dst_sel}/{unused} src {s0}/{x0} {s1}/{x1}");
+                    check_v0(&what, &body, &cases, |[a, b, old, _]| {
+                        let r = sdwa_field(a, s0, x0).wrapping_add(sdwa_field(b, s1, x1));
+                        if dst_sel == 6 {
+                            return r;
+                        }
+                        let (width, at) = if dst_sel < 4 {
+                            (8, 8 * u32::from(dst_sel))
+                        } else {
+                            (16, 16 * u32::from(dst_sel - 4))
+                        };
+                        let m = ((1u64 << width) - 1) as u32;
+                        let field = (r & m) << at;
+                        match unused {
+                            0 => field,
+                            1 => ((((r & m) << (32 - width)) as i32) >> (32 - width - at)) as u32,
+                            _ => old & !(m << at) | field,
+                        }
+                    });
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn float_arithmetic_matches_the_isa() {
+    let mut cases = Vec::new();
+    for &a in &FLOATS {
+        for &b in &FLOATS {
+            cases.push([a, b, 0x3F80_0000, 0]);
+        }
+    }
+    let f = |x: u32| f32::from_bits(x);
+    let same = |got: u32, want: f32| got == want.to_bits() || (want.is_nan() && f(got).is_nan());
+    type FloatOp = (&'static str, fn(f32, f32) -> f32);
+    let ops: &[FloatOp] = &[
+        ("v_add_f32", |a, b| a + b),
+        ("v_sub_f32", |a, b| a - b),
+        ("v_subrev_f32", |a, b| b - a),
+        ("v_mul_f32", |a, b| a * b),
+        // D3D9's: 0 times anything (infinity and NaN too) is 0.
+        ("v_mul_legacy_f32", |a, b| {
+            if a == 0.0 || b == 0.0 { 0.0 } else { a * b }
+        }),
+    ];
+    for &(name, reference) in ops {
+        let body = vop3(vop3_op(name), 0, vgpr(1), vgpr(2), 0);
+        for (c, got) in cases.iter().zip(eval_cases(&body, &cases)) {
+            let want = reference(f(c[0]), f(c[1]));
+            // The sign of a legacy zero product is not pinned down.
+            let ok = same(got[0], want)
+                || (name == "v_mul_legacy_f32" && want == 0.0 && f(got[0]) == 0.0);
+            assert!(
+                ok,
+                "{name}({:e}, {:e}) = {:e}, want {want:e}",
+                f(c[0]),
+                f(c[1]),
+                f(got[0])
+            );
+        }
+    }
+    // max and min: a NaN operand gives the other; RDNA2 orders -0 below +0.
+    for (name, max) in [("v_max_f32", true), ("v_min_f32", false)] {
+        let body = vop3(vop3_op(name), 0, vgpr(1), vgpr(2), 0);
+        for (c, got) in cases.iter().zip(eval_cases(&body, &cases)) {
+            let (a, b) = (f(c[0]), f(c[1]));
+            let want = if a.is_nan() {
+                b
+            } else if b.is_nan() {
+                a
+            } else if a == 0.0 && b == 0.0 {
+                // -0 below +0: max is -0 only if both are, min if either is.
+                let negative = if max {
+                    a.is_sign_negative() && b.is_sign_negative()
+                } else {
+                    a.is_sign_negative() || b.is_sign_negative()
+                };
+                if negative { -0.0 } else { 0.0 }
+            } else if a == b || (a > b) == max {
+                a
+            } else {
+                b
+            };
+            assert!(
+                same(got[0], want),
+                "{name}({a:e}, {b:e}) = {:e}, want {want:e}",
+                f(got[0])
+            );
+        }
+    }
+}
+
+#[test]
+fn packed_16_bit_integers_match_the_isa() {
+    let cases = pairs();
+    let lanes = |a: u32, b: u32, op: fn(u16, u16) -> u16| {
+        let lo = op(a as u16, b as u16);
+        let hi = op((a >> 16) as u16, (b >> 16) as u16);
+        u32::from(lo) | u32::from(hi) << 16
+    };
+    type Pk = (&'static str, fn(u16, u16) -> u16);
+    let ops: &[Pk] = &[
+        ("v_pk_add_u16", u16::wrapping_add),
+        ("v_pk_sub_u16", u16::wrapping_sub),
+        ("v_pk_mul_lo_u16", u16::wrapping_mul),
+        ("v_pk_max_u16", u16::max),
+        ("v_pk_min_u16", u16::min),
+        ("v_pk_max_i16", |a, b| (a as i16).max(b as i16) as u16),
+        ("v_pk_min_i16", |a, b| (a as i16).min(b as i16) as u16),
+        ("v_pk_lshlrev_b16", |a, b| b << (a & 15)),
+        ("v_pk_lshrrev_b16", |a, b| b >> (a & 15)),
+        ("v_pk_ashrrev_i16", |a, b| ((b as i16) >> (a & 15)) as u16),
+    ];
+    for &(name, op) in ops {
+        let code = crate::gfx10::opcode(crate::gfx10::Encoding::Vop3p, name)
+            .unwrap_or_else(|| panic!("{name}")) as u8;
+        check_v0(
+            name,
+            &vop3p(code, 0, vgpr(1), vgpr(2), 0),
+            &cases,
+            |[a, b, ..]| lanes(a, b, op),
+        );
+    }
+}
