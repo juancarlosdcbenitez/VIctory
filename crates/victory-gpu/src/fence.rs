@@ -102,6 +102,22 @@ impl Fence {
     }
 }
 
+/// Where a fence's value is (its GPU address), by which [`current`] finds
+/// it while it lives.
+pub(crate) fn value_address(this: This) -> usize {
+    (&raw const fence(this).value) as usize
+}
+
+/// The value of the live fence whose value is at `at`; `None` once that
+/// fence has been released.
+pub(crate) fn current(at: usize) -> Option<u64> {
+    let live = live();
+    let &object = live.get(&at)?;
+    // SAFETY: as in `written`: a fence in `LIVE` is alive.
+    let fence = unsafe { &*(object as *const Fence) };
+    Some(fence.value.load(Ordering::Acquire))
+}
+
 /// After a command list's bottom-of-pipe write stored `bytes` at `at`: a
 /// fence whose value it touched has moved, as if signalled, so its events
 /// are set and its blocked waits rechecked. Titles signal fences this way

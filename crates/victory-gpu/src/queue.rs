@@ -1,8 +1,16 @@
 //! Command queues. Submitted lists run on the host GPU and are waited for,
 //! so fence signals complete at once.
+//!
+//! A queue's waits (`Wait(fence, value)`) are not carried out: what is
+//! submitted after one runs when it is submitted, reached or not. Blocking
+//! the submitting thread instead would deadlock a title that signals the
+//! fence from that thread after submitting (legal in D3D12, where only the
+//! queue waits), so waits not yet reached are recorded, and work that runs
+//! ahead of one is counted and logged ([`Queue::runs_ahead`]).
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, QUEUE, S_OK, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
@@ -34,12 +42,54 @@ struct Queue {
     object: Object,
     kind: u32,
     desc: QueueDesc,
+    /// Waits that were not reached when the title asked for them, until
+    /// they are: `(where the fence's value is, the value)`.
+    waits: Mutex<Vec<(usize, u64)>>,
 }
 const _: () = assert!(std::mem::offset_of!(Queue, kind) == 0x10);
 
 fn queue<'a>(this: This) -> &'a Queue {
     // SAFETY: called from queue methods only.
     unsafe { &*this.cast::<Queue>() }
+}
+
+/// Submissions and signals that ran ahead of a wait on their queue, since
+/// the frame-rate line last reported them.
+static RAN_AHEAD: AtomicU64 = AtomicU64::new(0);
+
+/// How many runs ahead are logged one by one.
+const LOGGED_AHEAD: u32 = 8;
+
+impl Queue {
+    /// Drops the waits that are reached (or whose fence is gone) and says
+    /// whether one is left: then `what`, about to run, runs ahead of it,
+    /// where a real queue would hold it back.
+    fn runs_ahead(&self, what: &str) -> bool {
+        let mut waits = self.waits.lock().unwrap_or_else(|e| e.into_inner());
+        waits.retain(|&(at, value)| crate::fence::current(at).is_some_and(|now| now < value));
+        let Some(&(at, value)) = waits.first() else {
+            return false;
+        };
+        RAN_AHEAD.fetch_add(1, Ordering::Relaxed);
+        static LOGGED: AtomicU32 = AtomicU32::new(0);
+        if LOGGED.fetch_add(1, Ordering::Relaxed) < LOGGED_AHEAD {
+            tracing::warn!(
+                fence = format_args!("{at:#x}"),
+                waits_for = value,
+                value = crate::fence::current(at),
+                "{what} runs ahead of a queue wait not reached yet: our queues run work \
+                 when it is submitted, where this one would wait"
+            );
+        }
+        true
+    }
+}
+
+/// Submissions and signals that ran ahead of a queue wait since the last
+/// call (the frame-rate line).
+#[cfg(windows)]
+pub(crate) fn take_ran_ahead() -> u64 {
+    RAN_AHEAD.swap(0, Ordering::Relaxed)
 }
 
 pub(crate) extern "system" fn create(
@@ -61,6 +111,7 @@ pub(crate) extern "system" fn create(
         },
         kind: desc.kind,
         desc,
+        waits: Mutex::new(Vec::new()),
     });
     object::hand_out(QUEUE, queue, iid, &QUEUE_IIDS, out)
 }
@@ -111,10 +162,11 @@ extern "system" fn release(this: This) -> u32 {
 }
 
 /// Runs the lists' host lists and waits for them (decision 0007).
-extern "system" fn execute(_: This, count: u32, lists: *const This) {
+extern "system" fn execute(this: This, count: u32, lists: *const This) {
     if lists.is_null() {
         return;
     }
+    queue(this).runs_ahead("a submission");
     #[cfg(windows)]
     if let Some(host) = crate::host::host() {
         // SAFETY: the title passes `count` lists.
@@ -157,15 +209,25 @@ extern "system" fn signal2_x(
 }
 /// Markers and events only matter to profilers.
 extern "system" fn marker(_: This) {}
-extern "system" fn signal(_: This, fence: This, value: u64) -> HRESULT {
+extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {
         return E_INVALIDARG;
     }
+    queue(this).runs_ahead("a signal");
     crate::fence::signal(fence, value)
 }
-/// Nothing runs on the queue, so waiting for a fence never blocks it.
-extern "system" fn wait(_: This, fence: This, _value: u64) -> HRESULT {
-    if fence.is_null() { E_INVALIDARG } else { S_OK }
+/// Not carried out (see the module): a value not reached yet is recorded,
+/// so that work which runs ahead of it is counted.
+extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
+    if fence.is_null() {
+        return E_INVALIDARG;
+    }
+    let at = crate::fence::value_address(fence);
+    if crate::fence::current(at).is_some_and(|now| now < value) {
+        let mut waits = queue(this).waits.lock().unwrap_or_else(|e| e.into_inner());
+        waits.push((at, value));
+    }
+    S_OK
 }
 /// Ticks per second of GPU timestamps (see [`Written::GpuTimestamp`]).
 extern "system" fn timestamp_frequency(_: This, out: *mut u64) -> HRESULT {
@@ -534,6 +596,42 @@ mod tests {
         assert_eq!(old[14], new[16]); // signal 0x70 → 0x80
         assert_eq!(old[30], new[32]); // present 0xf0 → 0x100
         assert_eq!(new[35], execute_x as *const ()); // 0x118
+    }
+
+    /// A wait for a value not reached is recorded; work and signals on
+    /// that queue run ahead of it until a signal reaches it. Waits already
+    /// reached, and waits on fences released since, are not counted.
+    #[test]
+    fn work_after_a_wait_not_reached_runs_ahead_of_it() {
+        let null = std::ptr::null();
+        let desc = QueueDesc {
+            kind: 2,
+            priority: 0,
+            flags: 0,
+            nodes: 0,
+        };
+        let mut q = null;
+        assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut q), S_OK);
+        let fence_iid = &crate::fence::FENCE_IIDS[0];
+        let (mut f, mut g) = (null, null);
+        assert_eq!(crate::fence::create(null, 3, 0, fence_iid, &mut f), S_OK);
+        assert_eq!(crate::fence::create(null, 0, 0, fence_iid, &mut g), S_OK);
+        assert_eq!(wait(q, f, 3), S_OK, "reached already");
+        assert!(!queue(q).runs_ahead("test"));
+        assert_eq!(wait(q, f, 5), S_OK);
+        assert!(queue(q).runs_ahead("test"), "5 is not reached");
+        // A signal on the waiting queue itself runs ahead too.
+        assert_eq!(signal(q, g, 1), S_OK);
+        assert!(queue(q).runs_ahead("test"));
+        assert_eq!(crate::fence::signal(f, 5), S_OK);
+        assert!(!queue(q).runs_ahead("test"), "reached");
+        assert!(queue(q).waits.lock().unwrap().is_empty());
+        // A wait on a fence that is then released is dropped, unread.
+        assert_eq!(wait(q, g, 9), S_OK);
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(g, 0x10)(g), 0);
+        assert!(!queue(q).runs_ahead("test"));
+        assert!(queue(q).waits.lock().unwrap().is_empty());
+        assert_eq!(wait(q, null, 1), E_INVALIDARG);
     }
 
     #[test]

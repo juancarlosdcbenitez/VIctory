@@ -1592,6 +1592,13 @@ impl Meter {
                  {indirect:.0} indirect",
                 making = crate::pipeline::making()
             );
+            let ahead = crate::queue::take_ran_ahead();
+            if ahead > 0 {
+                tracing::warn!(
+                    "{ahead} submissions and signals since the last report ran ahead of a \
+                     queue wait not reached yet (our queues do not wait)"
+                );
+            }
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
