@@ -374,7 +374,13 @@ impl<'a> Lower<'a> {
                 n.starts_with("ds_swizzle")
                     || n.contains("permute")
                     || n.starts_with("v_mbcnt")
-                    || matches!(n, "v_readlane_b32" | "v_writelane_b32")
+                    || matches!(
+                        n,
+                        "v_readlane_b32"
+                            | "v_writelane_b32"
+                            | "v_permlane16_b32"
+                            | "v_permlanex16_b32"
+                    )
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
                     || reads_mask_as_data(x.st, i)
             }) || {
@@ -4687,6 +4693,35 @@ impl<'a> Lower<'a> {
                 let me = self.lane_index();
                 let is = self.s.m.cmp(c, pred::EQ, me, lane);
                 let r = self.s.m.select(c, is, a, old);
+                int(self, r)
+            }
+            "v_permlane16_b32" | "v_permlanex16_b32" => {
+                // Each lane reads lane `sel` of its row of 16 (permlanex16:
+                // of the other row of its pair), `sel` the lane's nibble of
+                // the 64-bit {S2, S1}.
+                // shortcut: op_sel's fetch-inactive and bound-control bits
+                // only change what inactive source lanes give; those read
+                // undefined values here, as DPP's do.
+                let x = s(self, 0)?;
+                let (lo, hi) = (s(self, 1)?, s(self, 2)?);
+                self.cross_lane(false)?;
+                let lane = self.lane_index();
+                let k = |l: &mut Self, n: u32| l.s.m.i32(n);
+                let (k15, k7, k2, not15) = (k(self, 15), k(self, 7), k(self, 2), k(self, !15));
+                let pos = self.s.m.bin(c, Bin::And, lane, k15);
+                let mut row = self.s.m.bin(c, Bin::And, lane, not15);
+                if name == "v_permlanex16_b32" {
+                    let k16 = k(self, 16);
+                    row = self.s.m.bin(c, Bin::Xor, row, k16);
+                }
+                let high = self.s.m.cmp(c, pred::IUGT, pos, k7);
+                let word = self.s.m.select(c, high, hi, lo);
+                let at = self.s.m.bin(c, Bin::And, pos, k7);
+                let at = self.s.m.bin(c, Bin::Shl, at, k2);
+                let sel = self.s.m.bin(c, Bin::LShr, word, at);
+                let sel = self.s.m.bin(c, Bin::And, sel, k15);
+                let src = self.s.m.bin(c, Bin::Or, row, sel);
+                let r = self.read_lane(x, src);
                 int(self, r)
             }
             "v_readfirstlane_b32"

@@ -2191,3 +2191,38 @@ fn dpp_reads_the_isa_lanes() {
         }
     }
 }
+
+#[test]
+fn permlane16_gathers_within_rows_as_the_isa() {
+    let (a, b) = (lane_inputs(9), lane_inputs(10));
+    let selectors = [
+        (0x7654_3210u32, 0xFEDC_BA98u32),
+        (0x0123_4567, 0x89AB_CDEF),
+        (0, 0),
+        (0xF0F0_F0F0, 0x1357_9BDF),
+    ];
+    for wave64 in [false, true] {
+        for cross in [false, true] {
+            let name = if cross {
+                "v_permlanex16_b32"
+            } else {
+                "v_permlane16_b32"
+            };
+            for (lo, hi) in selectors {
+                // op v4, v1, s0, s1 (the selectors as root constants).
+                let body = vop3(vop3_op(name), 4, vgpr(1), sgpr(0), sgpr(1));
+                let got = run_wave(&body, wave64, &a, &b, [lo, hi, 0, 0]);
+                for (l, g) in got.iter().enumerate() {
+                    let pos = l & 15;
+                    let sel = ((u64::from(hi) << 32 | u64::from(lo)) >> (4 * pos) & 15) as usize;
+                    let row = if cross { (l & !15) ^ 16 } else { l & !15 };
+                    assert_eq!(
+                        *g,
+                        a[row | sel],
+                        "{name} {lo:#x}:{hi:#x}, wave64 {wave64}, lane {l}"
+                    );
+                }
+            }
+        }
+    }
+}
