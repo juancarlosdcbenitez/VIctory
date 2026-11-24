@@ -209,6 +209,9 @@ impl Written {
                 at.cast::<u64>().write_unaligned(value);
             }
         }
+        // A fence's value, written through its GPU address, wakes what
+        // waits for it.
+        crate::fence::written(at as usize, bytes);
     }
 }
 
