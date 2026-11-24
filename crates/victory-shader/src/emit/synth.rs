@@ -169,14 +169,15 @@ pub(super) fn valu_program(body: &[u32]) -> NativeProgram {
     }
 }
 
-/// Lowers [`valu_program`] around `body`.
+/// Lowers [`valu_program`] around `body`. Where `dxil.dll` loads (Windows
+/// with the SDK, as on CI), the container must also pass the validator.
 pub(super) fn lower_valu(body: &[u32]) -> Result<Lowered, crate::ShaderError> {
     let native = valu_program(body);
     let p = ir::build(&native.code, native.wave64, native.vgprs)?;
     let st = structure::structure(&p)?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
     let io = io::raise(&p, &native)?;
-    lower::lower(&lower::Parts {
+    let l = lower::lower(&lower::Parts {
         native: &native,
         p: &p,
         st: &st,
@@ -186,7 +187,29 @@ pub(super) fn lower_valu(body: &[u32]) -> Result<Lowered, crate::ShaderError> {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
-    })
+    })?;
+    #[cfg(windows)]
+    validate(&l.dxil, body);
+    Ok(l)
+}
+
+/// Runs `dxil.dll`'s validator over `container` if one loads (loaded once).
+#[cfg(windows)]
+fn validate(container: &[u8], body: &[u32]) {
+    use super::validator::Validator;
+    use std::sync::{Mutex, OnceLock};
+    static VALIDATOR: OnceLock<Option<Mutex<Validator>>> = OnceLock::new();
+    let v = VALIDATOR.get_or_init(|| {
+        Validator::load(Validator::default_path().as_deref())
+            .ok()
+            .map(Mutex::new)
+    });
+    if let Some(v) = v {
+        let mut v = v.lock().unwrap_or_else(|e| e.into_inner());
+        if let Err(e) = v.validate(&mut container.to_vec()) {
+            panic!("{body:08x?}: the validator rejects the container: {e}");
+        }
+    }
 }
 
 /// The user-data dwords of a [`valu_program`] given its root constants.
