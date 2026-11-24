@@ -9,8 +9,8 @@
 
 use super::bitcode::eval::f16_to_f32;
 use super::synth::{
-    LITERAL, eval_cases, lower_valu, sgpr, sop1, sop2, sopc, sopk, vgpr, vop1, vop2, vop3, vop3b,
-    vop3p,
+    LITERAL, eval_cases, eval_wave, lower_valu, sgpr, sop1, sop2, sopc, sopk, vgpr, vop1, vop2,
+    vop3, vop3b, vop3p,
 };
 
 /// A named instruction with its opcode and a reference, in test tables.
@@ -2021,4 +2021,173 @@ fn half_dot_products_match_the_isa() {
         "v_dot2c_f32_f16",
         &[vop1(0x001, 0, vgpr(3)), vop2(vop2_op, 0, vgpr(1), 2)],
     );
+}
+
+// --- Waves: cross-lane instructions, lanes in lockstep --------------------
+
+/// Distinct per-lane inputs.
+fn lane_inputs(seed: u32) -> Vec<u32> {
+    (0..64u32)
+        .map(|i| i.wrapping_mul(0x9E37_79B9) ^ seed)
+        .collect()
+}
+
+/// `body` run as one wave (32 or 64 lanes): each lane's `v4`.
+fn run_wave(body: &[u32], wave64: bool, a: &[u32], b: &[u32], k: [u32; 4]) -> Vec<u32> {
+    let lanes = if wave64 { 64 } else { 32 };
+    eval_wave(body, lanes, wave64, a, b, k).unwrap_or_else(|e| panic!("{body:08x?}: {e}"))
+}
+
+#[test]
+fn a_wave_runs_each_lane_on_its_own_data() {
+    let (a, b) = (lane_inputs(1), lane_inputs(2));
+    for wave64 in [false, true] {
+        // v_add_nc_u32 v4, v1, v2.
+        let got = run_wave(&[vop2(0x25, 4, vgpr(1), 2)], wave64, &a, &b, [0; 4]);
+        for (l, g) in got.iter().enumerate() {
+            assert_eq!(*g, a[l].wrapping_add(b[l]), "wave64 {wave64}, lane {l}");
+        }
+    }
+}
+
+#[test]
+fn lane_reads_and_writes_match_the_isa() {
+    let (a, b) = (lane_inputs(3), lane_inputs(4));
+    for wave64 in [false, true] {
+        let n: u32 = if wave64 { 64 } else { 32 };
+        for k in [0u32, 5, n - 1] {
+            // v_readlane_b32 s20, v1, k; v_mov_b32 v4, s20.
+            let mut body = vop3(vop3_op("v_readlane_b32"), 20, vgpr(1), 128 + k as u16, 0).to_vec();
+            body.push(vop1(0x001, 4, sgpr(20)));
+            let got = run_wave(&body, wave64, &a, &b, [0; 4]);
+            assert!(
+                got.iter().all(|&g| g == a[k as usize]),
+                "readlane {k}, wave64 {wave64}: {got:x?}"
+            );
+            // v_mov_b32 v4, v1; v_writelane_b32 v4, s0, k: lane k takes s0.
+            let mut body = vec![vop1(0x001, 4, vgpr(1))];
+            body.extend(vop3(
+                vop3_op("v_writelane_b32"),
+                4,
+                sgpr(0),
+                128 + k as u16,
+                0,
+            ));
+            let got = run_wave(&body, wave64, &a, &b, [0xABCD_0123, 0, 0, 0]);
+            for (l, g) in got.iter().enumerate() {
+                let want = if l as u32 == k { 0xABCD_0123 } else { a[l] };
+                assert_eq!(*g, want, "writelane {k}, wave64 {wave64}, lane {l}");
+            }
+        }
+        // v_readfirstlane_b32 s20, v1; v_mov_b32 v4, s20.
+        let got = run_wave(
+            &[vop1(0x002, 20, vgpr(1)), vop1(0x001, 4, sgpr(20))],
+            wave64,
+            &a,
+            &b,
+            [0; 4],
+        );
+        assert!(
+            got.iter().all(|&g| g == a[0]),
+            "readfirstlane, wave64 {wave64}"
+        );
+    }
+}
+
+#[test]
+fn mbcnt_counts_the_mask_below_each_lane() {
+    let (a, b) = (lane_inputs(5), lane_inputs(6));
+    for wave64 in [false, true] {
+        let n = if wave64 { 64 } else { 32 };
+        // v_mbcnt_lo_u32_b32 v4, -1, 0 (and _hi with -1 in wave64): the lane.
+        let mut body = vop3(vop3_op("v_mbcnt_lo_u32_b32"), 4, 193, 128, 0).to_vec();
+        if wave64 {
+            body.extend(vop3(vop3_op("v_mbcnt_hi_u32_b32"), 4, 193, vgpr(4), 0));
+        }
+        let got = run_wave(&body, wave64, &a, &b, [0; 4]);
+        assert_eq!(
+            got,
+            (0..n).collect::<Vec<u32>>(),
+            "lane index, wave64 {wave64}"
+        );
+        // v_cmp_gt_u32 s[20:21], v1, v2; mbcnt over that mask: the lanes
+        // below with a > b.
+        let mut body = vop3(vop3_op("v_cmp_gt_u32"), 20, vgpr(1), vgpr(2), 0).to_vec();
+        body.extend(vop3(vop3_op("v_mbcnt_lo_u32_b32"), 4, sgpr(20), 128, 0));
+        if wave64 {
+            body.extend(vop3(vop3_op("v_mbcnt_hi_u32_b32"), 4, sgpr(21), vgpr(4), 0));
+        }
+        let got = run_wave(&body, wave64, &a, &b, [0; 4]);
+        for (l, g) in got.iter().enumerate() {
+            let want = (0..l).filter(|&i| a[i] > b[i]).count() as u32;
+            assert_eq!(*g, want, "mbcnt of a compare, wave64 {wave64}, lane {l}");
+        }
+    }
+}
+
+/// The lane DPP16 control `ctrl` reads for lane `l`, if it lies in the
+/// row (RDNA2 ISA).
+fn dpp16_source(ctrl: u16, l: usize) -> Option<usize> {
+    let (row, pos) = (l & !15, l & 15);
+    let n = usize::from(ctrl & 15);
+    match ctrl {
+        0..=0xFF => Some((l & !3) | (usize::from(ctrl) >> (2 * (l & 3)) & 3)),
+        0x101..=0x10F => (pos + n < 16).then_some(l + n),
+        0x111..=0x11F => (pos >= n).then(|| l - n),
+        0x121..=0x12F => Some(row | ((pos + 16 - n) & 15)),
+        0x140 => Some(row | (15 - pos)),
+        0x141 => Some(row | (pos & 8) | (7 - (pos & 7))),
+        0x150..=0x15F => Some(row | n),
+        0x160..=0x16F => Some(row | (pos ^ n)),
+        _ => unreachable!("{ctrl:#x}"),
+    }
+}
+
+#[test]
+fn dpp_reads_the_isa_lanes() {
+    let (a, b) = (lane_inputs(7), lane_inputs(8));
+    let mut ctrls: Vec<u16> = vec![0x00, 0xE4, 0x1B, 0x4E, 0xB1, 0xFF, 0x39];
+    ctrls.extend((1..16).flat_map(|n| [0x100 + n, 0x110 + n, 0x120 + n]));
+    ctrls.extend([
+        0x140, 0x141, 0x150, 0x153, 0x15F, 0x160, 0x161, 0x16A, 0x16F,
+    ]);
+    for wave64 in [false, true] {
+        for &ctrl in &ctrls {
+            for (row_mask, bank_mask, bound) in
+                [(0xF, 0xF, false), (0xF, 0xF, true), (0x5, 0xA, false)]
+            {
+                // v_mov_b32 v4, v2; v_mov_b32_dpp v4, v1 ctrl.
+                let ext = 1
+                    | u32::from(ctrl) << 8
+                    | u32::from(bound) << 19
+                    | (bank_mask as u32) << 24
+                    | (row_mask as u32) << 28;
+                let body = [vop1(0x001, 4, vgpr(2)), vop1(0x001, 4, 0xFA), ext];
+                let got = run_wave(&body, wave64, &a, &b, [0; 4]);
+                for (l, g) in got.iter().enumerate() {
+                    let enabled =
+                        row_mask >> (l / 16) & 1 != 0 && bank_mask >> (l / 4 % 4) & 1 != 0;
+                    let want = match (enabled, dpp16_source(ctrl, l)) {
+                        (false, _) => b[l],
+                        (true, Some(s)) => a[s],
+                        (true, None) if bound => 0,
+                        (true, None) => b[l],
+                    };
+                    assert_eq!(
+                        *g, want,
+                        "dpp {ctrl:#x} rows {row_mask:#x} banks {bank_mask:#x} bound {bound}, wave64 {wave64}, lane {l}"
+                    );
+                }
+            }
+        }
+        // DPP8: lane l reads lane sel[l % 8] of its group of eight.
+        for sel in [0o76543210u32, 0o01234567, 0o00000000, 0o35172604] {
+            let body = [vop1(0x001, 4, 0xE9), 1 | sel << 8];
+            let got = run_wave(&body, wave64, &a, &b, [0; 4]);
+            for (l, g) in got.iter().enumerate() {
+                let s = (l & !7) | (sel >> (3 * (l % 8)) & 7) as usize;
+                assert_eq!(*g, a[s], "dpp8 {sel:o}, wave64 {wave64}, lane {l}");
+            }
+        }
+    }
 }

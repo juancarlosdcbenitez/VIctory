@@ -1,6 +1,7 @@
 //! An interpreter of the module under construction, for tests: it runs
-//! `main` for one thread, so the lowering of an instruction can be checked
-//! against a reference on any machine, without a GPU or `dxil.dll`.
+//! `main` for one thread, or for the lanes of one wave in lockstep, so the
+//! lowering of an instruction can be checked against a reference on any
+//! machine, without a GPU or `dxil.dll`.
 //!
 //! It runs the symbolic module (before value numbering). Where DXIL leaves
 //! a choice to the driver, it makes one, and it refuses what LLVM leaves
@@ -13,8 +14,11 @@
 //!   which the hardware follows);
 //! * a shift by the bit width or more, an integer division by zero, a
 //!   branch on an undefined value and a store of one are errors;
-//! * reads of lanes other than the thread's own (quad and wave reads) give
-//!   undefined values, which are errors only where they are used.
+//! * reads of lanes outside the wave (quad and wave reads) give undefined
+//!   values, which are errors only where they are used;
+//! * lanes of a wave all run every instruction: a branch the lanes take
+//!   different ways is an error (divergence is not modelled), so wave
+//!   operations see every lane active.
 //!
 //! Supported: integer and float arithmetic, casts, compares, selects, phis,
 //! branches, group-shared memory and constant tables, and the `dx.op`
@@ -83,10 +87,13 @@ pub(crate) struct Env {
     pub heap: HashMap<u32, Vec<u8>>,
     pub group_size: [u32; 3],
     pub group: [u32; 3],
-    /// The thread's id in its group.
+    /// The id in its group of the wave's first thread; lane n is n further
+    /// along x.
     pub thread: [u32; 3],
     /// Lanes in the host wave (`WaveGetLaneCount`).
     pub wave_lanes: u32,
+    /// Lanes run in lockstep (at most `wave_lanes`): 1 runs one thread.
+    pub lanes: u32,
     /// Buffer accesses out of bounds (D3D defines them: reads give 0,
     /// writes are dropped), counted.
     pub out_of_bounds: u32,
@@ -105,6 +112,7 @@ impl Default for Env {
             group: [0, 0, 0],
             thread: [0, 0, 0],
             wave_lanes: 32,
+            lanes: 1,
             out_of_bounds: 0,
             max_blocks: 1 << 24,
         }
@@ -129,11 +137,16 @@ pub(crate) fn run(m: &Module, env: &mut Env) -> Result<(), String> {
             },
         })
         .collect::<Result<Vec<_>, String>>()?;
+    let lanes = env.lanes.max(1) as usize;
+    if lanes as u32 > env.wave_lanes {
+        return Err(format!("{lanes} lanes in a wave of {}", env.wave_lanes));
+    }
     let mut x = Exec {
         m,
         env,
-        vals: vec![None; m.insts.len()],
+        vals: vec![vec![None; m.insts.len()]; lanes],
         globals,
+        lane: 0,
     };
     x.main()
 }
@@ -234,59 +247,236 @@ pub(crate) fn f16_to_f32(h: u16) -> f32 {
 struct Exec<'m, 'e> {
     m: &'m Module,
     env: &'e mut Env,
-    vals: Vec<Option<Val>>,
+    /// Per lane, each instruction's value.
+    vals: Vec<Vec<Option<Val>>>,
     globals: Vec<Vec<Val>>,
+    /// The lane an instruction is evaluated for.
+    lane: usize,
 }
 
 impl Exec<'_, '_> {
     fn main(&mut self) -> Result<(), String> {
         let (mut block, mut prev) = (0usize, None);
+        let lanes = self.vals.len();
         for _ in 0..self.env.max_blocks {
             let blk = &self.m.blocks[block];
             // Phis read their incoming values all at once.
-            let mut phis = Vec::with_capacity(blk.phis.len());
-            for &i in &blk.phis {
-                let Op::Phi(incoming) = &self.m.insts[i as usize].op else {
-                    unreachable!()
-                };
-                let v = match incoming.iter().find(|(_, b)| Some(*b) == prev) {
-                    Some(&(v, _)) => self.value(v)?,
-                    // A phi nothing reads may lack an edge.
-                    None => Val::Undef,
-                };
-                phis.push((i, v));
-            }
-            for (i, v) in phis {
-                self.vals[i as usize] = Some(v);
+            for lane in 0..lanes {
+                self.lane = lane;
+                let mut phis = Vec::with_capacity(blk.phis.len());
+                for &i in &blk.phis {
+                    let Op::Phi(incoming) = &self.m.insts[i as usize].op else {
+                        unreachable!()
+                    };
+                    let v = match incoming.iter().find(|(_, b)| Some(*b) == prev) {
+                        Some(&(v, _)) => self.value(v)?,
+                        // A phi nothing reads may lack an edge.
+                        None => Val::Undef,
+                    };
+                    phis.push((i, v));
+                }
+                for (i, v) in phis {
+                    self.vals[lane][i as usize] = Some(v);
+                }
             }
             for &i in &blk.body {
-                let v = self.inst(i)?;
-                self.vals[i as usize] = Some(v);
+                if let Some(results) = self.across_lanes(i)? {
+                    for (lane, v) in results.into_iter().enumerate() {
+                        self.vals[lane][i as usize] = Some(v);
+                    }
+                    continue;
+                }
+                for lane in 0..lanes {
+                    self.lane = lane;
+                    let v = self.inst(i)?;
+                    self.vals[lane][i as usize] = Some(v);
+                }
             }
             prev = Some(block);
             block = match blk.term {
                 Some(Term::Ret) => return Ok(()),
                 Some(Term::Br(t)) => t,
-                Some(Term::CondBr(c, t, f)) => match self.value(c)? {
-                    Val::Int(1, x) => {
-                        if x != 0 {
-                            t
-                        } else {
-                            f
+                Some(Term::CondBr(c, t, f)) => {
+                    let mut to = None;
+                    for lane in 0..lanes {
+                        self.lane = lane;
+                        let next = match self.value(c)? {
+                            Val::Int(1, x) => {
+                                if x != 0 {
+                                    t
+                                } else {
+                                    f
+                                }
+                            }
+                            v => return Err(format!("a branch on {v:?}")),
+                        };
+                        if to.is_some_and(|b| b != next) {
+                            return Err("lanes branch different ways (divergence)".into());
                         }
+                        to = Some(next);
                     }
-                    v => return Err(format!("a branch on {v:?}")),
-                },
+                    to.expect("a lane")
+                }
                 None => return Err(format!("block {block} has no terminator")),
             };
         }
         Err("no return within the block limit".into())
     }
 
+    /// A wave operation (it reads other lanes): every lane's result, all
+    /// lanes active. `None` for any other instruction.
+    fn across_lanes(&mut self, i: u32) -> Result<Option<Vec<Val>>, String> {
+        let Op::Call(f, args) = &self.m.insts[i as usize].op else {
+            return Ok(None);
+        };
+        let Some(&V::Const(code)) = args.first() else {
+            return Ok(None);
+        };
+        let Val::Int(32, opcode) = constant(self.m, code) else {
+            return Ok(None);
+        };
+        if !self.m.funcs[*f as usize].name.starts_with("dx.op.") || !(113..=123).contains(&opcode) {
+            return Ok(None);
+        }
+        let lanes = self.vals.len();
+        let mut per_lane = Vec::with_capacity(lanes);
+        for lane in 0..lanes {
+            self.lane = lane;
+            let a = args[1..]
+                .iter()
+                .map(|&a| self.value(a))
+                .collect::<Result<Vec<_>, _>>()?;
+            per_lane.push(a);
+        }
+        let x = |l: usize| per_lane[l][0].clone();
+        let small = |l: usize, k: usize| match per_lane[l].get(k) {
+            Some(Val::Int(_, v)) => Ok(*v),
+            v => Err(format!("wave operation {opcode}: operand {k} is {v:?}")),
+        };
+        let undefined = per_lane.iter().any(|a| a[0] == Val::Undef);
+        let all = |v: Val| vec![v; lanes];
+        // Lanes past the wave read nothing defined.
+        let pick = |l: usize| if l < lanes { x(l) } else { Val::Undef };
+        Ok(Some(match opcode {
+            // WaveAnyTrue, WaveAllTrue.
+            113 | 114 => {
+                if undefined {
+                    all(Val::Undef)
+                } else {
+                    let set: Vec<bool> = (0..lanes).map(|l| x(l) == Val::bool(true)).collect();
+                    let r = if opcode == 113 {
+                        set.iter().any(|&b| b)
+                    } else {
+                        set.iter().all(|&b| b)
+                    };
+                    all(Val::bool(r))
+                }
+            }
+            // WaveActiveAllEqual.
+            115 => all(Val::bool((0..lanes).all(|l| x(l) == x(0)))),
+            // WaveActiveBallot: a bit per lane in four dwords.
+            116 => {
+                if undefined {
+                    all(Val::Undef)
+                } else {
+                    let mut words = [0u32; 4];
+                    for (l, word) in (0..lanes).map(|l| (l, l / 32)) {
+                        if x(l) == Val::bool(true) {
+                            words[word] |= 1 << (l % 32);
+                        }
+                    }
+                    all(Val::Agg(words.iter().map(|&w| Val::i32(w)).collect()))
+                }
+            }
+            // WaveReadLaneAt.
+            117 => (0..lanes)
+                .map(|l| Ok(pick(small(l, 1)? as usize)))
+                .collect::<Result<Vec<_>, String>>()?,
+            // WaveReadLaneFirst.
+            118 => all(x(0)),
+            // WaveActiveOp (sum, product, min, max; signed or unsigned),
+            // WaveActiveBit (and, or, xor), WavePrefixOp (exclusive).
+            119..=121 => {
+                if undefined {
+                    return Ok(Some(all(Val::Undef)));
+                }
+                let op = small(0, 1)?;
+                let unsigned = opcode != 120 && small(0, 2)? == 1;
+                let combine = |a: &Val, b: &Val| -> Result<Val, String> {
+                    Ok(match (a, b) {
+                        (Val::Int(n, a), Val::Int(_, b)) => {
+                            let r = match (opcode, op) {
+                                (120, 0) => a & b,
+                                (120, 1) => a | b,
+                                (120, _) => a ^ b,
+                                (_, 0) => a.wrapping_add(*b),
+                                (_, 1) => a.wrapping_mul(*b),
+                                _ => {
+                                    let less = if unsigned {
+                                        a < b
+                                    } else {
+                                        sext(*n, *a) < sext(*n, *b)
+                                    };
+                                    if less == (op == 2) { *a } else { *b }
+                                }
+                            };
+                            Val::Int(*n, mask(*n, r))
+                        }
+                        (Val::F32(a), Val::F32(b)) if opcode != 120 => {
+                            let (a, b) = (f32::from_bits(*a), f32::from_bits(*b));
+                            let r = match op {
+                                0 => a + b,
+                                1 => a * b,
+                                2 => a.min(b),
+                                _ => a.max(b),
+                            };
+                            Val::F32(r.to_bits())
+                        }
+                        (a, b) => return Err(format!("wave operation {opcode} of {a:?}, {b:?}")),
+                    })
+                };
+                if opcode == 121 {
+                    // Each lane gets the lanes below it, after the identity.
+                    let mut acc = match (x(0), op) {
+                        (Val::Int(n, _), 0) => Val::Int(n, 0),
+                        (Val::Int(n, _), 1) => Val::Int(n, 1),
+                        (Val::F32(_), 0) => Val::F32(0f32.to_bits()),
+                        (Val::F32(_), 1) => Val::F32(1f32.to_bits()),
+                        (v, op) => return Err(format!("a wave prefix {op} of {v:?}")),
+                    };
+                    let mut out = Vec::with_capacity(lanes);
+                    for l in 0..lanes {
+                        out.push(acc.clone());
+                        acc = combine(&acc, &x(l))?;
+                    }
+                    out
+                } else {
+                    let mut acc = x(0);
+                    for l in 1..lanes {
+                        acc = combine(&acc, &x(l))?;
+                    }
+                    all(acc)
+                }
+            }
+            // QuadReadLaneAt; QuadOp (across x, across y, diagonal).
+            122 | 123 => (0..lanes)
+                .map(|l| {
+                    let from = if opcode == 122 {
+                        (l & !3) + (small(l, 1)? as usize & 3)
+                    } else {
+                        l ^ (small(l, 1)? as usize + 1)
+                    };
+                    Ok(pick(from))
+                })
+                .collect::<Result<Vec<_>, String>>()?,
+            _ => unreachable!(),
+        }))
+    }
+
     fn value(&self, v: V) -> Result<Val, String> {
         Ok(match v {
             V::Const(i) => constant(self.m, i),
-            V::Inst(i) => self.vals[i as usize]
+            V::Inst(i) => self.vals[self.lane][i as usize]
                 .clone()
                 .ok_or_else(|| format!("instruction {i} read before it ran"))?,
             V::Global(g) => Val::Ptr(g, None),
@@ -598,44 +788,17 @@ impl Exec<'_, '_> {
             80 => Val::Undef,
             93 => {
                 let c = u(0)? as usize;
-                Val::i32(self.env.group[c] * self.env.group_size[c] + self.env.thread[c])
+                Val::i32(self.env.group[c] * self.env.group_size[c] + self.thread()[c])
             }
             94 => Val::i32(self.env.group[u(0)? as usize]),
-            95 => Val::i32(self.env.thread[u(0)? as usize]),
+            95 => Val::i32(self.thread()[u(0)? as usize]),
             96 => {
-                let [x, y, z] = self.env.thread;
+                let [x, y, z] = self.thread();
                 let [sx, sy, _] = self.env.group_size;
                 Val::i32(x + sx * (y + sy * z))
             }
-            111 => Val::i32(0),
+            111 => Val::i32(self.lane as u32),
             112 => Val::i32(self.env.wave_lanes),
-            113 | 114 => a[0].clone(),
-            115 => Val::bool(true),
-            116 => Val::Agg(vec![Val::i32(u(0)?), Val::i32(0), Val::i32(0), Val::i32(0)]),
-            117 => {
-                if u(1)? == 0 {
-                    a[0].clone()
-                } else {
-                    Val::Undef
-                }
-            }
-            118..=120 => a[0].clone(),
-            // A prefix over no lanes: the operation's identity (sum 0,
-            // product 1, ...).
-            121 => match (u(1)?, &a[0]) {
-                (0, Val::F32(_)) => float(0.0),
-                (1, Val::F32(_)) => float(1.0),
-                (0, Val::Int(b, _)) => Val::Int(*b, 0),
-                (1, Val::Int(b, _)) => Val::Int(*b, 1),
-                (op, v) => return Err(format!("a wave prefix {op} of {v:?}")),
-            },
-            122 => {
-                if u(1)? == 0 {
-                    a[0].clone()
-                } else {
-                    Val::Undef
-                }
-            }
             130 => Val::i32(u32::from(f32_to_f16(f(0)?))),
             131 => float(f16_to_f32(u(0)? as u16)),
             139 => {
@@ -720,6 +883,12 @@ impl Exec<'_, '_> {
             }),
             _ => return Err(format!("dx.op.{class} (opcode {opcode}) is not modelled")),
         })
+    }
+
+    /// The id in its group of the thread the current lane runs.
+    fn thread(&self) -> [u32; 3] {
+        let [x, y, z] = self.env.thread;
+        [x + self.lane as u32, y, z]
     }
 
     /// The field types of struct type `t`.
