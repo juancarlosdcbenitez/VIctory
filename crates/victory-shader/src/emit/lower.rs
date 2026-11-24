@@ -2452,9 +2452,47 @@ impl<'a> Lower<'a> {
             self.set(scc, Val::Bit(r));
             return Ok(());
         }
+        if name == "s_bitreplicate_b64_b32" {
+            // Bit i of S0 to bits 2i and 2i + 1 of the pair: each half of
+            // S0 spread to every other bit, then doubled.
+            let a = src32(self, 0)?;
+            let hi = dst_code.and_then(|c| inst.write(Reg::S(c + 1)));
+            let k16 = self.s.m.i32(16);
+            let top = self.s.m.bin(c, Bin::LShr, a, k16);
+            for (x, reg) in [(a, lo), (top, hi)] {
+                let m = self.s.m.i32(0xFFFF);
+                let mut x = self.s.m.bin(c, Bin::And, x, m);
+                for (sh, mask) in [
+                    (8, 0x00FF_00FF),
+                    (4, 0x0F0F_0F0F),
+                    (2, 0x3333_3333),
+                    (1, 0x5555_5555),
+                ] {
+                    let (sh, mask) = (self.s.m.i32(sh), self.s.m.i32(mask));
+                    let t = self.s.m.bin(c, Bin::Shl, x, sh);
+                    let t = self.s.m.bin(c, Bin::Or, x, t);
+                    x = self.s.m.bin(c, Bin::And, t, mask);
+                }
+                let one = self.s.m.i32(1);
+                let t = self.s.m.bin(c, Bin::Shl, x, one);
+                let r = self.s.m.bin(c, Bin::Or, x, t);
+                self.set(reg, Val::I32(r));
+            }
+            return Ok(());
+        }
         let wide = name.ends_with("_b64") || name.ends_with("_u64") || name.ends_with("_i64");
         if wide {
             let hi = dst_code.and_then(|c| inst.write(Reg::S(c + 1)));
+            // The destination pair's old dwords (for forms that keep bits).
+            let old = |l: &mut Self, h: u8| -> Result<V, Why> {
+                let code = dst_code.ok_or("a missing operand")?;
+                let v = inst.read(Reg::S(code + h)).ok_or("an unread operand")?;
+                l.i32_of(v)
+            };
+            let first_bit = |l: &mut Self, op: u32, x: V| {
+                let i32t = l.s.t.i32;
+                l.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, op, &[x])
+            };
             let nonzero = |l: &mut Self, a: V, b: V| {
                 let o = l.s.m.bin(c, Bin::Or, a, b);
                 let z = l.s.m.i32(0);
@@ -2551,6 +2589,180 @@ impl<'a> Lower<'a> {
                     let rl = self.s.m.cast(c, Cast::Trunc, r, self.s.t.i32);
                     let rh = self.s.m.bin(c, Bin::LShr, r, k32);
                     let rh = self.s.m.cast(c, Cast::Trunc, rh, self.s.t.i32);
+                    self.set(lo, Val::I32(rl));
+                    self.set(hi, Val::I32(rh));
+                    let s = nonzero(self, rl, rh);
+                    self.set(scc, Val::Bit(s));
+                    Ok(())
+                }
+                "s_brev_b64" => {
+                    // The pair reversed: each half reversed, the halves swapped.
+                    let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                    let i32t = self.s.t.i32;
+                    let ra = self.s.op(c, "unary.i32", Attr::ReadNone, i32t, 30, &[a]);
+                    let rb = self.s.op(c, "unary.i32", Attr::ReadNone, i32t, 30, &[b]);
+                    self.set(lo, Val::I32(rb));
+                    self.set(hi, Val::I32(ra));
+                    Ok(())
+                }
+                "s_bcnt0_i32_b64" => {
+                    let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                    let (na, nb) = (first_bit(self, 31, a), first_bit(self, 31, b));
+                    let n = self.s.m.bin(c, Bin::Add, na, nb);
+                    let k64 = self.s.m.i32(64);
+                    let r = self.s.m.bin(c, Bin::Sub, k64, n);
+                    self.set(lo, Val::I32(r));
+                    let z = self.s.m.i32(0);
+                    let s = self.s.m.cmp(c, pred::NE, r, z);
+                    self.set(scc, Val::Bit(s));
+                    Ok(())
+                }
+                "s_ff0_i32_b64" => {
+                    // The lowest clear bit; -1 for none: first-bit-low of the
+                    // complement, the high half's offset by 32.
+                    let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                    let ones = self.s.m.i32(u32::MAX);
+                    let a = self.s.m.bin(c, Bin::Xor, a, ones);
+                    let b = self.s.m.bin(c, Bin::Xor, b, ones);
+                    let (fa, fb) = (first_bit(self, 32, a), first_bit(self, 32, b));
+                    let (z, k32) = (self.s.m.i32(0), self.s.m.i32(32));
+                    let fb32 = self.s.m.bin(c, Bin::Add, fb, k32);
+                    let none = self.s.m.cmp(c, pred::EQ, b, z);
+                    let fb = self.s.m.select(c, none, fb, fb32);
+                    let low = self.s.m.cmp(c, pred::NE, a, z);
+                    let r = self.s.m.select(c, low, fa, fb);
+                    self.set(lo, Val::I32(r));
+                    Ok(())
+                }
+                "s_flbit_i32_b64" | "s_flbit_i32_i64" => {
+                    // The first set bit counted from bit 63 (for the signed
+                    // form, the first bit that differs from the sign); -1
+                    // for none.
+                    let (mut a, mut b) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                    let z = self.s.m.i32(0);
+                    if name == "s_flbit_i32_i64" {
+                        let ones = self.s.m.i32(u32::MAX);
+                        let neg = self.s.m.cmp(c, pred::SLT, b, z);
+                        let na = self.s.m.bin(c, Bin::Xor, a, ones);
+                        let nb = self.s.m.bin(c, Bin::Xor, b, ones);
+                        a = self.s.m.select(c, neg, na, a);
+                        b = self.s.m.select(c, neg, nb, b);
+                    }
+                    let (fa, fb) = (first_bit(self, 33, a), first_bit(self, 33, b));
+                    let k32 = self.s.m.i32(32);
+                    let fa32 = self.s.m.bin(c, Bin::Add, fa, k32);
+                    let ones = self.s.m.i32(u32::MAX);
+                    let none = self.s.m.cmp(c, pred::EQ, a, z);
+                    let low = self.s.m.select(c, none, ones, fa32);
+                    let high = self.s.m.cmp(c, pred::NE, b, z);
+                    let r = self.s.m.select(c, high, fb, low);
+                    self.set(lo, Val::I32(r));
+                    Ok(())
+                }
+                "s_bitset0_b64" | "s_bitset1_b64" => {
+                    // Clears (sets) bit S0[5:0] of the destination pair.
+                    let n = src32(self, 0)?;
+                    let (k31, k32, one, z) = (
+                        self.s.m.i32(31),
+                        self.s.m.i32(32),
+                        self.s.m.i32(1),
+                        self.s.m.i32(0),
+                    );
+                    let at = self.s.m.bin(c, Bin::And, n, k31);
+                    let bit = self.s.m.bin(c, Bin::Shl, one, at);
+                    let upper = self.s.m.bin(c, Bin::And, n, k32);
+                    let upper = self.s.m.cmp(c, pred::NE, upper, z);
+                    for (h, reg) in [(0u8, lo), (1, hi)] {
+                        let o = old(self, h)?;
+                        let x = if name == "s_bitset1_b64" {
+                            self.s.m.bin(c, Bin::Or, o, bit)
+                        } else {
+                            let ones = self.s.m.i32(u32::MAX);
+                            let nb = self.s.m.bin(c, Bin::Xor, bit, ones);
+                            self.s.m.bin(c, Bin::And, o, nb)
+                        };
+                        let here = if h == 1 {
+                            upper
+                        } else {
+                            let t = self.s.m.bool(true);
+                            self.s.m.bin(c, Bin::Xor, upper, t)
+                        };
+                        let r = self.s.m.select(c, here, x, o);
+                        self.set(reg, Val::I32(r));
+                    }
+                    Ok(())
+                }
+                "s_cmov_b64" => {
+                    let cond = self.scc_in(inst)?;
+                    for (h, reg) in [(0u8, lo), (1, hi)] {
+                        let (a, o) = (half(self, 0, h)?, old(self, h)?);
+                        let r = self.s.m.select(c, cond, a, o);
+                        self.set(reg, Val::I32(r));
+                    }
+                    Ok(())
+                }
+                "s_bfm_b64" => {
+                    // ((1 << S0[5:0]) - 1) << S1[5:0], 64 bits.
+                    let (a, b) = (src32(self, 0)?, src32(self, 1)?);
+                    let i64t = self.s.m.int(64);
+                    self.s.flags |= flags::INT64;
+                    let k63 = self.s.m.i32(63);
+                    let a = self.s.m.bin(c, Bin::And, a, k63);
+                    let b = self.s.m.bin(c, Bin::And, b, k63);
+                    let a = self.s.m.cast(c, Cast::ZExt, a, i64t);
+                    let b = self.s.m.cast(c, Cast::ZExt, b, i64t);
+                    let one = self.s.m.int_const(i64t, 1);
+                    let m = self.s.m.bin(c, Bin::Shl, one, a);
+                    let m = self.s.m.bin(c, Bin::Sub, m, one);
+                    let m = self.s.m.bin(c, Bin::Shl, m, b);
+                    let (rl, rh) = self.split64(m);
+                    self.set(lo, Val::I32(rl));
+                    self.set(hi, Val::I32(rh));
+                    Ok(())
+                }
+                "s_bfe_u64" | "s_bfe_i64" => {
+                    // The field of S1[22:16] bits at bit S1[5:0] of the pair
+                    // (sign-extended for the signed form); width 0 gives 0,
+                    // a field past bit 63 ends there. SCC: the result is
+                    // not zero.
+                    let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                    let spec = src32(self, 1)?;
+                    let i64t = self.s.m.int(64);
+                    self.s.flags |= flags::INT64;
+                    let a = self.s.m.cast(c, Cast::ZExt, a, i64t);
+                    let b = self.s.m.cast(c, Cast::ZExt, b, i64t);
+                    let k32 = self.s.m.int_const(i64t, 32);
+                    let b = self.s.m.bin(c, Bin::Shl, b, k32);
+                    let x = self.s.m.bin(c, Bin::Or, a, b);
+                    let (k63, k16, k127) = (self.s.m.i32(63), self.s.m.i32(16), self.s.m.i32(0x7F));
+                    let off = self.s.m.bin(c, Bin::And, spec, k63);
+                    let w = self.s.m.bin(c, Bin::LShr, spec, k16);
+                    let w = self.s.m.bin(c, Bin::And, w, k127);
+                    // The field's top at bit 63, then shifted down: up
+                    // = 64 - w - off when the field ends below bit 64.
+                    let k64 = self.s.m.i32(64);
+                    let end = self.s.m.bin(c, Bin::Add, w, off);
+                    let inside = self.s.m.cmp(c, pred::IULT, end, k64);
+                    let up = self.s.m.bin(c, Bin::Sub, k64, end);
+                    let z = self.s.m.i32(0);
+                    let up = self.s.m.select(c, inside, up, z);
+                    let down = self.s.m.bin(c, Bin::Add, up, off);
+                    // Only an empty field (replaced below) shifts by 64.
+                    let up = self.s.m.bin(c, Bin::And, up, k63);
+                    let down = self.s.m.bin(c, Bin::And, down, k63);
+                    let up = self.s.m.cast(c, Cast::ZExt, up, i64t);
+                    let down = self.s.m.cast(c, Cast::ZExt, down, i64t);
+                    let t = self.s.m.bin(c, Bin::Shl, x, up);
+                    let op = if name == "s_bfe_i64" {
+                        Bin::AShr
+                    } else {
+                        Bin::LShr
+                    };
+                    let r = self.s.m.bin(c, op, t, down);
+                    let empty = self.s.m.cmp(c, pred::EQ, w, z);
+                    let zero = self.s.m.int_const(i64t, 0);
+                    let r = self.s.m.select(c, empty, zero, r);
+                    let (rl, rh) = self.split64(r);
                     self.set(lo, Val::I32(rl));
                     self.set(hi, Val::I32(rh));
                     let s = nonzero(self, rl, rh);
@@ -2694,12 +2906,21 @@ impl<'a> Lower<'a> {
                 (self.s.m.bin(c, op, a, b), None)
             }
             "s_lshl1_add_u32" | "s_lshl2_add_u32" | "s_lshl3_add_u32" | "s_lshl4_add_u32" => {
+                // SCC is the unsigned overflow of the whole (S0 << n) + S1:
+                // bits shifted out of S0, or the add's carry.
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
-                let k = self.s.m.i32(u32::from(name.as_bytes()[6] - b'0'));
+                let n = u32::from(name.as_bytes()[6] - b'0');
+                let k = self.s.m.i32(n);
                 let t = self.s.m.bin(c, Bin::Shl, a, k);
-                (self.s.m.bin(c, Bin::Add, t, b), None)
+                let r = self.s.m.bin(c, Bin::Add, t, b);
+                let (out, z) = (self.s.m.i32(32 - n), self.s.m.i32(0));
+                let lost = self.s.m.bin(c, Bin::LShr, a, out);
+                let lost = self.s.m.cmp(c, pred::NE, lost, z);
+                let wrap = self.s.m.cmp(c, pred::IULT, r, t);
+                (r, Some(self.s.m.bin(c, Bin::Or, lost, wrap)))
             }
             "s_min_u32" | "s_max_u32" | "s_min_i32" | "s_max_i32" => {
+                // SCC is the comparison (S0 < S1 for min, S0 > S1 for max).
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
                 let p = match name {
                     "s_min_u32" => pred::IULT,
@@ -2708,7 +2929,64 @@ impl<'a> Lower<'a> {
                     _ => pred::SGT,
                 };
                 let t = self.s.m.cmp(c, p, a, b);
-                (self.s.m.select(c, t, a, b), None)
+                (self.s.m.select(c, t, a, b), Some(t))
+            }
+            "s_absdiff_i32" => {
+                // |S0 - S1| of the wrapped difference; SCC: it is not zero.
+                let (a, b) = (src32(self, 0)?, src32(self, 1)?);
+                let d = self.s.m.bin(c, Bin::Sub, a, b);
+                let z = self.s.m.i32(0);
+                let neg = self.s.m.cmp(c, pred::SLT, d, z);
+                let n = self.s.m.bin(c, Bin::Sub, z, d);
+                (self.s.m.select(c, neg, n, d), None)
+            }
+            "s_sext_i32_i8" | "s_sext_i32_i16" => {
+                let a = src32(self, 0)?;
+                let k = self.s.m.i32(if name == "s_sext_i32_i8" { 24 } else { 16 });
+                let t = self.s.m.bin(c, Bin::Shl, a, k);
+                (self.s.m.bin(c, Bin::AShr, t, k), None)
+            }
+            "s_bcnt0_i32_b32" | "s_ff0_i32_b32" => {
+                // Zero bits counted, or the lowest one found (-1 for none):
+                // the set-bit forms on the complement.
+                let a = src32(self, 0)?;
+                let ones = self.s.m.i32(u32::MAX);
+                let na = self.s.m.bin(c, Bin::Xor, a, ones);
+                let op = if name == "s_ff0_i32_b32" { 32 } else { 31 };
+                let r = self
+                    .s
+                    .op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, op, &[na]);
+                (r, None)
+            }
+            "s_pack_ll_b32_b16" | "s_pack_lh_b32_b16" | "s_pack_hh_b32_b16" => {
+                // The low result half from S0, the high one from S1: each
+                // operand's low (l) or high (h) half.
+                let (a, b) = (src32(self, 0)?, src32(self, 1)?);
+                let k16 = self.s.m.i32(16);
+                let low = if name == "s_pack_hh_b32_b16" {
+                    self.s.m.bin(c, Bin::LShr, a, k16)
+                } else {
+                    let m = self.s.m.i32(0xFFFF);
+                    self.s.m.bin(c, Bin::And, a, m)
+                };
+                let high = if name == "s_pack_ll_b32_b16" {
+                    self.s.m.bin(c, Bin::Shl, b, k16)
+                } else {
+                    let m = self.s.m.i32(0xFFFF_0000);
+                    self.s.m.bin(c, Bin::And, b, m)
+                };
+                (self.s.m.bin(c, Bin::Or, low, high), None)
+            }
+            "s_cmov_b32" | "s_cmovk_i32" => {
+                // The source if SCC is set; else the destination keeps its value.
+                let cond = self.scc_in(inst)?;
+                let old = self.operand(inst, dst.as_ref().ok_or("a missing operand")?)?;
+                let a = if name == "s_cmovk_i32" {
+                    sext16(self)
+                } else {
+                    src32(self, 0)?
+                };
+                (self.s.m.select(c, cond, a, old), None)
             }
             "s_abs_i32" => {
                 let a = src32(self, 0)?;
@@ -3913,6 +4191,121 @@ impl<'a> Lower<'a> {
                 let a = s(self, 0)?;
                 int(self, a)
             }
+            "v_mad_u64_u32" | "v_mad_i64_i32" => {
+                // D = S0 * S1 + S2: a 64-bit product of 32-bit sources (zero-
+                // or sign-extended) plus a 64-bit addend. The unsigned form's
+                // carry out of the sum is the lane's bit of SDST.
+                if v.clamp {
+                    return Err("a clamped 64-bit multiply-add");
+                }
+                let (a, b) = (s(self, 0)?, s(self, 1)?);
+                let acc = self.src64(inst, 2)?;
+                let signed = name == "v_mad_i64_i32";
+                let i64t = self.s.m.int(64);
+                let ext = if signed { Cast::SExt } else { Cast::ZExt };
+                let a = self.s.m.cast(c, ext, a, i64t);
+                let b = self.s.m.cast(c, ext, b, i64t);
+                let p = self.s.m.bin(c, Bin::Mul, a, b);
+                let r = self.s.m.bin(c, Bin::Add, p, acc);
+                let Some(Operand::Vector { reg, .. }) = v.dst else {
+                    return Err("a 64-bit result");
+                };
+                let (lo, hi) = self.split64(r);
+                self.write(inst, Reg::V(reg), lo, guard);
+                self.write(inst, Reg::V(reg + 1), hi, guard);
+                if !signed
+                    && let Some(Operand::Scalar { code, .. }) = v.carry
+                    && let Some(w) = inst.write(Reg::S(code))
+                {
+                    // The product is below 2^64, so the sum wrapped iff it
+                    // is below the addend.
+                    let carry = self.s.m.cmp(c, pred::IULT, r, acc);
+                    self.lane_bits.insert(w, carry);
+                }
+                for &(_, w) in &inst.writes {
+                    self.vals
+                        .entry(w)
+                        .or_insert(Val::Missing("a lane mask read as data"));
+                }
+                Ok(())
+            }
+            "v_ldexp_f32" => {
+                // S0 * 2^S1, as three multiplications by exact powers of two
+                // in the normal range (enough to reach any result from any
+                // input): an in-range result rounds once; only a denormal
+                // one can round twice (hosts usually flush those).
+                let x = f(self, 0)?;
+                let n = s(self, 1)?;
+                let clamp = |l: &mut Self, n: V| {
+                    let (lo, hi) = (l.s.m.i32(-126i32 as u32), l.s.m.i32(127));
+                    let below = l.s.m.cmp(c, pred::SLT, n, lo);
+                    let n = l.s.m.select(c, below, lo, n);
+                    let above = l.s.m.cmp(c, pred::SGT, n, hi);
+                    l.s.m.select(c, above, hi, n)
+                };
+                let mut r = x;
+                let mut rest = n;
+                for _ in 0..3 {
+                    let step = clamp(self, rest);
+                    rest = self.s.m.bin(c, Bin::Sub, rest, step);
+                    let (k127, k23) = (self.s.m.i32(127), self.s.m.i32(23));
+                    let e = self.s.m.bin(c, Bin::Add, step, k127);
+                    let bits = self.s.m.bin(c, Bin::Shl, e, k23);
+                    let pow = self.as_float(bits);
+                    r = self.s.m.bin(c, Bin::Mul, r, pow);
+                }
+                float(self, r)
+            }
+            "v_frexp_mant_f32" | "v_frexp_exp_i32_f32" => {
+                // x = mant * 2^exp with |mant| in [0.5, 1); zero, infinity
+                // and NaN give themselves and exponent 0. A denormal is
+                // scaled by 2^64 (exactly) to normalise it; a host that
+                // flushes denormals sees a zero, as such hardware does.
+                let x = f(self, 0)?;
+                let bits = self.as_int(x);
+                let (k23, kff, z) = (self.s.m.i32(23), self.s.m.i32(0xFF), self.s.m.i32(0));
+                let e = self.s.m.bin(c, Bin::LShr, bits, k23);
+                let e = self.s.m.bin(c, Bin::And, e, kff);
+                let denorm = self.s.m.cmp(c, pred::EQ, e, z);
+                let big = self.s.m.f32(0x5F80_0000); // 2^64
+                let scaled = self.s.m.bin(c, Bin::Mul, x, big);
+                let y = self.s.m.select(c, denorm, scaled, x);
+                let yb = self.as_int(y);
+                let special = self.s.m.cmp(c, pred::EQ, e, kff);
+                let mag = self.s.m.i32(0x7FFF_FFFF);
+                let ym = self.s.m.bin(c, Bin::And, yb, mag);
+                let zero = self.s.m.cmp(c, pred::EQ, ym, z);
+                if name == "v_frexp_mant_f32" {
+                    let keep = self.s.m.i32(0x807F_FFFF);
+                    let half = self.s.m.i32(0x3F00_0000);
+                    let m = self.s.m.bin(c, Bin::And, yb, keep);
+                    let m = self.s.m.bin(c, Bin::Or, m, half);
+                    let m = self.as_float(m);
+                    let m = self.s.m.select(c, zero, y, m);
+                    let m = self.s.m.select(c, special, x, m);
+                    return float(self, m);
+                }
+                let ey = self.s.m.bin(c, Bin::LShr, ym, k23);
+                let (k126, k190) = (self.s.m.i32(126), self.s.m.i32(190));
+                let bias = self.s.m.select(c, denorm, k190, k126);
+                let r = self.s.m.bin(c, Bin::Sub, ey, bias);
+                let none = self.s.m.bin(c, Bin::Or, zero, special);
+                let r = self.s.m.select(c, none, z, r);
+                int(self, r)
+            }
+            "v_cvt_pknorm_i16_f32" | "v_cvt_pknorm_u16_f32" => {
+                // Each f32 to a normalised 16-bit value (S0 low, S1 high),
+                // as `v_cvt_norm_*16_f16` does for f16.
+                let signed = name == "v_cvt_pknorm_i16_f32";
+                let (a, b) = (f(self, 0)?, f(self, 1)?);
+                let (a, b) = (self.as_int(a), self.as_int(b));
+                let lo = self.f32_norm16(a, signed);
+                let hi = self.f32_norm16(b, signed);
+                let k16 = self.s.m.i32(16);
+                let hi = self.s.m.bin(c, Bin::Shl, hi, k16);
+                let r = self.s.m.bin(c, Bin::Or, lo, hi);
+                int(self, r)
+            }
             "v_add_f32" | "v_sub_f32" | "v_subrev_f32" | "v_mul_f32" | "v_mul_legacy_f32"
             | "v_max_f32" | "v_min_f32" => {
                 let (a, bb) = (f(self, 0)?, f(self, 1)?);
@@ -4468,6 +4861,16 @@ impl<'a> Lower<'a> {
             "v_cvt_i16_f16",
             "v_cvt_norm_i16_f16",
             "v_cvt_norm_u16_f16",
+            "v_add_nc_i16",
+            "v_sub_nc_i16",
+            "v_mad_u16",
+            "v_mad_i16",
+            "v_min3_u16",
+            "v_min3_i16",
+            "v_max3_u16",
+            "v_max3_i16",
+            "v_med3_u16",
+            "v_med3_i16",
         ];
         let all = [FLOAT1, FLOAT2, FLOAT3, INT];
         if !all.iter().any(|l| l.contains(&name))
@@ -4648,9 +5051,48 @@ impl<'a> Lower<'a> {
                     b = sext(self, b);
                 }
                 let k15 = self.s.m.i32(15);
+                let third = |l: &mut Self| -> Result<V, Why> {
+                    let x = l.half_src(inst, 2)?;
+                    Ok(if name.ends_with("_i16") {
+                        sext(l, x)
+                    } else {
+                        x
+                    })
+                };
+                let (lt, gt) = if name.ends_with("_i16") {
+                    (pred::SLT, pred::SGT)
+                } else {
+                    (pred::IULT, pred::IUGT)
+                };
+                let pick = |l: &mut Self, p, x, y| {
+                    let t = l.s.m.cmp(c, p, x, y);
+                    l.s.m.select(c, t, x, y)
+                };
                 match name {
-                    "v_add_nc_u16" => self.s.m.bin(c, Bin::Add, a, b),
-                    "v_sub_nc_u16" => self.s.m.bin(c, Bin::Sub, a, b),
+                    "v_add_nc_u16" | "v_add_nc_i16" => self.s.m.bin(c, Bin::Add, a, b),
+                    "v_sub_nc_u16" | "v_sub_nc_i16" => self.s.m.bin(c, Bin::Sub, a, b),
+                    "v_mad_u16" | "v_mad_i16" => {
+                        let d = third(self)?;
+                        let m = self.s.m.bin(c, Bin::Mul, a, b);
+                        self.s.m.bin(c, Bin::Add, m, d)
+                    }
+                    "v_min3_u16" | "v_min3_i16" => {
+                        let d = third(self)?;
+                        let t = pick(self, lt, a, b);
+                        pick(self, lt, t, d)
+                    }
+                    "v_max3_u16" | "v_max3_i16" => {
+                        let d = third(self)?;
+                        let t = pick(self, gt, a, b);
+                        pick(self, gt, t, d)
+                    }
+                    "v_med3_u16" | "v_med3_i16" => {
+                        let d = third(self)?;
+                        let lo = pick(self, lt, a, b);
+                        let hi = pick(self, gt, a, b);
+                        let t = pick(self, lt, hi, d);
+                        pick(self, gt, lo, t)
+                    }
                     "v_subrev_nc_u16" => self.s.m.bin(c, Bin::Sub, b, a),
                     "v_mul_lo_u16" => self.s.m.bin(c, Bin::Mul, a, b),
                     "v_lshlrev_b16" | "v_lshrrev_b16" | "v_ashrrev_i16" => {
@@ -4754,6 +5196,84 @@ impl<'a> Lower<'a> {
         };
         let m16 = k(self, 0xFFFF);
         Ok(self.s.m.bin(c, Bin::And, r, m16))
+    }
+
+    /// The f32 with bits `x` as a normalised 16-bit integer (in the low
+    /// bits): clamped to [-1, 1] (signed) or [0, 1], times 32767 or 65535,
+    /// rounded to nearest even once from the exact product (40 bits, so in
+    /// i64); NaN gives 0. The rounding is the f16 forms' (`cvt_norm16`),
+    /// which the hardware tests pin down.
+    fn f32_norm16(&mut self, x: V, signed: bool) -> V {
+        let c = self.cur;
+        let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+        let i64t = self.s.m.int(64);
+        self.s.flags |= flags::INT64;
+        let k64 = |l: &mut Self, v: i64| l.s.m.int_const(i64t, v);
+        let scale = if signed { 0x7FFF } else { 0xFFFF };
+        let (k0, k23, k31) = (k(self, 0), k(self, 23), k(self, 31));
+        let mag_mask = k(self, 0x7FFF_FFFF);
+        let mag = self.s.m.bin(c, Bin::And, x, mag_mask);
+        let neg = self.s.m.bin(c, Bin::LShr, x, k31);
+        let neg = self.s.m.cmp(c, pred::NE, neg, k0);
+        // |x| < 1: x = m * 2^-s, m < 2^24 and 24 <= s <= 149 (denormals:
+        // s = 149); a shift past 63 leaves nothing, as 63 does.
+        let e = self.s.m.bin(c, Bin::LShr, mag, k23);
+        let man_mask = k(self, 0x7F_FFFF);
+        let man = self.s.m.bin(c, Bin::And, mag, man_mask);
+        let implicit = k(self, 0x80_0000);
+        let normal = self.s.m.bin(c, Bin::Or, man, implicit);
+        let sub = self.s.m.cmp(c, pred::EQ, e, k0);
+        let m = self.s.m.select(c, sub, man, normal);
+        let (k150, k149, k126, k63, k24) = (
+            k(self, 150),
+            k(self, 149),
+            k(self, 126),
+            k(self, 63),
+            k(self, 24),
+        );
+        let s_norm = self.s.m.bin(c, Bin::Sub, k150, e);
+        let s = self.s.m.select(c, sub, k149, s_norm);
+        // Exponents of 1 and above saturate below; keep their shift valid.
+        let ge_one = self.s.m.cmp(c, pred::IUGT, e, k126);
+        let s = self.s.m.select(c, ge_one, k24, s);
+        let far = self.s.m.cmp(c, pred::IUGT, s, k63);
+        let s = self.s.m.select(c, far, k63, s);
+        let m = self.s.m.cast(c, Cast::ZExt, m, i64t);
+        let s64 = self.s.m.cast(c, Cast::ZExt, s, i64t);
+        let ks = k64(self, scale);
+        let p = self.s.m.bin(c, Bin::Mul, m, ks);
+        let q = self.s.m.bin(c, Bin::LShr, p, s64);
+        let one = k64(self, 1);
+        let one_s = self.s.m.bin(c, Bin::Shl, one, s64);
+        let low_mask = self.s.m.bin(c, Bin::Sub, one_s, one);
+        let rem = self.s.m.bin(c, Bin::And, p, low_mask);
+        let half = self.s.m.bin(c, Bin::LShr, one_s, one);
+        let above = self.s.m.cmp(c, pred::IUGT, rem, half);
+        let tie = self.s.m.cmp(c, pred::EQ, rem, half);
+        let q = self.s.m.cast(c, Cast::Trunc, q, self.s.t.i32);
+        let k1 = k(self, 1);
+        let odd = self.s.m.bin(c, Bin::And, q, k1);
+        let odd = self.s.m.cmp(c, pred::NE, odd, k0);
+        let tie_up = self.s.m.bin(c, Bin::And, tie, odd);
+        let up = self.s.m.bin(c, Bin::Or, above, tie_up);
+        let r = self.s.m.select(c, up, k1, k0);
+        let r = self.s.m.bin(c, Bin::Add, q, r);
+        // |x| >= 1 (and infinity) saturates; NaN gives 0.
+        let one_f = k(self, 0x3F80_0000);
+        let big = self.s.m.cmp(c, pred::IUGE, mag, one_f);
+        let ksc = k(self, scale as u32);
+        let r = self.s.m.select(c, big, ksc, r);
+        let inf = k(self, 0x7F80_0000);
+        let nan = self.s.m.cmp(c, pred::IUGT, mag, inf);
+        let r = self.s.m.select(c, nan, k0, r);
+        let r = if signed {
+            let n = self.s.m.bin(c, Bin::Sub, k0, r);
+            self.s.m.select(c, neg, n, r)
+        } else {
+            self.s.m.select(c, neg, k0, r)
+        };
+        let m16 = k(self, 0xFFFF);
+        self.s.m.bin(c, Bin::And, r, m16)
     }
 
     /// Half `high` of source `k` of a packed (VOP3P) operation, in the low
@@ -4903,18 +5423,168 @@ impl<'a> Lower<'a> {
         };
         Ok(match name {
             "v_and_b32" | "v_or_b32" | "v_xor_b32" | "v_add_nc_u32" | "v_sub_nc_u32"
-            | "v_subrev_nc_u32" | "v_mul_lo_u32" => {
+            | "v_subrev_nc_u32" | "v_mul_lo_u32" | "v_add_nc_i32" | "v_sub_nc_i32"
+            | "v_mul_lo_i32" => {
+                // The signed forms differ only with clamp (refused).
                 let (a, b) = (s(self, 0)?, s(self, 1)?);
                 let (op, a, b) = match name {
                     "v_and_b32" => (Bin::And, a, b),
                     "v_or_b32" => (Bin::Or, a, b),
                     "v_xor_b32" => (Bin::Xor, a, b),
-                    "v_add_nc_u32" => (Bin::Add, a, b),
-                    "v_sub_nc_u32" => (Bin::Sub, a, b),
+                    "v_add_nc_u32" | "v_add_nc_i32" => (Bin::Add, a, b),
+                    "v_sub_nc_u32" | "v_sub_nc_i32" => (Bin::Sub, a, b),
                     "v_subrev_nc_u32" => (Bin::Sub, b, a),
                     _ => (Bin::Mul, a, b),
                 };
                 self.s.m.bin(c, op, a, b)
+            }
+            "v_mul_hi_u32_u24" | "v_mul_hi_i32_i24" => {
+                // Bits 32-47 of the 48-bit product of the low 24 bits (zero-
+                // or sign-extended): the high dword of their 64-bit product.
+                let (a, b) = (s(self, 0)?, s(self, 1)?);
+                let signed = name == "v_mul_hi_i32_i24";
+                let (sh, op) = (k(self, 8), if signed { Bin::AShr } else { Bin::LShr });
+                let a = self.s.m.bin(c, Bin::Shl, a, sh);
+                let a = self.s.m.bin(c, op, a, sh);
+                let b = self.s.m.bin(c, Bin::Shl, b, sh);
+                let b = self.s.m.bin(c, op, b, sh);
+                self.mul_hi(a, b, signed)
+            }
+            "v_mad_u32_u16" | "v_mad_i32_i16" => {
+                // 16-bit S0 and S1 (op_sel picks their halves), zero- or
+                // sign-extended, multiplied, plus the 32-bit S2.
+                let (mut a, mut b) = (self.half_src(inst, 0)?, self.half_src(inst, 1)?);
+                if name == "v_mad_i32_i16" {
+                    let k16 = k(self, 16);
+                    for x in [&mut a, &mut b] {
+                        let t = self.s.m.bin(c, Bin::Shl, *x, k16);
+                        *x = self.s.m.bin(c, Bin::AShr, t, k16);
+                    }
+                }
+                let d = s(self, 2)?;
+                let m = self.s.m.bin(c, Bin::Mul, a, b);
+                self.s.m.bin(c, Bin::Add, m, d)
+            }
+            "v_cvt_pk_u16_u32" | "v_cvt_pk_i16_i32" => {
+                // Each source saturated to 16 bits (unsigned, or signed):
+                // S0 into the low half, S1 into the high one.
+                let signed = name == "v_cvt_pk_i16_i32";
+                let mut halves = Vec::new();
+                for i in 0..2 {
+                    let x = s(self, i)?;
+                    let (lo, hi, p_lo, p_hi) = if signed {
+                        (-32768i32 as u32, 32767, pred::SLT, pred::SGT)
+                    } else {
+                        (0, 0xFFFF, pred::IULT, pred::IUGT)
+                    };
+                    let (lo, hi) = (k(self, lo), k(self, hi));
+                    let below = self.s.m.cmp(c, p_lo, x, lo);
+                    let x = self.s.m.select(c, below, lo, x);
+                    let above = self.s.m.cmp(c, p_hi, x, hi);
+                    let x = self.s.m.select(c, above, hi, x);
+                    let m = k(self, 0xFFFF);
+                    halves.push(self.s.m.bin(c, Bin::And, x, m));
+                }
+                let k16 = k(self, 16);
+                let hi = self.s.m.bin(c, Bin::Shl, halves[1], k16);
+                self.s.m.bin(c, Bin::Or, halves[0], hi)
+            }
+            "v_sad_u8" | "v_sad_hi_u8" | "v_sad_u16" | "v_sad_u32" => {
+                // Sums of absolute differences of the bytes (halves, the
+                // dwords) of S0 and S1, plus S2; sad_hi adds the byte sum
+                // shifted up by 16. Wrapping.
+                let (a, b, d) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
+                let width = match name {
+                    "v_sad_u16" => 16,
+                    "v_sad_u32" => 32,
+                    _ => 8,
+                };
+                let mut sum = k(self, 0);
+                for i in 0..32 / width {
+                    let (x, y) = if width == 32 {
+                        (a, b)
+                    } else {
+                        let (sh, m) = (k(self, width * i), k(self, (1 << width) - 1));
+                        let x = self.s.m.bin(c, Bin::LShr, a, sh);
+                        let x = self.s.m.bin(c, Bin::And, x, m);
+                        let y = self.s.m.bin(c, Bin::LShr, b, sh);
+                        (x, self.s.m.bin(c, Bin::And, y, m))
+                    };
+                    let gt = self.s.m.cmp(c, pred::IUGT, x, y);
+                    let xy = self.s.m.bin(c, Bin::Sub, x, y);
+                    let yx = self.s.m.bin(c, Bin::Sub, y, x);
+                    let diff = self.s.m.select(c, gt, xy, yx);
+                    sum = self.s.m.bin(c, Bin::Add, sum, diff);
+                }
+                if name == "v_sad_hi_u8" {
+                    let k16 = k(self, 16);
+                    sum = self.s.m.bin(c, Bin::Shl, sum, k16);
+                }
+                self.s.m.bin(c, Bin::Add, sum, d)
+            }
+            "v_lerp_u8" => {
+                // Per byte: (S0 + S1 + bit 0 of S2's byte) >> 1, the rounded
+                // average.
+                let (a, b, d) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
+                let (ff, one) = (k(self, 0xFF), k(self, 1));
+                let mut r = k(self, 0);
+                for i in 0..4 {
+                    let sh = k(self, 8 * i);
+                    let x = self.s.m.bin(c, Bin::LShr, a, sh);
+                    let x = self.s.m.bin(c, Bin::And, x, ff);
+                    let y = self.s.m.bin(c, Bin::LShr, b, sh);
+                    let y = self.s.m.bin(c, Bin::And, y, ff);
+                    let z = self.s.m.bin(c, Bin::LShr, d, sh);
+                    let z = self.s.m.bin(c, Bin::And, z, one);
+                    let t = self.s.m.bin(c, Bin::Add, x, y);
+                    let t = self.s.m.bin(c, Bin::Add, t, z);
+                    let t = self.s.m.bin(c, Bin::LShr, t, one);
+                    let t = self.s.m.bin(c, Bin::Shl, t, sh);
+                    r = self.s.m.bin(c, Bin::Or, r, t);
+                }
+                r
+            }
+            "v_dot4_u32_u8" | "v_dot4_i32_i8" | "v_dot2_u32_u16" | "v_dot2_i32_i16"
+            | "v_dot8_u32_u4" | "v_dot8_i32_i4" | "v_dot4c_i32_i8" => {
+                // The products of S0's and S1's packed fields (zero- or
+                // sign-extended), summed with S2 (the `c` form: the
+                // destination), wrapping. op_sel has no say over fields
+                // narrower than a half; for 16-bit fields only the plain
+                // halves are taken.
+                let Fields::Valu(v) = &inst.fields else {
+                    unreachable!()
+                };
+                let width: u32 = match &name[5..6] {
+                    "2" => 16,
+                    "4" => 8,
+                    _ => 4,
+                };
+                if v.neg_hi != 0 || (width == 16 && (v.opsel != 0 || v.opsel_hi & 3 != 3)) {
+                    return Err("a dot product with modifiers");
+                }
+                let signed = name.contains("_i32_");
+                let (a, b) = (s(self, 0)?, s(self, 1)?);
+                let mut sum = if name == "v_dot4c_i32_i8" {
+                    let Some(Operand::Vector { reg, .. }) = v.dst else {
+                        return Err("an accumulator");
+                    };
+                    self.i32_of(inst.read(Reg::V(reg)).ok_or("an accumulator")?)?
+                } else {
+                    s(self, 2)?
+                };
+                for i in 0..32 / width {
+                    // Field i at the top, then down: sign or zero fill.
+                    let up = k(self, 32 - width * (i + 1));
+                    let down = k(self, 32 - width);
+                    let op = if signed { Bin::AShr } else { Bin::LShr };
+                    let x = self.s.m.bin(c, Bin::Shl, a, up);
+                    let x = self.s.m.bin(c, op, x, down);
+                    let y = self.s.m.bin(c, Bin::Shl, b, up);
+                    let y = self.s.m.bin(c, op, y, down);
+                    let p = self.s.m.bin(c, Bin::Mul, x, y);
+                    sum = self.s.m.bin(c, Bin::Add, sum, p);
+                }
+                sum
             }
             "v_xnor_b32" => {
                 let (a, b) = (s(self, 0)?, s(self, 1)?);

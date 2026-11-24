@@ -57,6 +57,39 @@ pub(super) const fn vop3(op: u16, vdst: u8, src0: u16, src1: u16, src2: u16) -> 
     ]
 }
 
+/// VOP3B `op vdst, sdst, src0, src1, src2` (no modifiers): the VOP3 form
+/// with a scalar destination (a carry or a lane mask) in bits 8-14.
+pub(super) const fn vop3b(
+    op: u16,
+    vdst: u8,
+    sdst: u8,
+    src0: u16,
+    src1: u16,
+    src2: u16,
+) -> [u32; 2] {
+    let [w0, w1] = vop3(op, vdst, src0, src1, src2);
+    [w0 | (sdst as u32 & 0x7F) << 8, w1]
+}
+
+/// VOP3P `op vdst, src0, src1, src2` with the default op_sel_hi (each
+/// source's high half for the high result) and no other modifiers.
+pub(super) const fn vop3p(op: u8, vdst: u8, src0: u16, src1: u16, src2: u16) -> [u32; 2] {
+    [
+        0x33 << 26 | (op as u32 & 0x7F) << 16 | 1 << 14 | vdst as u32,
+        (src0 as u32 & 0x1FF) | (src1 as u32 & 0x1FF) << 9 | (src2 as u32 & 0x1FF) << 18 | 3 << 27,
+    ]
+}
+
+/// SOPK `op sdst, simm16`.
+pub(super) const fn sopk(op: u8, sdst: u8, imm: u16) -> u32 {
+    0xB000_0000 | (op as u32 & 0x1F) << 23 | (sdst as u32 & 0x7F) << 16 | imm as u32
+}
+
+/// SOPC `op src0, src1`.
+pub(super) const fn sopc(op: u8, src0: u8, src1: u8) -> u32 {
+    0xBF00_0000 | (op as u32 & 0x7F) << 16 | (src1 as u32) << 8 | src0 as u32
+}
+
 /// MUBUF `buffer_store_dword vdata, off, s[srsrc:srsrc+3], 0 offset:byte_off`.
 pub(super) const fn buffer_store_dword(vdata: u8, srsrc: u8, byte_off: u16) -> [u32; 2] {
     [

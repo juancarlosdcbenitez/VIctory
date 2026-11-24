@@ -8,13 +8,17 @@
 //! against references written from AMD's RDNA2 ISA descriptions.
 
 use super::bitcode::eval::f16_to_f32;
-use super::synth::{LITERAL, eval_cases, lower_valu, sgpr, sop1, sop2, vgpr, vop1, vop2, vop3};
+use super::synth::{
+    LITERAL, eval_cases, lower_valu, sgpr, sop1, sop2, sopc, sopk, vgpr, vop1, vop2, vop3, vop3b,
+    vop3p,
+};
 
 /// A named instruction with its opcode and a reference, in test tables.
 type Op1 = (&'static str, u16, fn(u32) -> u32);
 type Op3 = (&'static str, u16, fn(u32, u32, u32) -> u32);
 type Sop1 = (&'static str, u8, fn(u32) -> u32);
 type Sop2 = (&'static str, u8, fn(u32, u32) -> u32);
+type SccOp = (&'static str, u8, fn(u32, u32) -> bool);
 
 /// Runs `body` for each case and compares `v0` with `want(inputs)`.
 fn check_v0(what: &str, body: &[u32], cases: &[[u32; 4]], want: impl Fn([u32; 4]) -> u32) {
@@ -524,4 +528,547 @@ fn programs_lower_for_the_evaluator() {
     let l = lower_valu(&[]).expect("an empty body lowers");
     let got = super::synth::eval_valu(&l, [1, 2, 3, 4]).expect("runs");
     assert_eq!(got, [0, 0, 0, 0], "v0, v5-v7 start at zero");
+}
+
+// --- Instructions added with the evaluator --------------------------------
+
+/// The null SGPR (no carry out).
+const NULL: u8 = 0x7D;
+
+fn sext(bits: u32, x: u32) -> i32 {
+    ((x << (32 - bits)) as i32) >> (32 - bits)
+}
+
+#[test]
+fn added_integer_ops_match_references() {
+    let cases = pairs();
+    let ops: &[Op3] = &[
+        ("v_mul_hi_u32_u24", 0x10c, |a, b, _| {
+            ((u64::from(a & 0xFF_FFFF) * u64::from(b & 0xFF_FFFF)) >> 32) as u32
+        }),
+        ("v_mul_hi_i32_i24", 0x10a, |a, b, _| {
+            ((i64::from(sext(24, a)) * i64::from(sext(24, b))) >> 32) as u32
+        }),
+        ("v_add_nc_i32", 0x37f, |a, b, _| a.wrapping_add(b)),
+        ("v_sub_nc_i32", 0x376, |a, b, _| a.wrapping_sub(b)),
+        ("v_mul_lo_i32", 0x16b, |a, b, _| a.wrapping_mul(b)),
+        ("v_mad_u32_u16", 0x373, |a, b, c| {
+            (a & 0xFFFF).wrapping_mul(b & 0xFFFF).wrapping_add(c)
+        }),
+        ("v_mad_i32_i16", 0x375, |a, b, c| {
+            sext(16, a).wrapping_mul(sext(16, b)).wrapping_add(c as i32) as u32
+        }),
+        ("v_cvt_pk_u16_u32", 0x36a, |a, b, _| {
+            a.min(0xFFFF) | b.min(0xFFFF) << 16
+        }),
+        ("v_cvt_pk_i16_i32", 0x36b, |a, b, _| {
+            let sat = |x: u32| (x as i32).clamp(-32768, 32767) as u32 & 0xFFFF;
+            sat(a) | sat(b) << 16
+        }),
+        ("v_sad_u8", 0x15a, |a, b, c| {
+            let d: u32 = (0..4)
+                .map(|i| ((a >> (8 * i)) & 0xFF).abs_diff((b >> (8 * i)) & 0xFF))
+                .sum();
+            d.wrapping_add(c)
+        }),
+        ("v_sad_hi_u8", 0x15b, |a, b, c| {
+            let d: u32 = (0..4)
+                .map(|i| ((a >> (8 * i)) & 0xFF).abs_diff((b >> (8 * i)) & 0xFF))
+                .sum();
+            (d << 16).wrapping_add(c)
+        }),
+        ("v_sad_u16", 0x15c, |a, b, c| {
+            let d = (a & 0xFFFF).abs_diff(b & 0xFFFF) + (a >> 16).abs_diff(b >> 16);
+            d.wrapping_add(c)
+        }),
+        ("v_sad_u32", 0x15d, |a, b, c| a.abs_diff(b).wrapping_add(c)),
+        ("v_lerp_u8", 0x14d, |a, b, c| {
+            (0..4)
+                .map(|i| {
+                    let f = |x: u32| (x >> (8 * i)) & 0xFF;
+                    ((f(a) + f(b) + (f(c) & 1)) >> 1) << (8 * i)
+                })
+                .sum()
+        }),
+    ];
+    for &(name, op, reference) in ops {
+        check_v0(
+            name,
+            &vop3(op, 0, vgpr(1), vgpr(2), vgpr(3)),
+            &cases,
+            |[a, b, c, _]| reference(a, b, c),
+        );
+    }
+}
+
+#[test]
+fn added_16_bit_integer_ops_match_references() {
+    let cases = pairs();
+    let ops: &[Op3] = &[
+        ("v_add_nc_i16", 0x30d, |a, b, _| a.wrapping_add(b)),
+        ("v_sub_nc_i16", 0x30e, |a, b, _| a.wrapping_sub(b)),
+        ("v_mad_u16", 0x340, |a, b, c| {
+            a.wrapping_mul(b).wrapping_add(c)
+        }),
+        ("v_mad_i16", 0x35e, |a, b, c| {
+            a.wrapping_mul(b).wrapping_add(c)
+        }),
+        ("v_min3_u16", 0x353, |a, b, c| {
+            (a & 0xFFFF).min(b & 0xFFFF).min(c & 0xFFFF)
+        }),
+        ("v_max3_u16", 0x356, |a, b, c| {
+            (a & 0xFFFF).max(b & 0xFFFF).max(c & 0xFFFF)
+        }),
+        ("v_min3_i16", 0x352, |a, b, c| {
+            sext(16, a).min(sext(16, b)).min(sext(16, c)) as u32
+        }),
+        ("v_max3_i16", 0x355, |a, b, c| {
+            sext(16, a).max(sext(16, b)).max(sext(16, c)) as u32
+        }),
+        ("v_med3_u16", 0x359, |a, b, c| {
+            let mut v = [a & 0xFFFF, b & 0xFFFF, c & 0xFFFF];
+            v.sort_unstable();
+            v[1]
+        }),
+        ("v_med3_i16", 0x358, |a, b, c| {
+            let mut v = [sext(16, a), sext(16, b), sext(16, c)];
+            v.sort_unstable();
+            v[1] as u32
+        }),
+    ];
+    for &(name, op, reference) in ops {
+        // The result is the low half; v0's high half (zero) is kept.
+        check_v0(
+            name,
+            &vop3(op, 0, vgpr(1), vgpr(2), vgpr(3)),
+            &cases,
+            |[a, b, c, _]| reference(a, b, c) & 0xFFFF,
+        );
+    }
+}
+
+#[test]
+fn v_mad_u64_u32_and_v_mad_i64_i32_match_references() {
+    // v_mad_*64_*32 v[6:7], null, v1, v2, v[3:4]: the addend is inputs 2-3.
+    let mut cases = pairs();
+    cases
+        .iter_mut()
+        .enumerate()
+        .for_each(|(i, c)| c[3] = DWORDS[i % DWORDS.len()]);
+    let got_u = eval_cases(&vop3b(0x176, 6, NULL, vgpr(1), vgpr(2), vgpr(3)), &cases);
+    let got_i = eval_cases(&vop3b(0x177, 6, NULL, vgpr(1), vgpr(2), vgpr(3)), &cases);
+    for ((c, u), i) in cases.iter().zip(got_u).zip(got_i) {
+        let addend = u64::from(c[2]) | u64::from(c[3]) << 32;
+        let want_u = (u64::from(c[0]) * u64::from(c[1])).wrapping_add(addend);
+        let want_i =
+            (i64::from(c[0] as i32) * i64::from(c[1] as i32)).wrapping_add(addend as i64) as u64;
+        let got = |r: [u32; 4]| u64::from(r[2]) | u64::from(r[3]) << 32;
+        assert_eq!(got(u), want_u, "v_mad_u64_u32{c:08x?}");
+        assert_eq!(got(i), want_i, "v_mad_i64_i32{c:08x?}");
+    }
+    // The carry out (s20), selected into v0.
+    let mut body = vop3b(0x176, 6, 20, vgpr(1), vgpr(2), vgpr(3)).to_vec();
+    body.extend_from_slice(&vop3(0x101, 0, 0x80, 0x81, sgpr(20)));
+    check_v0("v_mad_u64_u32 carry", &body, &cases, |[a, b, lo, hi]| {
+        let sum = u128::from(a) * u128::from(b) + (u128::from(hi) << 32 | u128::from(lo));
+        u32::from(sum > u128::from(u64::MAX))
+    });
+}
+
+/// A spread of f32 bit patterns: zeros, denormals, normals around 1, the
+/// largest finite, infinities, NaNs.
+const FLOATS: [u32; 18] = [
+    0x0000_0000,
+    0x8000_0000,
+    0x0000_0001,
+    0x807F_FFFF,
+    0x0080_0000,
+    0x3F00_0000, // 0.5
+    0x3F80_0000, // 1
+    0xBF80_0000, // -1
+    0x3F7F_FFFF,
+    0x4049_0FDB, // pi
+    0xC2F6_E979, // -123.456
+    0x3E99_999A, // 0.3
+    0x7F7F_FFFF,
+    0xFF7F_FFFF,
+    0x7F80_0000,
+    0xFF80_0000,
+    0x7FC0_0000,
+    0x3F2A_AAAB, // 2/3
+];
+
+#[test]
+fn v_ldexp_f32_matches_a_reference() {
+    let exps: [i32; 16] = [
+        0,
+        1,
+        -1,
+        23,
+        -23,
+        126,
+        -126,
+        127,
+        -127,
+        149,
+        -149,
+        254,
+        -254,
+        300,
+        i32::MAX,
+        i32::MIN,
+    ];
+    let mut cases = Vec::new();
+    for &x in &FLOATS {
+        for &n in &exps {
+            cases.push([x, n as u32, 0, 0]);
+        }
+    }
+    let got = eval_cases(&vop3(0x362, 0, vgpr(1), vgpr(2), 0), &cases);
+    for (c, got) in cases.iter().zip(got) {
+        let x = f32::from_bits(c[0]);
+        let n = (c[1] as i32).clamp(-400, 400);
+        // Exact in f64, then rounded once.
+        let want = (f64::from(x) * 2f64.powi(n)) as f32;
+        let got = f32::from_bits(got[0]);
+        if want.is_nan() {
+            assert!(got.is_nan(), "ldexp({x:e}, {n}) = {got:e}");
+        } else if want.is_subnormal() {
+            // Two roundings are allowed for denormal results.
+            let ulps = (got.to_bits() as i64 - want.to_bits() as i64).abs();
+            assert!(ulps <= 1, "ldexp({x:e}, {n}) = {got:e}, want {want:e}");
+        } else {
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "ldexp({x:e}, {n}) = {got:e}, want {want:e}"
+            );
+        }
+    }
+}
+
+#[test]
+fn v_frexp_f32_matches_a_reference() {
+    let cases: Vec<[u32; 4]> = FLOATS.iter().map(|&x| [x, 0, 0, 0]).collect();
+    let mant = eval_cases(&[vop1(0x040, 0, vgpr(1))], &cases);
+    let exp = eval_cases(&[vop1(0x03f, 0, vgpr(1))], &cases);
+    for ((c, m), e) in cases.iter().zip(mant).zip(exp) {
+        let x = f32::from_bits(c[0]);
+        // Through f64, where every f32 (denormals too) is normal.
+        let (want_m, want_e) = if x == 0.0 || !x.is_finite() {
+            (x, 0)
+        } else {
+            let bits = f64::from(x).to_bits();
+            let e = ((bits >> 52) & 0x7FF) as i32 - 1022;
+            ((f64::from(x) / 2f64.powi(e)) as f32, e)
+        };
+        let got_m = f32::from_bits(m[0]);
+        if want_m.is_nan() {
+            assert!(got_m.is_nan(), "frexp_mant({x:e}) = {got_m:e}");
+        } else {
+            assert_eq!(
+                got_m.to_bits(),
+                want_m.to_bits(),
+                "frexp_mant({x:e}) = {got_m:e}"
+            );
+        }
+        assert_eq!(e[0] as i32, want_e, "frexp_exp({x:e})");
+    }
+}
+
+#[test]
+fn v_cvt_pknorm_f32_match_a_reference() {
+    let mut extra = vec![
+        0x3F00_0000u32, // 0.5: 16383.5 rounds to even
+        0xBF00_0000,
+        0x3E80_0000, // 0.25
+        0x3800_0000, // 2^-15
+        0x3780_0000, // 2^-16
+        0x477F_FF00, // 65535
+    ];
+    extra.extend(FLOATS);
+    let mut cases = Vec::new();
+    for &a in &extra {
+        for &b in &[0x3F80_0000u32, 0x3E99_999A, 0xBE99_999A] {
+            cases.push([a, b, 0, 0]);
+        }
+    }
+    let norm = |x: u32, signed: bool| -> u32 {
+        let x = f32::from_bits(x);
+        if x.is_nan() {
+            return 0;
+        }
+        let (lo, scale) = if signed {
+            (-1.0, 32767.0)
+        } else {
+            (0.0, 65535.0)
+        };
+        // Exact in f64 (24 + 16 bits), rounded once.
+        let p = f64::from(x.clamp(lo, 1.0)) * scale;
+        (p.round_ties_even() as i32) as u32 & 0xFFFF
+    };
+    for (op, signed) in [(0x368u16, true), (0x369, false)] {
+        check_v0(
+            if signed {
+                "v_cvt_pknorm_i16_f32"
+            } else {
+                "v_cvt_pknorm_u16_f32"
+            },
+            &vop3(op, 0, vgpr(1), vgpr(2), 0),
+            &cases,
+            |[a, b, ..]| norm(a, signed) | norm(b, signed) << 16,
+        );
+    }
+}
+
+#[test]
+fn dot_products_match_references() {
+    let cases = pairs();
+    let field = |x: u32, width: u32, i: u32, signed: bool| -> i64 {
+        let f = (x >> (width * i)) & ((1u64 << width) - 1) as u32;
+        if signed {
+            i64::from(sext(width, f))
+        } else {
+            i64::from(f)
+        }
+    };
+    let dot = |a: u32, b: u32, width: u32, signed: bool| -> u32 {
+        (0..32 / width)
+            .map(|i| field(a, width, i, signed) * field(b, width, i, signed))
+            .sum::<i64>() as u32
+    };
+    for (name, op, width, signed) in [
+        ("v_dot2_i32_i16", 0x14u8, 16u32, true),
+        ("v_dot2_u32_u16", 0x15, 16, false),
+        ("v_dot4_i32_i8", 0x16, 8, true),
+        ("v_dot4_u32_u8", 0x17, 8, false),
+        ("v_dot8_u32_u4", 0x19, 4, false),
+    ] {
+        check_v0(
+            name,
+            &vop3p(op, 0, vgpr(1), vgpr(2), vgpr(3)),
+            &cases,
+            |[a, b, c, _]| dot(a, b, width, signed).wrapping_add(c),
+        );
+    }
+    // v_mov_b32 v0, v3; v_dot4c_i32_i8 v0, v1, v2 (accumulates into v0).
+    check_v0(
+        "v_dot4c_i32_i8",
+        &[vop1(0x001, 0, vgpr(3)), vop2(0x0d, 0, vgpr(1), 2)],
+        &cases,
+        |[a, b, c, _]| dot(a, b, 8, true).wrapping_add(c),
+    );
+}
+
+#[test]
+fn added_scalar_ops_match_references() {
+    let cases = pairs();
+    let sop1_ops: &[Sop1] = &[
+        ("s_sext_i32_i8", 0x19, |x| sext(8, x) as u32),
+        ("s_sext_i32_i16", 0x1a, |x| sext(16, x) as u32),
+        ("s_bcnt0_i32_b32", 0x0d, u32::count_zeros),
+        ("s_ff0_i32_b32", 0x11, |x| {
+            if x == u32::MAX {
+                u32::MAX
+            } else {
+                x.trailing_ones()
+            }
+        }),
+    ];
+    for &(name, op, reference) in sop1_ops {
+        check_v0(
+            name,
+            &[sop1(op, 6, 0), vop1(0x001, 0, sgpr(6))],
+            &cases,
+            |[a, ..]| reference(a),
+        );
+    }
+    let sop2_ops: &[Sop2] = &[
+        ("s_absdiff_i32", 0x2c, |a, b| {
+            (a as i32).wrapping_sub(b as i32).wrapping_abs() as u32
+        }),
+        ("s_pack_ll_b32_b16", 0x32, |a, b| a & 0xFFFF | b << 16),
+        ("s_pack_lh_b32_b16", 0x33, |a, b| {
+            a & 0xFFFF | b & 0xFFFF_0000
+        }),
+        ("s_pack_hh_b32_b16", 0x34, |a, b| a >> 16 | b & 0xFFFF_0000),
+    ];
+    for &(name, op, reference) in sop2_ops {
+        check_v0(
+            name,
+            &[sop2(op, 6, 0, 1), vop1(0x001, 0, sgpr(6))],
+            &cases,
+            |[a, b, ..]| reference(a, b),
+        );
+    }
+}
+
+/// Runs a scalar body leaving a 64-bit result in s[6:7] (v6, v7) and
+/// compares it with `want(s[0:1], s2)`.
+fn check_s64(what: &str, body: &[u32], want: impl Fn(u64, u32) -> u64) {
+    let mut full = body.to_vec();
+    full.extend([vop1(0x001, 6, sgpr(6)), vop1(0x001, 7, sgpr(7))]);
+    let mut cases = Vec::new();
+    for &a in &DWORDS {
+        for &b in &[0u32, 1, 0x8000_0000, 0xFFFF_FFFF, 0x0F0F_1234] {
+            for &c in &[
+                0u32,
+                1,
+                31,
+                32,
+                33,
+                63,
+                64,
+                0x0008_0004,
+                0x0020_0010,
+                0x0040_0020,
+                0x007F_003F,
+            ] {
+                cases.push([a, b, c, 0]);
+            }
+        }
+    }
+    for (c, got) in cases.iter().zip(eval_cases(&full, &cases)) {
+        let x = u64::from(c[0]) | u64::from(c[1]) << 32;
+        let want = want(x, c[2]);
+        let got = u64::from(got[2]) | u64::from(got[3]) << 32;
+        assert_eq!(got, want, "{what}(s[0:1] = {x:#018x}, s2 = {:#x})", c[2]);
+    }
+}
+
+#[test]
+fn added_64_bit_scalar_ops_match_references() {
+    check_s64("s_bfm_b64", &[sop2(0x25, 6, 2, 0)], |x, c| {
+        // S0 = s2 (width), S1 = s0 (offset).
+        let (w, o) = (c & 63, (x as u32) & 63);
+        ((1u64 << w).wrapping_sub(1)) << o
+    });
+    let bfe = |x: u64, c: u32, signed: bool| -> u64 {
+        let (o, w) = (c & 63, (c >> 16) & 0x7F);
+        if w == 0 {
+            return 0;
+        }
+        if w + o >= 64 {
+            return if signed {
+                ((x as i64) >> o) as u64
+            } else {
+                x >> o
+            };
+        }
+        let t = x << (64 - w - o);
+        if signed {
+            ((t as i64) >> (64 - w)) as u64
+        } else {
+            t >> (64 - w)
+        }
+    };
+    check_s64("s_bfe_u64", &[sop2(0x29, 6, 0, 2)], move |x, c| {
+        bfe(x, c, false)
+    });
+    check_s64("s_bfe_i64", &[sop2(0x2a, 6, 0, 2)], move |x, c| {
+        bfe(x, c, true)
+    });
+    check_s64("s_brev_b64", &[sop1(0x0c, 6, 0)], |x, _| x.reverse_bits());
+    check_s64(
+        "s_bitset0_b64",
+        &[sop1(0x03, 6, 0), sop1(0x03, 7, 1), sop1(0x1c, 6, 2)],
+        |x, c| x & !(1u64 << (c & 63)),
+    );
+    check_s64(
+        "s_bitset1_b64",
+        &[sop1(0x03, 6, 0), sop1(0x03, 7, 1), sop1(0x1e, 6, 2)],
+        |x, c| x | 1u64 << (c & 63),
+    );
+    check_s64("s_bitreplicate_b64_b32", &[sop1(0x3b, 6, 2)], |_, c| {
+        (0..32).fold(0u64, |r, i| r | (u64::from(c >> i & 1) * 3) << (2 * i))
+    });
+    // s_cmp_lg_u32 s2, 0 sets SCC; s_cmov_b64 s[6:7], s[0:1] moves on it
+    // over s[6:7] = 0 (never written: zero).
+    check_s64(
+        "s_cmov_b64",
+        &[sopc(0x07, 2, 0x80), sop1(0x06, 6, 0)],
+        |x, c| {
+            if c != 0 { x } else { 0 }
+        },
+    );
+    // 32-bit results of 64-bit sources, in s6 (s7 never written: zero).
+    check_s64("s_bcnt0_i32_b64", &[sop1(0x0e, 6, 0)], |x, _| {
+        u64::from(x.count_zeros())
+    });
+    check_s64("s_ff0_i32_b64", &[sop1(0x12, 6, 0)], |x, _| {
+        if x == u64::MAX {
+            0xFFFF_FFFF
+        } else {
+            u64::from(x.trailing_ones())
+        }
+    });
+    check_s64("s_flbit_i32_b64", &[sop1(0x16, 6, 0)], |x, _| {
+        if x == 0 {
+            0xFFFF_FFFF
+        } else {
+            u64::from(x.leading_zeros())
+        }
+    });
+    check_s64("s_flbit_i32_i64", &[sop1(0x18, 6, 0)], |x, _| {
+        let y = if (x as i64) < 0 { !x } else { x };
+        if y == 0 {
+            0xFFFF_FFFF
+        } else {
+            u64::from(y.leading_zeros())
+        }
+    });
+}
+
+#[test]
+fn scalar_conditional_moves_follow_scc() {
+    // s_cmp_eq_u32 s0, s1; s_mov_b32 s6, s2; s_cmov_b32 s6, s3 / s_cmovk_i32 s6, -5.
+    let cases = pairs();
+    let mut cmov = vec![sopc(0x06, 0, 1), sop1(0x03, 6, 2), sop1(0x05, 6, 3)];
+    cmov.push(vop1(0x001, 0, sgpr(6)));
+    check_v0(
+        "s_cmov_b32",
+        &cmov,
+        &cases,
+        |[a, b, c, d]| if a == b { d } else { c },
+    );
+    let mut cmovk = vec![sopc(0x06, 0, 1), sop1(0x03, 6, 2), sopk(0x02, 6, 0xFFFB)];
+    cmovk.push(vop1(0x001, 0, sgpr(6)));
+    check_v0("s_cmovk_i32", &cmovk, &cases, |[a, b, c, _]| {
+        if a == b { (-5i32) as u32 } else { c }
+    });
+}
+
+/// SCC after `s_min_*` and `s_max_*` is the comparison, and after
+/// `s_lshl*_add_u32` the unsigned overflow (RDNA2 ISA), not "the result is
+/// not zero" (what the lowering wrote before).
+#[test]
+fn scalar_scc_follows_the_isa() {
+    let cases = pairs();
+    // op s6, s0, s1; s_cselect_b32 s7, 1, 0; v_mov_b32 v0, s7.
+    let ops: &[SccOp] = &[
+        ("s_min_u32", 0x07, |a, b| a < b),
+        ("s_min_i32", 0x06, |a, b| (a as i32) < (b as i32)),
+        ("s_max_u32", 0x09, |a, b| a > b),
+        ("s_max_i32", 0x08, |a, b| (a as i32) > (b as i32)),
+        ("s_lshl1_add_u32", 0x2e, |a, b| {
+            (u64::from(a) << 1) + u64::from(b) > 0xFFFF_FFFF
+        }),
+        ("s_lshl2_add_u32", 0x2f, |a, b| {
+            (u64::from(a) << 2) + u64::from(b) > 0xFFFF_FFFF
+        }),
+        ("s_lshl4_add_u32", 0x31, |a, b| {
+            (u64::from(a) << 4) + u64::from(b) > 0xFFFF_FFFF
+        }),
+        ("s_absdiff_i32", 0x2c, |a, b| a != b),
+    ];
+    for &(name, op, reference) in ops {
+        let body = [
+            sop2(op, 6, 0, 1),
+            sop2(0x0a, 7, 0x81, 0x80),
+            vop1(0x001, 0, sgpr(7)),
+        ];
+        check_v0(&format!("SCC of {name}"), &body, &cases, |[a, b, ..]| {
+            u32::from(reference(a, b))
+        });
+    }
 }
