@@ -4293,6 +4293,50 @@ impl<'a> Lower<'a> {
                 let r = self.s.m.select(c, none, z, r);
                 int(self, r)
             }
+            "v_dot2_f32_f16" | "v_dot2c_f32_f16" => {
+                // S0.f16[0] * S1.f16[0] + S0.f16[1] * S1.f16[1] + S2 (the c
+                // form: the destination), in f32: the f16 products are
+                // exact there.
+                // shortcut: the two additions round separately (the
+                // hardware may round the three-term sum once).
+                if v.neg != 0 || v.neg_hi != 0 || v.opsel != 0 {
+                    return Err("a dot product with modifiers");
+                }
+                if inst.machine.encoding == crate::gfx10::Encoding::Vop3p && v.opsel_hi & 3 != 3 {
+                    return Err("a dot product with modifiers");
+                }
+                let (a, bb) = (s(self, 0)?, s(self, 1)?);
+                let acc = if name == "v_dot2c_f32_f16" {
+                    let Some(Operand::Vector { reg, .. }) = v.dst else {
+                        return Err("an accumulator");
+                    };
+                    let acc = inst.read(Reg::V(reg)).ok_or("an accumulator")?;
+                    self.float_of(acc)?
+                } else {
+                    f(self, 2)?
+                };
+                let f32t = self.s.t.f32;
+                let mut sum = None;
+                for high in [false, true] {
+                    let half = |l: &mut Self, x: V| {
+                        let x = if high {
+                            let k16 = l.s.m.i32(16);
+                            l.s.m.bin(c, Bin::LShr, x, k16)
+                        } else {
+                            x
+                        };
+                        l.s.op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x])
+                    };
+                    let (x, y) = (half(self, a), half(self, bb));
+                    let p = self.s.m.bin(c, Bin::Mul, x, y);
+                    sum = Some(match sum {
+                        Some(t) => self.s.m.bin(c, Bin::Add, t, p),
+                        None => p,
+                    });
+                }
+                let r = self.s.m.bin(c, Bin::Add, sum.expect("two products"), acc);
+                float(self, r)
+            }
             "v_cvt_pknorm_i16_f32" | "v_cvt_pknorm_u16_f32" => {
                 // Each f32 to a normalised 16-bit value (S0 low, S1 high),
                 // as `v_cvt_norm_*16_f16` does for f16.
@@ -4592,8 +4636,19 @@ impl<'a> Lower<'a> {
                 } else {
                     None
                 };
-                let (r, carry) = self.add_sub_carry(c, name.starts_with("v_add"), a, bb, cin);
-                int(self, r)?;
+                let add = name.starts_with("v_add");
+                let (r, carry) = self.add_sub_carry(c, add, a, bb, cin);
+                if v.clamp && v.omod == 0 {
+                    // Clamp saturates where the carry (borrow) leaves.
+                    let edge = self.s.m.i32(if add { u32::MAX } else { 0 });
+                    let r = self.s.m.select(c, carry, edge, r);
+                    let Some(Operand::Vector { reg, .. }) = v.dst else {
+                        return Err("a result without a register");
+                    };
+                    self.write(inst, Reg::V(reg), r, guard);
+                } else {
+                    int(self, r)?;
+                }
                 if let Some(Operand::Scalar { code, .. }) = v.carry
                     && let Some(w) = inst.write(Reg::S(code))
                 {
@@ -4657,11 +4712,132 @@ impl<'a> Lower<'a> {
                 );
                 int(self, r)
             }
+            _ if v.clamp && v.omod == 0 && self.saturates(name) => {
+                // Integer clamp: the result saturated at its type's range.
+                let r = self.saturated(inst, name)?;
+                let Some(Operand::Vector { reg, .. }) = v.dst else {
+                    return Err("a result without a register");
+                };
+                self.write(inst, Reg::V(reg), r, guard);
+                Ok(())
+            }
             _ => {
                 let r = self.integer(inst, name)?;
                 int(self, r)
             }
         }
+    }
+
+    /// Whether [`Self::saturated`] lowers `name` with clamp.
+    fn saturates(&self, name: &str) -> bool {
+        matches!(
+            name,
+            "v_add_nc_u32"
+                | "v_sub_nc_u32"
+                | "v_subrev_nc_u32"
+                | "v_add_nc_i32"
+                | "v_sub_nc_i32"
+                | "v_dot4_u32_u8"
+                | "v_dot4_i32_i8"
+                | "v_dot2_u32_u16"
+                | "v_dot2_i32_i16"
+                | "v_dot8_u32_u4"
+                | "v_dot8_i32_i4"
+        )
+    }
+
+    /// An integer operation with clamp (VOP3): the exact result saturated
+    /// at the destination type's range, unsigned for `_u32`, signed for
+    /// `_i32` results (LLVM's uaddsat, saddsat and the dot intrinsics'
+    /// clamp operand are these).
+    fn saturated(&mut self, inst: &Inst, name: &'static str) -> Result<V, Why> {
+        let c = self.cur;
+        let (a, b) = (self.src(inst, 0)?, self.src(inst, 1)?);
+        let k = |l: &mut Self, x: u32| l.s.m.i32(x);
+        Ok(match name {
+            "v_add_nc_u32" => {
+                // Wrapped below a: the sum carried out.
+                let r = self.s.m.bin(c, Bin::Add, a, b);
+                let over = self.s.m.cmp(c, pred::IULT, r, a);
+                let max = k(self, u32::MAX);
+                self.s.m.select(c, over, max, r)
+            }
+            "v_sub_nc_u32" | "v_subrev_nc_u32" => {
+                let (a, b) = if name == "v_sub_nc_u32" {
+                    (a, b)
+                } else {
+                    (b, a)
+                };
+                let r = self.s.m.bin(c, Bin::Sub, a, b);
+                let under = self.s.m.cmp(c, pred::IULT, a, b);
+                let z = k(self, 0);
+                self.s.m.select(c, under, z, r)
+            }
+            "v_add_nc_i32" | "v_sub_nc_i32" => {
+                // Overflow: the operands' signs (for subtraction, the
+                // minuend's and the negated subtrahend's) agree and the
+                // result's differs; it saturates toward the first's sign.
+                let add = name == "v_add_nc_i32";
+                let r = self.s.m.bin(c, if add { Bin::Add } else { Bin::Sub }, a, b);
+                let ar = self.s.m.bin(c, Bin::Xor, a, r);
+                let other = if add {
+                    self.s.m.bin(c, Bin::Xor, b, r)
+                } else {
+                    self.s.m.bin(c, Bin::Xor, a, b)
+                };
+                let both = self.s.m.bin(c, Bin::And, ar, other);
+                let z = k(self, 0);
+                let over = self.s.m.cmp(c, pred::SLT, both, z);
+                let neg = self.s.m.cmp(c, pred::SLT, a, z);
+                let (min, max) = (k(self, 0x8000_0000), k(self, 0x7FFF_FFFF));
+                let edge = self.s.m.select(c, neg, min, max);
+                self.s.m.select(c, over, edge, r)
+            }
+            _ => {
+                // Dot products: the exact sum in 64 bits, then clamped.
+                let width: u32 = match &name[5..6] {
+                    "2" => 16,
+                    "4" => 8,
+                    _ => 4,
+                };
+                let Fields::Valu(v) = &inst.fields else {
+                    unreachable!()
+                };
+                if v.neg_hi != 0 || (width == 16 && (v.opsel != 0 || v.opsel_hi & 3 != 3)) {
+                    return Err("a dot product with modifiers");
+                }
+                let signed = name.contains("_i32_");
+                let i64t = self.s.m.int(64);
+                self.s.flags |= flags::INT64;
+                let ext = if signed { Cast::SExt } else { Cast::ZExt };
+                let acc = self.src(inst, 2)?;
+                let mut sum = self.s.m.cast(c, ext, acc, i64t);
+                let op = if signed { Bin::AShr } else { Bin::LShr };
+                for i in 0..32 / width {
+                    let up = k(self, 32 - width * (i + 1));
+                    let down = k(self, 32 - width);
+                    let x = self.s.m.bin(c, Bin::Shl, a, up);
+                    let x = self.s.m.bin(c, op, x, down);
+                    let y = self.s.m.bin(c, Bin::Shl, b, up);
+                    let y = self.s.m.bin(c, op, y, down);
+                    let x = self.s.m.cast(c, ext, x, i64t);
+                    let y = self.s.m.cast(c, ext, y, i64t);
+                    let p = self.s.m.bin(c, Bin::Mul, x, y);
+                    sum = self.s.m.bin(c, Bin::Add, sum, p);
+                }
+                let (lo, hi) = if signed {
+                    (i64::from(i32::MIN), i64::from(i32::MAX))
+                } else {
+                    (0, i64::from(u32::MAX))
+                };
+                let (lo, hi) = (self.s.m.int_const(i64t, lo), self.s.m.int_const(i64t, hi));
+                let below = self.s.m.cmp(c, pred::SLT, sum, lo);
+                let sum = self.s.m.select(c, below, lo, sum);
+                let above = self.s.m.cmp(c, pred::SGT, sum, hi);
+                let sum = self.s.m.select(c, above, hi, sum);
+                self.s.m.cast(c, Cast::Trunc, sum, self.s.t.i32)
+            }
+        })
     }
 
     /// A 64-bit source (a register pair; inline constants sign-extend).
@@ -5017,7 +5193,12 @@ impl<'a> Lower<'a> {
             return self.write_half(inst, r, guard);
         }
         // 16-bit integers: computed on the low halves, the low 16 bits kept.
-        if v.clamp || v.omod != 0 || v.abs != 0 || v.neg != 0 {
+        // Clamp saturates the 16-bit sums and differences.
+        let saturating = matches!(
+            name,
+            "v_add_nc_u16" | "v_sub_nc_u16" | "v_add_nc_i16" | "v_sub_nc_i16"
+        );
+        if (v.clamp && !saturating) || v.omod != 0 || v.abs != 0 || v.neg != 0 {
             return Err("modifiers on a 16-bit integer operation");
         }
         let r = match name {
@@ -5122,6 +5303,22 @@ impl<'a> Lower<'a> {
                     }
                 }
             }
+        };
+        // The operands are extended to 32 bits, so the sum or difference
+        // is exact there; clamp saturates it at the 16-bit range.
+        let r = if v.clamp && saturating {
+            let (lo, hi) = if name.ends_with("_i16") {
+                (-32768i32 as u32, 32767)
+            } else {
+                (0, 0xFFFF)
+            };
+            let (lo, hi) = (self.s.m.i32(lo), self.s.m.i32(hi));
+            let below = self.s.m.cmp(c, pred::SLT, r, lo);
+            let r = self.s.m.select(c, below, lo, r);
+            let above = self.s.m.cmp(c, pred::SGT, r, hi);
+            self.s.m.select(c, above, hi, r)
+        } else {
+            r
         };
         self.write_half(inst, r, guard)
     }

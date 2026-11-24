@@ -1877,3 +1877,148 @@ fn multiply_add_operand_orders_match_the_isa() {
         });
     }
 }
+
+/// `words` (a VOP3, VOP3B or VOP3P instruction) with its clamp bit set.
+fn clamped(mut words: [u32; 2]) -> [u32; 2] {
+    words[0] |= 1 << 15;
+    words
+}
+
+#[test]
+fn integer_clamp_saturates_as_the_isa() {
+    let cases = pairs();
+    let ops: &[Op3] = &[
+        ("v_add_nc_u32", 0, |a, b, _| a.saturating_add(b)),
+        ("v_sub_nc_u32", 0, |a, b, _| a.saturating_sub(b)),
+        ("v_subrev_nc_u32", 0, |a, b, _| b.saturating_sub(a)),
+        ("v_add_nc_i32", 0, |a, b, _| {
+            (a as i32).saturating_add(b as i32) as u32
+        }),
+        ("v_sub_nc_i32", 0, |a, b, _| {
+            (a as i32).saturating_sub(b as i32) as u32
+        }),
+        ("v_add_nc_u16", 0, |a, b, _| {
+            (a as u16).saturating_add(b as u16).into()
+        }),
+        ("v_sub_nc_u16", 0, |a, b, _| {
+            (a as u16).saturating_sub(b as u16).into()
+        }),
+        ("v_add_nc_i16", 0, |a, b, _| {
+            u32::from((a as i16).saturating_add(b as i16) as u16)
+        }),
+        ("v_sub_nc_i16", 0, |a, b, _| {
+            u32::from((a as i16).saturating_sub(b as i16) as u16)
+        }),
+    ];
+    for &(name, _, reference) in ops {
+        let body = clamped(vop3(vop3_op(name), 0, vgpr(1), vgpr(2), 0));
+        // 16-bit results land in the low half (the high half, zero, kept).
+        check_v0(&format!("{name} clamp"), &body, &cases, |[a, b, c, _]| {
+            reference(a, b, c)
+        });
+    }
+    // The carry forms: saturated where the carry (borrow) leaves, the
+    // carry itself as without clamp.
+    for (name, add, rev) in [
+        ("v_add_co_u32", true, false),
+        ("v_sub_co_u32", false, false),
+        ("v_subrev_co_u32", false, true),
+    ] {
+        let mut body = clamped(vop3b(vop3_op(name), 0, 20, vgpr(1), vgpr(2), 0)).to_vec();
+        body.extend_from_slice(&vop3(0x101, 5, 0x80, 0x81, sgpr(20)));
+        for (c, got) in cases.iter().zip(eval_cases(&body, &cases)) {
+            let (a, b) = if rev { (c[1], c[0]) } else { (c[0], c[1]) };
+            let (r, carry) = if add {
+                (a.saturating_add(b), a.checked_add(b).is_none())
+            } else {
+                (a.saturating_sub(b), a < b)
+            };
+            assert_eq!(
+                [got[0], got[1]],
+                [r, u32::from(carry)],
+                "{name} clamp{c:08x?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn dot_product_clamp_saturates_the_exact_sum() {
+    let cases = pairs();
+    let field = |x: u32, width: u32, i: u32, signed: bool| -> i64 {
+        let f = (x >> (width * i)) & ((1u64 << width) - 1) as u32;
+        if signed {
+            i64::from(sext(width, f))
+        } else {
+            i64::from(f)
+        }
+    };
+    for (name, op, width, signed) in [
+        ("v_dot2_i32_i16", 0x14u8, 16u32, true),
+        ("v_dot2_u32_u16", 0x15, 16, false),
+        ("v_dot4_i32_i8", 0x16, 8, true),
+        ("v_dot4_u32_u8", 0x17, 8, false),
+        ("v_dot8_u32_u4", 0x19, 4, false),
+    ] {
+        let body = clamped(vop3p(op, 0, vgpr(1), vgpr(2), vgpr(3)));
+        check_v0(&format!("{name} clamp"), &body, &cases, |[a, b, c, _]| {
+            let acc = if signed {
+                i64::from(c as i32)
+            } else {
+                i64::from(c)
+            };
+            let sum = acc
+                + (0..32 / width)
+                    .map(|i| field(a, width, i, signed) * field(b, width, i, signed))
+                    .sum::<i64>();
+            if signed {
+                sum.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32 as u32
+            } else {
+                sum.clamp(0, i64::from(u32::MAX)) as u32
+            }
+        });
+    }
+}
+
+#[test]
+fn half_dot_products_match_the_isa() {
+    // Values whose products and sums are exact in f32, then infinities and
+    // NaNs.
+    let h = |x: f32| u32::from(super::bitcode::eval::f32_to_f16(x));
+    let pack = |lo: f32, hi: f32| h(lo) | h(hi) << 16;
+    let cases: Vec<[u32; 4]> = [
+        ((1.0, 2.0), (3.0, 4.0), 0.5),
+        ((-1.5, 0.25), (2.0, -8.0), -7.0),
+        ((1024.0, 0.5), (1024.0, 3.0), 1.0),
+        ((0.0, -0.0), (5.0, 5.0), -0.0),
+        ((f32::INFINITY, 1.0), (1.0, 1.0), 2.0),
+        ((f32::INFINITY, 1.0), (0.0, 1.0), 2.0),
+        ((f32::NAN, 1.0), (1.0, 1.0), 2.0),
+        ((1.0, 1.0), (1.0, 1.0), f32::NAN),
+    ]
+    .iter()
+    .map(|&((a0, a1), (b0, b1), c)| [pack(a0, a1), pack(b0, b1), c.to_bits(), 0])
+    .collect();
+    let want = |[a, b, c, _]: [u32; 4]| {
+        let f = |x: u32| f64::from(f16_to_f32(x as u16));
+        let exact = f(a) * f(b) + f(a >> 16) * f(b >> 16) + f64::from(f32::from_bits(c));
+        exact as f32
+    };
+    let check = |name: &str, body: &[u32]| {
+        for (c, got) in cases.iter().zip(eval_cases(body, &cases)) {
+            let (got, want) = (f32::from_bits(got[0]), want(*c));
+            assert!(
+                got.to_bits() == want.to_bits() || (got.is_nan() && want.is_nan()),
+                "{name}{c:08x?} = {got}, want {want}"
+            );
+        }
+    };
+    check("v_dot2_f32_f16", &vop3p(0x13, 0, vgpr(1), vgpr(2), vgpr(3)));
+    // v_mov_b32 v0, v3; v_dot2c_f32_f16 v0, v1, v2.
+    let vop2_op = crate::gfx10::opcode(crate::gfx10::Encoding::Vop2, "v_dot2c_f32_f16")
+        .expect("v_dot2c_f32_f16") as u8;
+    check(
+        "v_dot2c_f32_f16",
+        &[vop1(0x001, 0, vgpr(3)), vop2(vop2_op, 0, vgpr(1), 2)],
+    );
+}
