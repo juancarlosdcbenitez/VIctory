@@ -97,3 +97,9 @@ the lanes take, from structurisation), and accessed with a non-uniform heap
 index in one pass. `victory translate`
 runs every shader it finds (containers, SGD5 files) through these and
 lists what they cannot handle yet.
+
+What a lowering computes is tested without a GPU: `emit::bitcode::eval`
+runs the emitted module for one thread, and `emit::eval_tests` checks
+synthetic programs on it against the ISA. See [testing.md](testing.md);
+the engineering record and backlog are in
+[engineering-status.md](engineering-status.md).

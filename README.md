@@ -58,7 +58,7 @@ the Windows paging file size, then retry.
 ```powershell
 cargo xtask install-hooks                # asset-policy check on every commit
 copy victory.example.toml victory.toml   # then set your paths (outside the repo)
-cargo test --workspace                   # needs no game data
+cargo test --workspace                   # needs no game data (docs/testing.md)
 cargo run -p victory -- config           # check your paths
 ```
 
