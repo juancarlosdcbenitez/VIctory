@@ -15,6 +15,8 @@ use crate::dxbc::{Container, FourCC};
 
 pub struct Host {
     pub device: ID3D12Device,
+    /// The adapter's name, and whether it renders in software.
+    pub adapter: (String, bool),
 }
 
 /// What the stage declares that a pipeline must match.
@@ -62,39 +64,153 @@ fn err(e: windows::core::Error) -> String {
     e.message().to_string()
 }
 
+/// The factory's adapters with their names and whether each renders in
+/// software, in the system's order.
+fn adapters(factory: &IDXGIFactory4) -> Vec<(IDXGIAdapter1, (String, bool))> {
+    (0..)
+        // SAFETY: a plain enumeration; it ends with an error.
+        .map_while(|i| unsafe { factory.EnumAdapters1(i) }.ok())
+        .map(|a| {
+            let d = describe(&a);
+            (a, d)
+        })
+        .collect()
+}
+
+/// An adapter's name, and whether it renders in software.
+fn describe(adapter: &IDXGIAdapter1) -> (String, bool) {
+    // SAFETY: a plain query into a structure of ours.
+    match unsafe { adapter.GetDesc1() } {
+        Ok(d) => {
+            let len = d.Description.iter().position(|&c| c == 0).unwrap_or(128);
+            let name = String::from_utf16_lossy(&d.Description[..len]);
+            (name, d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0)
+        }
+        Err(e) => (
+            format!("an adapter that does not describe itself: {}", err(e)),
+            false,
+        ),
+    }
+}
+
+/// The highest shader model `device` supports, as D3D numbers it (0x66 is
+/// 6.6), asked from 6.9 down.
+fn shader_model(device: &ID3D12Device) -> Option<i32> {
+    for highest in [0x69, 0x68, 0x67, 0x66, 0x65, 0x60] {
+        let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
+            HighestShaderModel: D3D_SHADER_MODEL(highest),
+        };
+        // SAFETY: a plain query into a structure of ours.
+        let ok = unsafe {
+            device.CheckFeatureSupport(
+                D3D12_FEATURE_SHADER_MODEL,
+                (&raw mut sm).cast(),
+                size_of_val(&sm) as u32,
+            )
+        };
+        if ok.is_ok() {
+            return Some(sm.HighestShaderModel.0);
+        }
+    }
+    None
+}
+
+/// One D3D12 feature structure of `device`, if the runtime answers for it.
+fn feature<T: Default>(device: &ID3D12Device, which: D3D12_FEATURE) -> Option<T> {
+    let mut data = T::default();
+    // SAFETY: `data` is the structure `which` names, of its size.
+    unsafe { device.CheckFeatureSupport(which, (&raw mut data).cast(), size_of::<T>() as u32) }
+        .ok()
+        .map(|()| data)
+}
+
+/// What translated shaders and the GPU layer may need of a device, as one
+/// line: the shader model, wave sizes, mesh shaders, 64-bit atomics, format
+/// casting, enhanced barriers, resource binding.
+pub fn capabilities(device: &ID3D12Device) -> String {
+    let sm = shader_model(device).map_or("unknown".into(), |m| format!("{}.{}", m >> 4, m & 15));
+    let o: Option<D3D12_FEATURE_DATA_D3D12_OPTIONS> = feature(device, D3D12_FEATURE_D3D12_OPTIONS);
+    let o1: Option<D3D12_FEATURE_DATA_D3D12_OPTIONS1> =
+        feature(device, D3D12_FEATURE_D3D12_OPTIONS1);
+    let o7: Option<D3D12_FEATURE_DATA_D3D12_OPTIONS7> =
+        feature(device, D3D12_FEATURE_D3D12_OPTIONS7);
+    let o9: Option<D3D12_FEATURE_DATA_D3D12_OPTIONS9> =
+        feature(device, D3D12_FEATURE_D3D12_OPTIONS9);
+    let o11: Option<D3D12_FEATURE_DATA_D3D12_OPTIONS11> =
+        feature(device, D3D12_FEATURE_D3D12_OPTIONS11);
+    let o12: Option<D3D12_FEATURE_DATA_D3D12_OPTIONS12> =
+        feature(device, D3D12_FEATURE_D3D12_OPTIONS12);
+    let yes = |b: Option<bool>| match b {
+        Some(true) => "yes",
+        Some(false) => "no",
+        None => "unknown",
+    };
+    format!(
+        "SM {sm}; resource binding tier {}; waves {}; mesh shaders {}; \
+         64-bit atomics on typed resources {}, on heap resources {}, in group \
+         memory {}; relaxed format casting {}; enhanced barriers {}",
+        o.map_or("unknown".into(), |o| o.ResourceBindingTier.0.to_string()),
+        o1.map_or("unknown".into(), |o| format!(
+            "{}-{} lanes",
+            o.WaveLaneCountMin, o.WaveLaneCountMax
+        )),
+        o7.map_or("unknown".into(), |o| format!("tier {}", o.MeshShaderTier.0)),
+        yes(o9.map(|o| o.AtomicInt64OnTypedResourceSupported.as_bool())),
+        yes(o11.map(|o| o.AtomicInt64OnDescriptorHeapResourceSupported.as_bool())),
+        yes(o9.map(|o| o.AtomicInt64OnGroupSharedSupported.as_bool())),
+        yes(o12.map(|o| o.RelaxedFormatCastingSupported.as_bool())),
+        yes(o12.map(|o| o.EnhancedBarriersSupported.as_bool())),
+    )
+}
+
 impl Host {
-    /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
+    /// The first hardware adapter at shader model 6.6, or WARP with `warp`
+    /// (or `VICTORY_WARP=1`). Software adapters are never taken for
+    /// hardware: without a GPU (CI machines) the system's default adapter
+    /// is the Basic Render Driver, which is WARP, and a run on it is no
+    /// hardware result.
     pub fn new(warp: bool) -> Result<Self, String> {
         let warp = warp || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
-        // SAFETY: plain D3D12/DXGI calls with valid out pointers.
+        // SAFETY: plain DXGI calls with valid out pointers.
+        let factory: IDXGIFactory4 =
+            unsafe { CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)) }.map_err(err)?;
+        if warp {
+            // SAFETY: as above.
+            let adapter: IDXGIAdapter1 = unsafe { factory.EnumWarpAdapter() }.map_err(err)?;
+            return Self::on(&adapter);
+        }
+        let mut refused = Vec::new();
+        for (adapter, (name, software)) in adapters(&factory) {
+            if software {
+                refused.push(format!("{name} (software)"));
+                continue;
+            }
+            match Self::on(&adapter) {
+                Ok(host) => return Ok(host),
+                Err(e) => refused.push(format!("{name}: {e}")),
+            }
+        }
+        Err(format!(
+            "no hardware adapter at SM 6.6 (adapters: {refused:?})"
+        ))
+    }
+
+    /// A device on `adapter` if it reaches shader model 6.6.
+    fn on(adapter: &IDXGIAdapter1) -> Result<Self, String> {
+        let described = describe(adapter);
+        // SAFETY: plain D3D12 calls with valid out pointers.
         unsafe {
             let mut device: Option<ID3D12Device> = None;
-            if warp {
-                let factory: IDXGIFactory4 =
-                    CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
-                let adapter: IDXGIAdapter = factory.EnumWarpAdapter().map_err(err)?;
-                D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
-            } else {
-                D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
-            }
+            D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
             let device = device.ok_or("no device")?;
-            let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
-                HighestShaderModel: D3D_SHADER_MODEL_6_6,
-            };
-            device
-                .CheckFeatureSupport(
-                    D3D12_FEATURE_SHADER_MODEL,
-                    (&raw mut sm).cast(),
-                    size_of_val(&sm) as u32,
-                )
-                .map_err(err)?;
-            if sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0 {
-                return Err(format!(
-                    "the device supports SM {:#x} only",
-                    sm.HighestShaderModel.0
-                ));
+            let sm = shader_model(&device).ok_or("no shader model answer")?;
+            if sm < D3D_SHADER_MODEL_6_6.0 {
+                return Err(format!("the device supports SM {sm:#x} only"));
             }
-            Ok(Host { device })
+            Ok(Host {
+                device,
+                adapter: described,
+            })
         }
     }
 
@@ -1376,6 +1492,47 @@ impl Host {
             }
             drop(keep);
             Ok(out)
+        }
+    }
+}
+
+#[cfg(test)]
+mod capability_report {
+    use super::*;
+
+    /// This machine's adapters, each labelled hardware or software, and
+    /// WARP, with what translated shaders and the GPU layer may need of
+    /// them. `cargo test -p victory-shader capability_report -- --ignored
+    /// --nocapture`
+    #[test]
+    #[ignore = "a report of this machine's adapters, not a check"]
+    fn capability_report() {
+        // SAFETY: plain DXGI and D3D12 calls with valid out pointers.
+        unsafe {
+            let factory: IDXGIFactory4 =
+                CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).expect("a DXGI factory");
+            let mut list = adapters(&factory);
+            match factory.EnumWarpAdapter::<IDXGIAdapter1>() {
+                Ok(w) => {
+                    let (name, _) = describe(&w);
+                    list.push((w, (format!("WARP ({name})"), true)));
+                }
+                Err(e) => println!("no WARP adapter: {}", err(e)),
+            }
+            for (adapter, (name, software)) in list {
+                let kind = if software { "software" } else { "hardware" };
+                let mut device: Option<ID3D12Device> = None;
+                match D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device) {
+                    Ok(()) => match device {
+                        Some(d) => println!("{kind} adapter {name}: {}", capabilities(&d)),
+                        None => println!("{kind} adapter {name}: no device"),
+                    },
+                    Err(e) => println!(
+                        "{kind} adapter {name}: no D3D12 device at feature level 12_0 ({})",
+                        err(e)
+                    ),
+                }
+            }
         }
     }
 }

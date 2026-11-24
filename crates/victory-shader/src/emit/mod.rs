@@ -560,10 +560,15 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn stub_pipeline_is_created() {
-        let Ok(host) = super::host::Host::new(false) else {
-            eprintln!("no SM 6.6 device; skipped");
-            return;
+        // Pipeline creation is checked on WARP where no GPU is present.
+        let host = match super::host::Host::new(false).or_else(|_| super::host::Host::new(true)) {
+            Ok(host) => host,
+            Err(e) => {
+                eprintln!("no SM 6.6 device; skipped: {e}");
+                return;
+            }
         };
+        eprintln!("pipelines on {} (software: {})", host.adapter.0, host.adapter.1);
         let ps = super::HostShader {
             stage: crate::HwStage::Ps,
             dxil: constant_color(),
