@@ -32,6 +32,8 @@ mod host;
 #[cfg(windows)]
 mod indirect;
 pub mod list;
+#[cfg(any(windows, test))]
+mod merge;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
