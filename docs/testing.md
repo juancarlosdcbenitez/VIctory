@@ -114,6 +114,16 @@ inputs)` lowers with the loop limit at `limit` on the test's thread
 iterations; a lane the limit stops leaves the program, so nothing is
 stored (`NOT_STORED` stays).
 
+For image atomics, `synth::image_program(body)` adds a typed texture UAV
+at heap index 1, its descriptor in `s[12:19]` (`synth::mimg` encodes the
+instructions), and `synth::eval_image(lowered, inputs, dims, texels)`
+runs it on the evaluator, which models typed texture UAVs for atomics
+(texels of 4 bytes, or 8 for a 64-bit component type). 64-bit image
+atomics lower only with `emit::TEST_IMAGE_ATOMICS_64` set on the test's
+thread; on Windows, `valu_tests::wide_image_atomics_on_the_host` runs
+them on an R32G32_UINT texture UAV (`View::Uint2TextureUav`) on devices
+with 64-bit typed atomics.
+
 For cross-lane code, `synth::wave_program` builds one wave (32 or 64
 lanes) whose lanes load their own `v1` and `v2` from two arrays and store
 their own `v4`. `eval_wave(body, lanes, wave64, a, b, constants)` runs

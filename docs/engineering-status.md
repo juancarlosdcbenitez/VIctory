@@ -186,6 +186,28 @@ result.
   once (`Batch::texture_due`). blake3's `hazmat` API would allow a
   bit-identical parallel hash; not done, since its benefit against the
   title's own threads needs a world measurement.
+* **Image atomics went through a float4 handle** (fixed; verified
+  off-GPU, DXIL-valid on Windows, run 7): every descriptor load makes a
+  size-query handle annotated as the view's float4 form, and heap handles
+  were cached on the first property word only, so an image atomic in the
+  same block as its descriptor load (the usual case) did a 32-bit integer
+  atomic through a handle annotated F32 x4. Found by the first image
+  atomic tests (the evaluator now models typed texture UAVs).
+* **SH-1's shader side** (verified on WARP, run 8): 64-bit image atomics
+  are lowered to `atomicBinOp.i64` / `atomicCompareExchange.i64` on a U64
+  heap handle, with the shader flags and SFI0 bits checked in DXC's
+  sources, behind `emit::image_atomics_64`, off by default. Evaluator
+  tests cover every operation against ISA references; on Windows CI they
+  pass `dxil.dll`, and six of them run on WARP on an R32G32_UINT texture
+  UAV and match the evaluator. Microsoft's SM 6.6 atomics spec settles the
+  view format: "Typed resources used in 64-bit integer operations must be
+  declared with HLSL type int64_t or uint64_t and have format
+  R32G32_UINT", so the second session's plan of R64 views through
+  castable resources was wrong; the title's two-dword view is the format
+  D3D12 wants. The GPU layer now refuses these pipelines on devices
+  without OPTIONS9/OPTIONS11 support, and a diagnostics build turns them
+  on with `VICTORY_SHADER_IMAGE_ATOMICS_64=1` (implemented, not run in the
+  world).
 * **ds_swizzle and ds_bpermute** (reviewed, unchanged): LLVM's AMDGPU
   assembler (SIDefines.h, AMDGPUAsmParser.cpp) confirms GFX9-and-later
   encodings: rotate from 0xC000 (direction bit 10, size bits 9:5), FFT
@@ -209,7 +231,7 @@ P3 runtime compatibility, P4 usability.
 | PERF-3 | P2 | hypothesis | Loops stopped only at `LOOP_LIMIT` (2^20 per lane) can cost about a second in a full-screen pass, the order of the world's frame times. Since the third session a lane the limit stops leaves the program at every back edge (it used to run on at conditional ones). Check: a diagnostics build in the world with `VICTORY_SHADER_LOOP_LIMIT=4096`; if frames get much faster, find the loops (`VICTORY_GPU_TIMING=1` names slow lists and their commands). Next instrument: count the lanes the limit stops (a diagnostics UAV the host reads after each submission), which also tells whether it hides translation bugs. |
 | PERF-4 | P2 | hypothesis | Host copies of title buffers are custom-heap, write-back L0 (system memory; `host::Host::shared_buffer`), so a discrete GPU reads every vertex, index and constant there over PCIe. Check by timing a heavy pass with its inputs moved to a default heap. |
 | PERF-5 | P2 | hypothesis | Textures in memory that cannot be write-watched are hashed whole (BLAKE3) at every submission that samples them (`texture::Staging::refresh_now`), once per submission. Exact elimination across submissions needs to see writes through every view of the texture pool's pages (third session); a bit-identical parallel hash (blake3 `hazmat`) is the other option. Check first: the frame-rate line's "textures ms, MB" and the `TexHashed` counter (diagnostics, copystat) per world frame. |
-| SH-1 | P1 | not implemented, investigated | **64-bit image atomics** (README). WARP on Windows CI supports what they need (third session's capability report: 64-bit atomics on typed and heap resources, relaxed format casting), so both sides can be validated there before hardware. Shader side: `dx.op.atomicBinOp.i64` / `atomicCompareExchange.i64` on a typed UAV annotated U64 (component type 7: props `(kind \| 0x1000, 0x107)`), with the two data dwords joined and the old value split; shader flags Int64Ops (bit 20), AtomicInt64OnTypedResource (bit 27) and AtomicInt64OnHeapResource (bit 32), SFI0 0x8000, 0x400000 and 0x10000000 (from memory of DXC's headers: confirm). Host side, found in the second session: host UAVs take the title's view description, which is R32G32 for these atomics (`descriptor::host::make`), and host textures are created once with the title's format (`resource::host_texture`). A shader-only change would bind a 64-bit typed UAV declaration to an R32G32 view, which is undefined behaviour where today the draw is only dropped, so the two sides land together. That needs R64_UINT views of those textures (a castable-format resource via `CreateCommittedResource3`, which needs OPTIONS12 RelaxedFormatCastingSupported), the OPTIONS9 AtomicInt64OnTypedResourceSupported and OPTIONS11 AtomicInt64OnDescriptorHeapResourceSupported checks (refuse such pipelines without them), and a record per pipeline of which table entries need R64 views. Validate on Windows: a valu_tests-style dispatch doing image_atomic_umax with dmask 0x3 on an R64_UINT UAV, read back, clean under `VICTORY_D3D12_DEBUG=1` and `VICTORY_D3D12_GBV=1`; then `victory translate` counts. |
+| SH-1 | P1 | verified on WARP, off by default | **64-bit image atomics** (README). Shader side done in the third session behind `emit::image_atomics_64` (evaluator tests from the ISA; `dxil.dll` on Windows; six operations on WARP on an R32G32_UINT UAV, `valu_tests::wide_image_atomics_on_the_host`). The view format is R32G32_UINT by Microsoft's SM 6.6 atomics spec (no R64 views are needed; the second session's plan was wrong), which the title's two-dword views should already be. The GPU layer refuses such pipelines on devices without OPTIONS9 AtomicInt64OnTypedResourceSupported and OPTIONS11 AtomicInt64OnDescriptorHeapResourceSupported. Next: a diagnostics world run with `VICTORY_SHADER_IMAGE_ATOMICS_64=1`, `VICTORY_D3D12_DEBUG=1` and `VICTORY_D3D12_GBV=1` (the debug layer names a view whose format does not fit), then `victory translate` counts; if clean, turn it on by default. |
 | SH-2 | P1 | not implemented | `tbuffer_store_format_*`: typed-format stores are refused (`buffer()`); the inverse of `format_load` (pack, round and saturate per numeric format). |
 | SH-3 | P1 | not implemented | Double precision (`v_*_f64`, `v_cvt_*_f64`, f64 compares): the DXIL writer has no `double` type. |
 | SH-4 | P1 | not implemented | `v_div_scale/fmas/fixup_f32` (the precise division sequence). |
@@ -236,14 +258,15 @@ paragraph); Windows validation run 6 (`37c0ff5`) is the last code run.
    counts (SYNC-1), fence-wait warnings (GPU-2), and the frame-rate
    line's texture time (PERF-5); then one with
    `VICTORY_SHADER_LOOP_LIMIT=4096` (PERF-3).
-3. The exact next implementation task: **SH-1's shader side, validated on
-   WARP**: lower 64-bit `image_atomic_*` (dmask 0x3; cmpswap 0xF) to
-   `atomicBinOp.i64` / `atomicCompareExchange.i64` on a U64 typed UAV,
-   behind a switch the GPU layer leaves off; confirm the shader flags and
-   SFI0 bits from DXC's sources (raw.githubusercontent.com is reachable:
-   `include/dxc/DXIL/DxilShaderFlags.h`); evaluator tests from the ISA; a
-   D3D12 test on an R64_UINT UAV in the shader test host, run on WARP by
-   CI. Then the host side (castable R64_UINT views, capability checks),
-   and only then the switch on.
+3. SH-1 is done but for its world check: run step 2's world run once
+   more with `VICTORY_SHADER_IMAGE_ATOMICS_64=1` (diagnostics build, with
+   `VICTORY_D3D12_DEBUG=1` and `VICTORY_D3D12_GBV=1`). If the debug layer
+   reports nothing about these views, make `image_atomics_64` default on.
+   The exact next implementation task otherwise: **GPU-1 instrumentation**
+   (a diagnostics UAV that translated shaders write when a per-lane heap
+   index reaches past the bound heap, and when the loop limit stops a
+   lane, read back after each submission and logged with the pipeline),
+   which settles GPU-1 and PERF-3 from one world run without clamping
+   anything.
 4. If step 2 shows SYNC-1 run-aheads, deferring queue work behind
    unreached waits comes first.
