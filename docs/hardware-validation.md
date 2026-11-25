@@ -31,7 +31,8 @@ In Command Prompt, in the package folder, with `GAME` set to the title's
 executable inside your game folder:
 
 ```bat
-set GAME=D:\victory-data\game\title.exe
+set GAMEDIR=D:\victory-data\game
+set GAME=%GAMEDIR%\title.exe
 set RUN=%USERPROFILE%\victory-runs
 mkdir "%RUN%"
 victory.exe --version > "%RUN%\build.txt"
@@ -71,6 +72,38 @@ What identifies a failure, in every stage:
 | black output | `a black frame after a frame that was not` warnings, with the draws of that frame |
 
 ## The stages
+
+### 0. Baseline: the repository before this work
+
+Every later result is compared with what the code did before the
+engineering sessions began: commit `ffe310e`, the state the README's
+results come from. Build it once, from a checkout of this repository:
+
+```bat
+git worktree add ..\victory-baseline ffe310e
+cd ..\victory-baseline
+cargo build --profile diag -p victory --features diagnostics
+```
+
+Run stages 1, 2, 3 and 9 with `..\victory-baseline\target\diag\victory.exe`
+into `%RUN%\baseline-<stage>` folders, then the same stages with the
+download. A stage the baseline passes and the download fails is a
+regression to report first.
+
+### Translation census
+
+No game is started: every shader of the game folder is translated, checked
+by `dxil.dll` (the Windows SDK's) and, with `--pipelines`, made into a host
+pipeline on the GPU. It reports how many programs translate and why the
+others do not; `--list` adds one line per program and outcome:
+
+```bat
+victory.exe translate "%GAMEDIR%" --validate --list > "%RUN%\census.txt" 2>&1
+victory.exe translate "%GAMEDIR%" --validate --pipelines > "%RUN%\census-pipelines.txt" 2>&1
+```
+
+Run it with the baseline too: the difference is what this work changed in
+coverage. The most frequent reasons decide the next lowering to write.
 
 ### 1. Startup
 
@@ -177,6 +210,19 @@ README's machine had 0.5-1.8 s). One more run with `VICTORY_GPU_TIMING=1`
 names the slow command lists (with `VICTORY_D3D12_DRED=1` too, their
 slowest commands).
 
+The 5 s lines are averages. Presented-frame intervals one by one, which
+show stutter the averages hide: `VICTORY_LOG=victory_gpu::frame=debug,info`
+logs a timestamped `present` line per frame (a variable of its own: run
+it separately), or an external capture with Microsoft's PresentMon while
+the game runs:
+
+```bat
+PresentMon.exe --process_name victory.exe --timed 120 --terminate_after_timed --output_file "%RUN%\09-presentmon.csv"
+```
+
+Report the median and the 99th percentile of the intervals, next to the
+5 s lines' CPU (preparing) and GPU times.
+
 ### 10. Memory
 
 Variable: none. While stage 9 runs, sample memory every 5 s in a second
@@ -210,11 +256,21 @@ adapters points at translation; wrong output on the GPU only, at undefined
 behaviour the software adapter happens to hide, or the driver. Describe the
 differences in the notes; the images are game content: keep them private.
 
+### 12. Interactive stability
+
+Variable: none. Play for 30 minutes from a save in the world: walk,
+drive, open menus and the map, load a save. Note every crash, hang,
+device removal and visual fault with its time; the stage passes only with
+none. Run it once with the baseline for comparison if the baseline
+reaches the world.
+
 ## Reporting
 
 Keep `build.txt`, `machine.txt`, `bind.txt` and each stage's folder. What
 each stage settles in the engineering record
 ([engineering-status.md](engineering-status.md)): 3 and 4, the world hang
 and GPU-1; 5, GPU-1; 6, SYNC-1; 7, PERF-3; 8, SH-1; 9 and 10, PERF-1, PERF-4
-and PERF-5 (their baselines); 11, the scene's correctness. A stage not run,
+and PERF-5 (their baselines); 11, the scene's correctness; 0 and the
+census, what changed since `ffe310e` and which lowerings matter most; 12,
+whether the game is playable at all. A stage not run,
 or run with a different variable, is reported as such, never as passed.

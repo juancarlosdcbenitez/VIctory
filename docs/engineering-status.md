@@ -279,7 +279,8 @@ Nothing here ran on a hardware GPU or with the game.
   `victory-diag-0.1.0-b90281f9eace-windows-x64`, 10.6 MB.
   [diagnostic-build.md](diagnostic-build.md) has the exact commands to
   collect logs; [hardware-validation.md](hardware-validation.md) is the
-  first hardware procedure (eleven stages, one diagnostic variable per
+  first hardware procedure (a baseline, a translation census and twelve
+  stages, one diagnostic variable per
   run, which log line settles which backlog item). Neither assumes anyone
   has a suitable machine or the game.
 * **Texture checks side by side** (PERF-5; implemented; equivalence
@@ -445,7 +446,7 @@ P3 runtime compatibility, P4 usability.
 | SH-7 | P1 | DXIL verified; integers and floats on WARP | The evaluator programs, the 59 lowerings of the first session among them, pass `dxil.dll` on Windows CI; the integer ones agree with WARP (third session), and 43 float lowerings were compared in the fourth (runs 16 and 17: three conversions disagree, being fixed). Left: everything on hardware, and the f16 and packed float ops (VOP3P) on WARP. |
 | SH-8 | P1 | not verified | ds_bpermute's index in wave32 (we wrap at 32) against AMD's RDNA2 ISA guide (DS_BPERMUTE_B32), which this environment cannot reach. |
 | CI-1 | P1 | verified | Windows validation workflow (third session). It never claims a hardware result: hosted runners have no GPU. A hardware result needs a self-hosted runner with a GPU or a run on a machine with one. Since the fourth session it also builds the diagnostic download once the checks pass, and runs the hashing benchmark. |
-| HW-1 | P0 | blocked (no machine) | The first hardware validation: [hardware-validation.md](hardware-validation.md), eleven stages on a Windows machine with a hardware D3D12 GPU and game files one may use, with the diagnostic download. Nothing in this repository's CI can stand in for it. |
+| HW-1 | P0 | blocked (no machine) | The first hardware validation: [hardware-validation.md](hardware-validation.md): a baseline against `ffe310e`, a translation census and twelve stages on a Windows machine with a hardware D3D12 GPU and game files one may use, with the diagnostic download. Nothing in this repository's CI can stand in for it. |
 | PERF-1 | P2 | open | World frames take 0.5-1.8 s (README, one machine). No measurement possible here. The existing switches (`VICTORY_GPU_TIMING`, `VICTORY_SHADER_LOOP_LIMIT`) are where to start. |
 
 ## Next session
