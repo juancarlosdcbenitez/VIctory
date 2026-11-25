@@ -358,12 +358,14 @@ mod tests {
     #[test]
     #[ignore = "benchmark"]
     fn hashing_throughput() {
+        // Seconds a call of `f` takes: repeated for at least 50 ms (three
+        // times at least), after a call to warm up.
         let time = |f: &dyn Fn()| {
-            f(); // warm up
-            let reps = 5;
-            let started = std::time::Instant::now();
-            for _ in 0..reps {
+            f();
+            let (mut reps, started) = (0u32, std::time::Instant::now());
+            while reps < 3 || started.elapsed() < std::time::Duration::from_millis(50) {
                 f();
+                reps += 1;
             }
             started.elapsed().as_secs_f64() / f64::from(reps)
         };
@@ -386,20 +388,28 @@ mod tests {
             println!("a call over 8 empty items on up to {helpers} threads: {us:.1} us");
         }
         let big = input(64 << 20);
+        // The thread counts to compare, up to the machine's.
+        let counts: Vec<usize> = [2, 4, 8].into_iter().filter(|&n| n <= threads).collect();
         for mib in [1, 4, 16, 64] {
             let bytes = &big[..mib << 20];
             let one = time(&|| {
                 std::hint::black_box(blake3::hash(std::hint::black_box(bytes)));
             });
-            let split = time(&|| {
-                std::hint::black_box(super::blake3(std::hint::black_box(bytes), threads));
-            });
-            println!(
-                "one input of {mib} MiB: {:.2} GB/s on one thread, {:.2} GB/s split ({:.1}x)",
-                bytes.len() as f64 / one / 1e9,
-                bytes.len() as f64 / split / 1e9,
-                one / split
+            let mut line = format!(
+                "one input of {mib} MiB: {:.2} GB/s on one thread",
+                bytes.len() as f64 / one / 1e9
             );
+            for &n in &counts {
+                let split = time(&|| {
+                    std::hint::black_box(super::blake3(std::hint::black_box(bytes), n));
+                });
+                line += &format!(
+                    ", {:.2} split on {n} ({:.1}x)",
+                    bytes.len() as f64 / split / 1e9,
+                    one / split
+                );
+            }
+            println!("{line}");
         }
         // A submission's group: 48 textures of 1 MiB, then 12 of 4 MiB.
         for (count, mib) in [(48, 1), (12, 4)] {
@@ -411,18 +421,24 @@ mod tests {
                     std::hint::black_box(blake3::hash(t));
                 }
             });
-            let side_by_side = time(&|| {
-                for_each(&textures, threads, |t| {
-                    std::hint::black_box(blake3::hash(t));
-                });
-            });
             let total = (count * (mib << 20)) as f64;
-            println!(
-                "{count} inputs of {mib} MiB: {:.2} GB/s one by one, {:.2} GB/s side by side ({:.1}x)",
-                total / one / 1e9,
-                total / side_by_side / 1e9,
-                one / side_by_side
+            let mut line = format!(
+                "{count} inputs of {mib} MiB: {:.2} GB/s one by one",
+                total / one / 1e9
             );
+            for &n in &counts {
+                let side_by_side = time(&|| {
+                    for_each(&textures, n, |t| {
+                        std::hint::black_box(blake3::hash(t));
+                    });
+                });
+                line += &format!(
+                    ", {:.2} side by side on {n} ({:.1}x)",
+                    total / side_by_side / 1e9,
+                    one / side_by_side
+                );
+            }
+            println!("{line}");
         }
     }
 }
