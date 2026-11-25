@@ -433,17 +433,17 @@ P3 runtime compatibility, P4 usability.
 | GPU-1 | P0 | hypothesis, instrumented | **Out-of-range heap indices as a hang cause.** Audited (second session): table bases cannot leave the heaps (`draw::State::user_value` gives 0 for a table outside the bound heaps), and tables reaching past a smaller host heap get fresh slots (`draw::State::tables`). What remains unbounded is an index the shader computes per lane (bindless indexing, waterfall loops: `emit::lower::lane_heap_index`, `fetched_index`), read through `ResourceDescriptorHeap[]` with no clamp. Since the fourth session, probes (`VICTORY_SHADER_PROBES=1`, diagnostics) record every such index at or past the bound heap's slots, with the shader, without clamping. Check: hardware-validation.md stages 4 and 5. Records name the shaders whose index computation to fix; none, with DRED placing a fault past a heap, would mean an index inside the slots naming the wrong descriptor, which probes do not see. Clamping stays out: it would hide the defect. |
 | GPU-2 | P0 | verified off-GPU | Fence waits follow D3D12's rules (third session): no timeout, rewinds, bottom-of-pipe writes wake waiters. Next: a world run; a "blocking fence wait has not been reached" warning names a fence nothing signals, or a title deadlock. |
 | SYNC-1 | P0 | implemented, not run in the world | Queue waits were not carried out (work behind a wait not reached ran ahead of it). Since the fourth session the work is held and a queue worker runs it once the fence gets there (`schedule`, `queue`; the rules checked on WARP). Left running ahead, and counted: presents and page mappings on a held queue. Check: hardware-validation.md stage 6 (held counts after the frame lines; waits held 5 s or more; `VICTORY_QUEUE_WAITS=0` to compare). A wait that only held work could satisfy would hang: the log names it. |
-| PERF-2 | P2 | open (design, dependencies mapped) | Every submission runs synchronously: `host::Host::execute` holds a lock, executes, signals and waits `INFINITE` before returning (decision 0007). This makes lifetimes safe by construction, but CPU and GPU never overlap, and one submission past about 2 s is a TDR. The fourth session listed what depends on it (session log): single-buffered host copies, dirty-page copies over GPU-written ranges not yet copied back, completion writes, releases right after a submission, the probe buffer. Order: (1) a registry of in-flight GPU-written ranges that preparation consults (wait for that submission only, or skip the range); (2) host copies versioned per submission, or copied on write while in flight; (3) host resources and descriptor slots retired by host fence value; (4) completion (copy-back, bottom-of-pipe writes, probe reads) moved to the queue worker; (5) only then `execute` returning before the GPU finishes. Each step needs a world run on a GPU to show it changes nothing but timing; measure first (`VICTORY_GPU_TIMING`, the frame line's CPU and GPU times). |
+| PERF-2 | P2 | open; invariants written, two components built | Every submission runs synchronously: `host::Host::execute` holds a lock, executes, signals and waits `INFINITE` before returning (decision 0007). This makes lifetimes safe by construction, but CPU and GPU never overlap, and one submission past about 2 s is a TDR. The fourth session listed what depends on it (session log): single-buffered host copies, dirty-page copies over GPU-written ranges not yet copied back, completion writes, releases right after a submission, the probe buffer. Order: (1) a registry of in-flight GPU-written ranges that preparation consults (wait for that submission only, or skip the range); (2) host copies versioned per submission, or copied on write while in flight; (3) host resources and descriptor slots retired by host fence value; (4) completion (copy-back, bottom-of-pipe writes, probe reads) moved to the queue worker; (5) only then `execute` returning before the GPU finishes. Each step needs a world run on a GPU to show it changes nothing but timing; measure first (`VICTORY_GPU_TIMING`, the frame line's CPU and GPU times). Fifth session: the invariants are in architecture.md (C1-C4, O1-O3, what keeps each today and with overlap); `inflight::Retire` (O2) and `inflight::InFlight` (C3) exist, tested on their own and Retire on WARP with eight submissions in flight, allocators reused; not used yet. |
 | PERF-3 | P2 | hypothesis, instrumented | Loops stopped only at `LOOP_LIMIT` (2^20 per lane) can cost about a second in a full-screen pass, the order of the world's frame times. Since the third session a lane the limit stops leaves the program at every back edge; since the fourth, probes count and record such lanes with their shader. Check: hardware-validation.md stages 5 and 7 (`VICTORY_SHADER_LOOP_LIMIT=4096`); if frames get much faster, `VICTORY_GPU_TIMING=1` names the slow lists. Recorded stops in shaders whose loops should end tell whether the limit hides translation bugs. |
 | PERF-4 | P2 | hypothesis | Host copies of title buffers are custom-heap, write-back L0 (system memory; `host::Host::shared_buffer`), so a discrete GPU reads every vertex, index and constant there over PCIe. Check by timing a heavy pass with its inputs moved to a default heap. |
-| PERF-5 | P2 | parallel (equivalent), effect in a frame unmeasured | Textures in memory that cannot be write-watched are hashed whole (BLAKE3) at every submission that samples them, once per submission. Since the fourth session a submission's textures are checked side by side and big hashes split along BLAKE3's tree (bit-identical; 2.0-2.4x CPU throughput on the Windows runner for 16 MiB and more or groups of textures). Skipping hashes across submissions would need to see writes through every view of the texture pool's pages (third session). Check: the frame line's "textures ms, MB" in a world run (hardware-validation.md stage 9). |
+| PERF-5 | P2 | parallel (equivalent), effect in a frame unmeasured | Textures in memory that cannot be write-watched are hashed whole (BLAKE3) at every submission that samples them, once per submission. Since the fourth session a submission's textures are checked side by side and big hashes split along BLAKE3's tree (bit-identical; on a pool of parked threads since the fifth session, which cut a call's overhead from 58-217 to 3-8 microseconds here). Skipping hashes across submissions would need to see writes through every view of the texture pool's pages (third session). Check: the frame line's "textures ms, MB" in a world run (hardware-validation.md stage 9). |
 | SH-1 | P1 | verified on WARP, off by default | **64-bit image atomics** (README). Shader side done in the third session behind `emit::image_atomics_64` (evaluator tests from the ISA; `dxil.dll` on Windows; six operations on WARP on an R32G32_UINT UAV, `valu_tests::wide_image_atomics_on_the_host`). The view format is R32G32_UINT by Microsoft's SM 6.6 atomics spec (no R64 views are needed; the second session's plan was wrong), which the title's two-dword views should already be. The GPU layer refuses such pipelines on devices without OPTIONS9 AtomicInt64OnTypedResourceSupported and OPTIONS11 AtomicInt64OnDescriptorHeapResourceSupported. Fourth session: 32 lanes contending on one texel (add with carries, cmpswap, umax) pass order-independent checks on the evaluator and on WARP (run 15, 8 dispatches each). Next: hardware-validation.md stage 8 (the switch alone, then with `VICTORY_D3D12_DEBUG=1`, then GBV: the debug layer names a view whose format does not fit), then `victory translate` counts; if clean, turn it on by default. |
 | SH-2 | P1 | part implemented | `tbuffer_store_format_*` (the format in the instruction): since the fourth session, formats whose channels are all 32-bit UINT, SINT or FLOAT, all stored, are lowered as the plain stores they are (evaluator tests; DXIL-valid on Windows). Every other format is refused with its reason: the inverse of `format_load` (pack, round and saturate per numeric format) and what is written for channels a store leaves out need AMD's ISA guide. |
 | SH-3 | P1 | not implemented | Double precision (`v_*_f64`, `v_cvt_*_f64`, f64 compares): the DXIL writer has no `double` type. |
 | SH-4 | P1 | not implemented | `v_div_scale/fmas/fixup_f32` (the precise division sequence). |
 | SH-5 | P1 | not implemented | `ds_permute_b32` (forward permute), ds_swizzle's rotate and FFT modes (refused; encodings confirmed from LLVM, semantics need AMD's ISA guide), `v_msad_u8`, `v_qsad/mqsad`, `image_msaa_load`, `image_*_pck*`, flat and scratch memory, `s_getreg_b32`, scalar stores and atomics, clamped integer mads. (v_permlane16/x16, v_dot2(c)_f32_f16, ds_bpermute and integer clamp on adds, subtracts and dots were done in the second session.) |
 | SH-6 | P1 | not implemented | Merged geometry stages; 64-lane cross-lane code on 32-lane hosts (README). |
-| SH-7 | P1 | DXIL verified; integers and floats on WARP | The evaluator programs, the 59 lowerings of the first session among them, pass `dxil.dll` on Windows CI; the integer ones agree with WARP (third session), and 43 float lowerings were compared in the fourth (runs 16 and 17: three conversions disagree, being fixed). Left: everything on hardware, and the f16 and packed float ops (VOP3P) on WARP. |
+| SH-7 | P1 | DXIL verified; integers, floats, f16 and packed f16 on WARP | The evaluator programs pass `dxil.dll` on Windows CI; the integer lowerings agree with WARP (third session), and since the fifth 43 float lowerings, f16 arithmetic and packed f16 arithmetic agree to the bit but where the D3D11.3 specification leaves results to the device (NaN bits, denormal flushing, min/max zero signs, FMad fusion, chapter 22 precision). The comparison found two lowering defects, both fixed: f16 results rounded toward zero by D3D's `f32tof16`, and integer-to-float conversions not exact on every device. Left: everything on hardware; d16 texture returns keep D3D's conversion (the texture unit's rounding is not documented here). |
 | SH-8 | P1 | not verified | ds_bpermute's index in wave32 (we wrap at 32) against AMD's RDNA2 ISA guide (DS_BPERMUTE_B32), which this environment cannot reach. |
 | CI-1 | P1 | verified | Windows validation workflow (third session). It never claims a hardware result: hosted runners have no GPU. A hardware result needs a self-hosted runner with a GPU or a run on a machine with one. Since the fourth session it also builds the diagnostic download once the checks pass, and runs the hashing benchmark. |
 | HW-1 | P0 | blocked (no machine) | The first hardware validation: [hardware-validation.md](hardware-validation.md): a baseline against `ffe310e`, a translation census and twelve stages on a Windows machine with a hardware D3D12 GPU and game files one may use, with the diagnostic download. Nothing in this repository's CI can stand in for it. |
@@ -451,30 +451,32 @@ P3 runtime compatibility, P4 usability.
 
 ## Next session
 
-Remote branch head at the end of the fourth session: the last commit of
+Remote branch head at the end of the fifth session: the last commit of
 `claude/sharp-thompson-o8cl4c` (the docs commit that adds this
-paragraph). The last green Windows validation run is 15 (`fe69655`); runs
-16 and 17 fail in the float differential until the conversions it caught
-are fixed.
+paragraph). Windows validation runs 18 to 20 passed (`628d456`,
+`ef346c8`, `ab8a6dd`), each with its diagnostic package; see the
+fifth-session entry for the later ones.
 
-1. Check the latest Windows validation run (Actions tab or the job
-   summary): both jobs green, the summary saying no hardware GPU was
-   present, and a `victory-diag-...` artifact for the head commit.
+1. Check the latest Windows validation run: both jobs green, the summary
+   saying no hardware GPU was present, the float, f16 and packed f16
+   device tests run on WARP (not skipped), and a `victory-diag-...`
+   artifact for the head commit.
 2. Whoever has a Windows machine with a hardware D3D12 GPU and game files
    they may use: [hardware-validation.md](hardware-validation.md) with
-   that artifact, one stage and one variable at a time. Its stages settle
-   the open P0 items in order: the world hang (3, 4), GPU-1 (5), SYNC-1
-   (6), PERF-3 (7), SH-1 (8), the frame and memory baselines (9, 10).
+   that artifact: the baseline against `ffe310e` and the translation
+   census first, then the stages one variable at a time. They settle the
+   open P0 items: the world hang (3, 4), GPU-1 (5), SYNC-1 (6), PERF-3 (7),
+   SH-1 (8), the frame and memory baselines (9, 10), playability (12).
    Nothing in this repository's CI can stand in for it (HW-1).
 3. Without such a machine, the next implementation tasks, in order:
-   * PERF-2 step 1: the registry of in-flight GPU-written ranges, with
-     preparation consulting it, built and tested while submissions still
-     wait (so it changes nothing yet), then step 3, retirement by host
-     fence value. Steps 4 and 5 only after a world run measures the CPU
-     and GPU split.
-   * SH-7: the f16 and packed float ops (VOP3P) against WARP, as the f32
-     ones now are; any difference not in `Leeway` is a lowering to fix.
-   * With the game's shaders at hand (`victory translate <game dir>
-     --list`), the most frequent refusal reasons decide the next lowering;
-     those needing AMD's ISA guide (SH-2's converting formats, SH-4, SH-5)
-     wait for it.
+   * PERF-2: check C3 in diagnostics builds with `inflight::InFlight`
+     (every GPU-written range recorded per submission, every range
+     preparation reads checked against it), so the bookkeeping is proven
+     on real workloads before anything relies on it; then per-submission
+     versions of host copies (C1). No step that lets submissions overlap
+     before a world run measures the CPU and GPU split.
+   * With the game's shaders at hand (the census), the most frequent
+     refusal reasons decide the next lowering; those needing AMD's ISA
+     guide (SH-2's converting formats, SH-4, SH-5) wait for it.
+   * The d16 texture returns' rounding (D3D's toward zero today), once a
+     hardware run can compare them with nearest-even.
