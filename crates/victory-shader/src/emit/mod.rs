@@ -799,6 +799,10 @@ mod tests {
         let host = match super::host::Host::any() {
             Ok(host) => host,
             Err(e) => {
+                assert!(
+                    !super::valu_tests::warp_required(),
+                    "VICTORY_WARP_REQUIRED=1, but there is no SM 6.6 device: {e}"
+                );
                 eprintln!("no SM 6.6 device; skipped: {e}");
                 return;
             }

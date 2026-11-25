@@ -5,7 +5,7 @@
 
 use windows::Win32::Graphics::Direct3D12::*;
 
-use super::host::{Dispatch, Host, Root, Stride, View};
+use super::host::{Dispatch, Root, Stride, View};
 use super::{HostShader, lower, validator};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
@@ -113,12 +113,8 @@ fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     for (label, warp) in [("hardware", false), ("warp", true)] {
-        let host = match Host::new(warp) {
-            Ok(host) => host,
-            Err(e) => {
-                eprintln!("{label}: skipped: {e}");
-                continue;
-            }
+        let Some(host) = super::valu_tests::test_host(label, warp) else {
+            continue;
         };
         let kind = if host.adapter.1 {
             "software"

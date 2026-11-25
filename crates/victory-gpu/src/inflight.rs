@@ -167,10 +167,8 @@ mod tests {
 /// data, and the released allocators are reset and reused.
 #[cfg(all(test, windows))]
 mod d3d12 {
-    use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
     use windows::Win32::Graphics::Direct3D12::*;
     use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
-    use windows::Win32::Graphics::Dxgi::*;
     use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
     use windows::core::Interface;
 
@@ -228,19 +226,9 @@ mod d3d12 {
         // is written before its submission and not again while in flight,
         // and an allocator is reset only once the fence passed its work.
         unsafe {
-            let factory: IDXGIFactory4 =
-                CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).expect("DXGI");
-            let Ok(adapter) = factory.EnumWarpAdapter::<IDXGIAdapter1>() else {
-                eprintln!("no WARP adapter; skipped");
+            let Some(d) = crate::warp::device() else {
                 return;
             };
-            let mut device: Option<ID3D12Device> = None;
-            if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).is_err() {
-                eprintln!("no WARP device; skipped");
-                return;
-            }
-            let d = device.expect("a device");
-            eprintln!("on WARP (software)");
             let queue: ID3D12CommandQueue = d
                 .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
                     Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
@@ -335,19 +323,9 @@ mod d3d12 {
         // is written before its copy is submitted, and the readback buffer
         // is read only where the fence says the copies writing it are done.
         unsafe {
-            let factory: IDXGIFactory4 =
-                CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).expect("DXGI");
-            let Ok(adapter) = factory.EnumWarpAdapter::<IDXGIAdapter1>() else {
-                eprintln!("no WARP adapter; skipped");
+            let Some(d) = crate::warp::device() else {
                 return;
             };
-            let mut device: Option<ID3D12Device> = None;
-            if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).is_err() {
-                eprintln!("no WARP device; skipped");
-                return;
-            }
-            let d = device.expect("a device");
-            eprintln!("on WARP (software)");
             let queue: ID3D12CommandQueue = d
                 .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
                     Type: D3D12_COMMAND_LIST_TYPE_DIRECT,

@@ -83,6 +83,14 @@ cargo test --locked -p victory-shader capability_report -- --ignored --nocapture
 
 `VICTORY_WARP=1` makes the GPU tests' "hardware" half run on WARP too.
 
+`VICTORY_WARP_REQUIRED=1` (set by the Windows validation workflow, whose
+runners always have WARP) turns every skip of a WARP run into a failure:
+no WARP device for the shader GPU tests (`valu_tests::test_host`), the
+pipeline-creation test or the GPU layer's queue and in-flight tests
+(`victory-gpu`'s `warp::device`), and WARP without 64-bit typed atomics
+for the SH-1 tests. A test that passed on CI therefore ran on WARP; the
+GPU layer's tests do not print their adapter (their output is captured).
+
 On Linux, the portable crates' tests:
 
 ```bash

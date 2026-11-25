@@ -33,6 +33,10 @@ concurrency:
 env:
   CARGO_TERM_COLOR: never
   RUST_BACKTRACE: "1"
+  # Windows always has WARP: a D3D12 test that cannot run its WARP half
+  # (no device, or a capability it checks) fails instead of skipping, so a
+  # test that passed here ran on WARP.
+  VICTORY_WARP_REQUIRED: "1"
 
 jobs:
   validate:

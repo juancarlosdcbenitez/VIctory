@@ -169,6 +169,29 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
 /// modules take this lock too.
 pub(super) static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Whether a GPU test whose WARP half cannot run (no WARP device, or WARP
+/// without a capability the test needs) fails instead of skipping that
+/// half: Windows CI sets `VICTORY_WARP_REQUIRED=1`, since its runners always
+/// have WARP, so a test that passed there ran on it.
+pub(super) fn warp_required() -> bool {
+    std::env::var("VICTORY_WARP_REQUIRED").is_ok_and(|v| v == "1")
+}
+
+/// The device for one half of a GPU test (`warp`: WARP, else the first
+/// hardware adapter), or `None` to skip that half; see [`warp_required`].
+pub(super) fn test_host(label: &str, warp: bool) -> Option<Host> {
+    match Host::new(warp) {
+        Ok(host) => Some(host),
+        Err(e) if warp && warp_required() => {
+            panic!("{label}: VICTORY_WARP_REQUIRED=1, but there is no WARP device: {e}")
+        }
+        Err(e) => {
+            eprintln!("{label}: skipped: {e}");
+            None
+        }
+    }
+}
+
 /// Runs `shader` on every available SM 6.6 host (hardware GPU and WARP) for
 /// each 4-dword input set and invokes `check(backend, case_index, inputs, result_dword)`.
 fn run_cases(
@@ -179,12 +202,8 @@ fn run_cases(
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
-        let host = match Host::new(warp) {
-            Ok(host) => host,
-            Err(e) => {
-                eprintln!("{label}: skipped: {e}");
-                continue;
-            }
+        let Some(host) = test_host(label, warp) else {
+            continue;
         };
         let kind = if host.adapter.1 {
             "software"
@@ -973,12 +992,8 @@ fn wide_image_atomics_on_the_host() {
     ];
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
-        let host = match Host::new(warp) {
-            Ok(host) => host,
-            Err(e) => {
-                eprintln!("{label}: skipped: {e}");
-                continue;
-            }
+        let Some(host) = test_host(label, warp) else {
+            continue;
         };
         let kind = if host.adapter.1 {
             "software"
@@ -986,6 +1001,11 @@ fn wide_image_atomics_on_the_host() {
             "hardware"
         };
         if !host.typed_atomics_64() {
+            assert!(
+                !(warp && warp_required()),
+                "{label}: VICTORY_WARP_REQUIRED=1, but {} has no 64-bit typed atomics",
+                host.adapter.0
+            );
             eprintln!(
                 "{label}: skipped: {} ({kind}) has no 64-bit typed atomics",
                 host.adapter.0
@@ -1090,14 +1110,15 @@ fn contended_wide_image_atomics_on_the_host() {
     const LANES: u32 = 32;
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
-        let host = match Host::new(warp) {
-            Ok(host) => host,
-            Err(e) => {
-                eprintln!("{label}: skipped: {e}");
-                continue;
-            }
+        let Some(host) = test_host(label, warp) else {
+            continue;
         };
         if !host.typed_atomics_64() {
+            assert!(
+                !(warp && warp_required()),
+                "{label}: VICTORY_WARP_REQUIRED=1, but {} has no 64-bit typed atomics",
+                host.adapter.0
+            );
             eprintln!(
                 "{label}: skipped: {} has no 64-bit typed atomics",
                 host.adapter.0
@@ -1250,12 +1271,8 @@ fn integer_lowerings_agree_with_the_evaluator_on_the_host() {
         .collect();
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
-        let host = match Host::new(warp) {
-            Ok(host) => host,
-            Err(e) => {
-                eprintln!("{label}: skipped: {e}");
-                continue;
-            }
+        let Some(host) = test_host(label, warp) else {
+            continue;
         };
         let kind = if host.adapter.1 {
             "software"
@@ -1449,12 +1466,8 @@ fn compare_lowered_bodies(ops: &[(&str, Vec<u32>, u8, Domain)], cases: &[[u32; 4
     use super::synth::{eval_valu, lower_valu};
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
-        let host = match Host::new(warp) {
-            Ok(host) => host,
-            Err(e) => {
-                eprintln!("{label}: skipped: {e}");
-                continue;
-            }
+        let Some(host) = test_host(label, warp) else {
+            continue;
         };
         let kind = if host.adapter.1 {
             "software"
@@ -1712,12 +1725,8 @@ fn probes_record_heap_indices_past_the_bound_heap_on_the_host() {
     let dwords = super::probe::DWORDS as u32;
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
-        let host = match Host::new(warp) {
-            Ok(host) => host,
-            Err(e) => {
-                eprintln!("{label}: skipped: {e}");
-                continue;
-            }
+        let Some(host) = test_host(label, warp) else {
+            continue;
         };
         let kind = if host.adapter.1 {
             "software"
