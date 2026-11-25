@@ -422,6 +422,44 @@ DirectXShaderCompiler repository.
     state, and write-watch answers do not depend on order; SH-2's typed
     stores reuse the raw-store path unchanged (addressing, index stride,
     guard, alignment, bounds), which they equal for those formats.
+* **Later in the session** (each pushed and run on Windows CI):
+  * GPU-1: a probed pixel shader passes `dxil.dll` (run 27): the global
+    UAV fence after each probe record is accepted outside compute stages,
+    which every probed graphics pipeline needs.
+  * PERF-2: `Retire` and `InFlight` against a real D3D12 queue on WARP
+    (run 25, passed): eight submissions in flight with their allocators
+    reused; a read waits for exactly the newest writer of its range.
+  * SH-7: packed f16 arithmetic against the evaluator on WARP (run 25).
+  * PERF-5: the hashing benchmark measures 2, 4 and 8 threads, each for at
+    least 50 ms. Windows runner, run 27 (4 threads; CPU throughput, not a
+    frame rate): a call on the pool costs 0.9-1.3 microseconds; split
+    hashes 1.0x at 1 MiB (below the 2 MiB threshold, by design), 1.8x and
+    2.6x at 4 MiB on 2 and 4 threads, 1.8x and 3.0x at 16 MiB, 2.0x and
+    3.0x at 64 MiB; 48 x 1 MiB side by side 2.0x and 3.1x, 12 x 4 MiB 1.9x
+    and 2.7x.
+  * SYNC-1: the 5 s frame line reports the ms per frame title threads
+    waited for each other's submissions (the submission lock), so a
+    hardware run shows what running submissions one at a time costs
+    (`4bc6e42`, measurement only).
+  * CI-1: `VICTORY_WARP_REQUIRED=1` on the Windows workflow turns every
+    skip of a WARP run into a failure (no WARP device; WARP without the
+    64-bit typed atomics the SH-1 tests need). The GPU layer's queue and
+    in-flight tests print nothing on CI (captured output), so before this
+    a skip there would have passed unseen (`3d3bd7d`).
+* **CI and the diagnostic package.** Runs 18-20, 22, 25 and 27 passed both
+  jobs; 21, 23, 24 and 26 were replaced while waiting by newer pushes
+  (cancelled, never run), and every commit they held is in a later run
+  that passed. Run 27 (`de302ed`) built
+  `victory-diag-0.1.0-de302ed0a8c7-windows-x64` (10,684,135 bytes; zip
+  SHA-256 `c3d1452ca5c2f2023e115ebd0bb7a99790863dd04e1ad235e114f675bf2742cc`;
+  `victory.exe` `58b6d7ca86ced684bc879c303df4456c4ef4286b11f2bc05cf10a7a4ff2850d2`,
+  `victory.pdb` `e5c1000a029e88369b466ab18d081aa5295a446042f453ec5598ad4b4d0feb56`),
+  after the job checked that the package holds exactly its nine files and
+  that `victory.exe --version` names the commit; run 25's (`39b7967`) is
+  `victory-diag-0.1.0-39b7967d92c8-windows-x64` (`victory.exe`
+  `b14a13b87455df30c42c99b8a053121276fece807719f985325ee7342ac7df7d`). The
+  runner's adapters: the Basic Render Driver twice and WARP, all software
+  (SM 6.8, 64-bit typed atomics); no hardware GPU, no game run.
 
 ## Backlog
 
@@ -433,7 +471,7 @@ P3 runtime compatibility, P4 usability.
 | GPU-1 | P0 | hypothesis, instrumented | **Out-of-range heap indices as a hang cause.** Audited (second session): table bases cannot leave the heaps (`draw::State::user_value` gives 0 for a table outside the bound heaps), and tables reaching past a smaller host heap get fresh slots (`draw::State::tables`). What remains unbounded is an index the shader computes per lane (bindless indexing, waterfall loops: `emit::lower::lane_heap_index`, `fetched_index`), read through `ResourceDescriptorHeap[]` with no clamp. Since the fourth session, probes (`VICTORY_SHADER_PROBES=1`, diagnostics) record every such index at or past the bound heap's slots, with the shader, without clamping. Check: hardware-validation.md stages 4 and 5. Records name the shaders whose index computation to fix; none, with DRED placing a fault past a heap, would mean an index inside the slots naming the wrong descriptor, which probes do not see. Clamping stays out: it would hide the defect. |
 | GPU-2 | P0 | verified off-GPU | Fence waits follow D3D12's rules (third session): no timeout, rewinds, bottom-of-pipe writes wake waiters. Next: a world run; a "blocking fence wait has not been reached" warning names a fence nothing signals, or a title deadlock. |
 | SYNC-1 | P0 | implemented, not run in the world | Queue waits were not carried out (work behind a wait not reached ran ahead of it). Since the fourth session the work is held and a queue worker runs it once the fence gets there (`schedule`, `queue`; the rules checked on WARP). Left running ahead, and counted: presents and page mappings on a held queue. Check: hardware-validation.md stage 6 (held counts after the frame lines; waits held 5 s or more; `VICTORY_QUEUE_WAITS=0` to compare). A wait that only held work could satisfy would hang: the log names it. |
-| PERF-2 | P2 | open; invariants written, two components built | Every submission runs synchronously: `host::Host::execute` holds a lock, executes, signals and waits `INFINITE` before returning (decision 0007). This makes lifetimes safe by construction, but CPU and GPU never overlap, and one submission past about 2 s is a TDR. The fourth session listed what depends on it (session log): single-buffered host copies, dirty-page copies over GPU-written ranges not yet copied back, completion writes, releases right after a submission, the probe buffer. Order: (1) a registry of in-flight GPU-written ranges that preparation consults (wait for that submission only, or skip the range); (2) host copies versioned per submission, or copied on write while in flight; (3) host resources and descriptor slots retired by host fence value; (4) completion (copy-back, bottom-of-pipe writes, probe reads) moved to the queue worker; (5) only then `execute` returning before the GPU finishes. Each step needs a world run on a GPU to show it changes nothing but timing; measure first (`VICTORY_GPU_TIMING`, the frame line's CPU and GPU times). Fifth session: the invariants are in architecture.md (C1-C4, O1-O3, what keeps each today and with overlap); `inflight::Retire` (O2) and `inflight::InFlight` (C3) exist, tested on their own and Retire on WARP with eight submissions in flight, allocators reused; not used yet. |
+| PERF-2 | P2 | open; invariants written, two components built | Every submission runs synchronously: `host::Host::execute` holds a lock, executes, signals and waits `INFINITE` before returning (decision 0007). This makes lifetimes safe by construction, but CPU and GPU never overlap, and one submission past about 2 s is a TDR. The fourth session listed what depends on it (session log): single-buffered host copies, dirty-page copies over GPU-written ranges not yet copied back, completion writes, releases right after a submission, the probe buffer. Order: (1) a registry of in-flight GPU-written ranges that preparation consults (wait for that submission only, or skip the range); (2) host copies versioned per submission, or copied on write while in flight; (3) host resources and descriptor slots retired by host fence value; (4) completion (copy-back, bottom-of-pipe writes, probe reads) moved to the queue worker; (5) only then `execute` returning before the GPU finishes. Each step needs a world run on a GPU to show it changes nothing but timing; measure first (`VICTORY_GPU_TIMING`, the frame line's CPU and GPU times). Fifth session: the invariants are in architecture.md (C1-C4, O1-O3, what keeps each today and with overlap); `inflight::Retire` (O2) and `inflight::InFlight` (C3) exist, tested on their own and on WARP (eight submissions in flight with allocators reused; a read waiting for exactly the newest writer of its range); not used yet. The frame line now reports the time title threads wait for each other's submissions. |
 | PERF-3 | P2 | hypothesis, instrumented | Loops stopped only at `LOOP_LIMIT` (2^20 per lane) can cost about a second in a full-screen pass, the order of the world's frame times. Since the third session a lane the limit stops leaves the program at every back edge; since the fourth, probes count and record such lanes with their shader. Check: hardware-validation.md stages 5 and 7 (`VICTORY_SHADER_LOOP_LIMIT=4096`); if frames get much faster, `VICTORY_GPU_TIMING=1` names the slow lists. Recorded stops in shaders whose loops should end tell whether the limit hides translation bugs. |
 | PERF-4 | P2 | hypothesis | Host copies of title buffers are custom-heap, write-back L0 (system memory; `host::Host::shared_buffer`), so a discrete GPU reads every vertex, index and constant there over PCIe. Check by timing a heavy pass with its inputs moved to a default heap. |
 | PERF-5 | P2 | parallel (equivalent), effect in a frame unmeasured | Textures in memory that cannot be write-watched are hashed whole (BLAKE3) at every submission that samples them, once per submission. Since the fourth session a submission's textures are checked side by side and big hashes split along BLAKE3's tree (bit-identical; on a pool of parked threads since the fifth session, which cut a call's overhead from 58-217 to 3-8 microseconds here). Skipping hashes across submissions would need to see writes through every view of the texture pool's pages (third session). Check: the frame line's "textures ms, MB" in a world run (hardware-validation.md stage 9). |
@@ -445,7 +483,7 @@ P3 runtime compatibility, P4 usability.
 | SH-6 | P1 | not implemented | Merged geometry stages; 64-lane cross-lane code on 32-lane hosts (README). |
 | SH-7 | P1 | DXIL verified; integers, floats, f16 and packed f16 on WARP | The evaluator programs pass `dxil.dll` on Windows CI; the integer lowerings agree with WARP (third session), and since the fifth 43 float lowerings, f16 arithmetic and packed f16 arithmetic agree to the bit but where the D3D11.3 specification leaves results to the device (NaN bits, denormal flushing, min/max zero signs, FMad fusion, chapter 22 precision). The comparison found two lowering defects, both fixed: f16 results rounded toward zero by D3D's `f32tof16`, and integer-to-float conversions not exact on every device. Left: everything on hardware; d16 texture returns keep D3D's conversion (the texture unit's rounding is not documented here). |
 | SH-8 | P1 | not verified | ds_bpermute's index in wave32 (we wrap at 32) against AMD's RDNA2 ISA guide (DS_BPERMUTE_B32), which this environment cannot reach. |
-| CI-1 | P1 | verified | Windows validation workflow (third session). It never claims a hardware result: hosted runners have no GPU. A hardware result needs a self-hosted runner with a GPU or a run on a machine with one. Since the fourth session it also builds the diagnostic download once the checks pass, and runs the hashing benchmark. |
+| CI-1 | P1 | verified | Windows validation workflow (third session). It never claims a hardware result: hosted runners have no GPU. A hardware result needs a self-hosted runner with a GPU or a run on a machine with one. Since the fourth session it also builds the diagnostic download once the checks pass, and runs the hashing benchmark. Since the fifth, a test that cannot run its WARP half fails there instead of skipping (`VICTORY_WARP_REQUIRED=1`). |
 | HW-1 | P0 | blocked (no machine) | The first hardware validation: [hardware-validation.md](hardware-validation.md): a baseline against `ffe310e`, a translation census and twelve stages on a Windows machine with a hardware D3D12 GPU and game files one may use, with the diagnostic download. Nothing in this repository's CI can stand in for it. |
 | PERF-1 | P2 | open | World frames take 0.5-1.8 s (README, one machine). No measurement possible here. The existing switches (`VICTORY_GPU_TIMING`, `VICTORY_SHADER_LOOP_LIMIT`) are where to start. |
 
@@ -453,9 +491,11 @@ P3 runtime compatibility, P4 usability.
 
 Remote branch head at the end of the fifth session: the last commit of
 `claude/sharp-thompson-o8cl4c` (the docs commit that adds this
-paragraph). Windows validation runs 18 to 20 passed (`628d456`,
-`ef346c8`, `ab8a6dd`), each with its diagnostic package; see the
-fifth-session entry for the later ones.
+paragraph). Windows validation runs 18-20, 22, 25 and 27 passed, each with
+its diagnostic package; the latest verified one is run 27's
+(`victory-diag-0.1.0-de302ed0a8c7-windows-x64`, checksums in the
+fifth-session entry). Runs for `4bc6e42` and `3d3bd7d` had not finished
+when this was written.
 
 1. Check the latest Windows validation run: both jobs green, the summary
    saying no hardware GPU was present, the float, f16 and packed f16
