@@ -130,7 +130,7 @@ test on a machine with a GPU, one switch at a time.
 | `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
 | `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
 | `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
-| `VICTORY_SHADER_PROBES=1` | translated shaders count and record heap indices past the bound heap and lanes the loop limit stops, logged with the shader after each submission (nothing is clamped; own shader cache entries) |
+| `VICTORY_SHADER_PROBES=1` | translated shaders count and record heap indices past the bound heap (checked before the descriptor is fetched, so a fault's failure report can name it) and lanes the loop limit stops, logged with the shader after each submission (nothing is clamped; own shader cache entries; a pipeline with a full root signature is dropped in such runs, and logged) |
 | `VICTORY_SHADER_IMAGE_ATOMICS_64=1` | translates 64-bit image atomics, off by default (checked on WARP only; own shader cache entries) |
 | `VICTORY_QUEUE_WAITS=0` | queue waits no longer hold back the work behind them (the earlier behaviour, to compare) |
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
