@@ -346,6 +346,54 @@ Nothing here ran on a hardware GPU or with the game.
   showed (`v_div_fixup_f32` and `v_cvt_off_f32_i4` refused, 46 others
   lowered).
 
+### 2026-11-25, fifth session (same container; Windows CI)
+
+Baseline: `b4b6a7b` plus a docs checkpoint; runs 16 and 17 red in the
+float differential. Microsoft's D3D11.3 functional specification (v1.17)
+was read from the DirectX-Specs repository on GitHub (`microsoft.github.io`
+is not reachable from this environment); DXIL.rst from the
+DirectXShaderCompiler repository.
+
+* **f16 results rounded toward zero on every D3D device** (defect, fixed;
+  verified on the evaluator and on WARP, run 18). D3D's `f32tof16` (DXIL
+  `legacyF32ToF16`) "Follows D3D rules for floating point conversion"
+  (22.13.2): round toward zero, and an overflow gives "the maximum
+  representable (appropriately signed) value ..., NOT including signed
+  infinity" (3.2.2). The lowering used it for every f16 result the ISA
+  rounds to nearest even: `v_cvt_f16_f32`, f16 and packed f16 arithmetic,
+  `v_fma_mix`, packed f16 interpolation. The evaluator had modelled the op
+  as nearest-even, which hid it; runs 16 and 17 showed it (WARP: f32::MAX
+  to `0x7BFF`, not infinity). Now `f16_nearest_even` converts with
+  operations D3D defines exactly (integer arithmetic on the bits; for half
+  denormals a power-of-two scale and `round_ne`), and the evaluator models
+  the DXIL op as the specification defines it, so three existing evaluator
+  tests failed against the old lowering and pass against the new. The d16
+  texture and buffer returns keep D3D's conversion (a shortcut now
+  documented: the texture unit's rounding is not documented here).
+* **Integer-to-float conversions not exact on every device** (defect,
+  fixed; verified on WARP, run 18): for integers too large to convert
+  exactly, nearest-even rounding is "strongly recommended but not
+  required" (22.13.5-6), and WARP rounds `0xFFFFFF6B` up to 2^32.
+  `v_cvt_f32_u32` and `v_cvt_f32_i32` now build such values from their
+  bits.
+* **The differential accepts only what the specifications permit**: NaN
+  bits (3.1.3.2), compared per half for f16; denormals flushed on input or
+  output (3.1.3.2, never for halves: 3.1.5); zero signs from min/max only;
+  `FMad` fused or not (DXIL.rst); approximate operations within their
+  chapter 22 bounds (rcp, rsq, exp 2^-21 relative; sqrt 1 ULP; log 2^-21
+  absolute on [0.5, 2] else relative; sin and cos 0.0008 absolute within
+  100 pi radians). Run 18: no other difference; the three conversions and
+  `v_add/sub/mul/fma_f16` agree with the evaluator to the bit.
+* **Probes now check an access before it fetches its descriptor**
+  (defect, fixed; verified on the evaluator; WARP: run 19). The fourth
+  session's checks ran at the end of each block, after the accesses, so
+  an access whose descriptor fetch faults (GPU-1's case) left no record.
+  Each access is now checked just before its `createHandleFromHeap`, and
+  the record is followed by a global UAV fence before the fetch is issued.
+  Whether a record reaches memory before a device is removed still depends
+  on the device. A test shows the record exists when the evaluator stops
+  at the faulting access, and fails with the old placement.
+
 ## Backlog
 
 Priority order: P0 GPU stability, P1 shader correctness, P2 performance,
