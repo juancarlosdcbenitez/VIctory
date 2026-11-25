@@ -182,8 +182,9 @@ const PARALLEL_MIN: u64 = 2 << 20;
 /// Brings `due` up to date: textures a submission samples, checked one after
 /// another with no title memory written in between, each detiled into its
 /// staging buffer if its memory changed (and is mapped at all). They are
-/// checked side by side when there is enough memory to read, each hash on
-/// the threads left over; the outcome does not depend on how.
+/// checked side by side on the parallel pool when there is enough memory
+/// to read; a group of one texture splits its hash instead (a call nested
+/// in the pool's work runs alone). The outcome does not depend on how.
 pub(crate) fn refresh(due: &[Arc<Staging>]) {
     use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
     if due.is_empty() {
@@ -197,9 +198,8 @@ pub(crate) fn refresh(due: &[Arc<Staging>]) {
     } else {
         victory_core::parallel::threads()
     };
-    let workers = threads.min(due.len());
-    let per_hash = (threads / workers.max(1)).max(1);
-    victory_core::parallel::for_each(due, workers, |staging| {
+    let per_hash = if due.len() == 1 { threads } else { 1 };
+    victory_core::parallel::for_each(due, threads, |staging| {
         read.fetch_add(staging.refresh_now(per_hash), Relaxed);
     });
     let preparing = &crate::host::PREPARING;
