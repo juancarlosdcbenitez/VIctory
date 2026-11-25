@@ -2743,6 +2743,73 @@ fn wide_image_atomics_on_a_typed_texture() {
     }
 }
 
+/// 64-bit image atomics from all 32 lanes of a wave on one texel: adds of
+/// 0xFFFF_FFFF, each carrying into the high dword but the first; a cmpswap
+/// against 0 that one lane wins; umax. What `synth::check_contended` checks
+/// holds whatever order lanes run in (no update lost, each lane's old
+/// value one the texel held); the evaluator runs them in one order, the
+/// host test (`contended_wide_image_atomics_on_the_host`) in the GPU's.
+#[test]
+fn contended_wide_image_atomics_keep_every_update() {
+    for name in [
+        "image_atomic_add",
+        "image_atomic_cmpswap",
+        "image_atomic_umax",
+    ] {
+        let body = super::synth::contended_image_atomic(
+            mimg_op(name),
+            name.ends_with("cmpswap"),
+            name.ends_with("add"),
+        );
+        super::TEST_IMAGE_ATOMICS_64.set(true);
+        let lowered = super::synth::lower_native(&super::synth::image_wave_program(&body, 32));
+        super::TEST_IMAGE_ATOMICS_64.set(false);
+        let l = lowered.unwrap_or_else(|e| panic!("{name}: does not lower: {e}"));
+        let (buffer, texture) = super::synth::eval_image_wave(&l, 32)
+            .unwrap_or_else(|e| panic!("{name}: does not run: {e}"));
+        super::synth::check_contended(name, 32, &buffer, &texture).unwrap();
+    }
+}
+
+/// `synth::check_contended` refuses what a broken 64-bit atomic would
+/// leave: 32-bit halves updated apart (the carry dropped), a lost update
+/// (an old value twice), two cmpswap winners, a umax short of the largest.
+#[test]
+fn contended_atomic_checks_catch_broken_results() {
+    use super::synth::{CONTENDED_TEXEL, check_contended, contended_value};
+    let lanes = 4u32;
+    let (x, y) = CONTENDED_TEXEL;
+    let at = 2 * (4 * y + x) as usize;
+    let run = |old: &[u64], texel: u64| {
+        let mut buffer = vec![0u32; 192];
+        for (i, &o) in old.iter().enumerate() {
+            buffer[128 + i] = o as u32;
+            buffer[64 + i] = (o >> 32) as u32;
+        }
+        let mut texture = vec![0u32; 32];
+        texture[at] = texel as u32;
+        texture[at + 1] = (texel >> 32) as u32;
+        (buffer, texture)
+    };
+    let step = 0xFFFF_FFFFu64;
+    let check = |name: &str, old: &[u64], texel: u64| {
+        let (buffer, texture) = run(old, texel);
+        check_contended(name, lanes, &buffer, &texture)
+    };
+    let sums = [0, step, 2 * step, 3 * step];
+    check("image_atomic_add", &sums, 4 * step).unwrap();
+    let carry_dropped = (4 * step) & 0xFFFF_FFFF;
+    assert!(check("image_atomic_add", &sums, carry_dropped).is_err());
+    assert!(check("image_atomic_add", &[0, step, step, 3 * step], 4 * step).is_err());
+    let v = contended_value;
+    check("image_atomic_cmpswap", &[v(2), 0, v(2), v(2)], v(1)).unwrap_err();
+    check("image_atomic_cmpswap", &[v(1), 0, v(1), v(1)], v(1)).unwrap();
+    assert!(check("image_atomic_cmpswap", &[0, 0, v(1), v(1)], v(1)).is_err());
+    check("image_atomic_umax", &[0, v(0), v(1), v(1)], v(3)).unwrap();
+    assert!(check("image_atomic_umax", &[0, v(0), v(1), v(1)], v(2)).is_err());
+    assert!(check("image_atomic_umax", &[0, 7, v(1), v(1)], v(3)).is_err());
+}
+
 /// A 64-bit image atomic declares what it needs (DXC's rules): 64-bit
 /// integer operations, 64-bit atomics on a typed resource and on a
 /// descriptor-heap resource, in the shader flags and SFI0. Without the

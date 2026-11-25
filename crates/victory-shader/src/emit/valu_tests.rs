@@ -1073,6 +1073,86 @@ fn wide_image_atomics_on_the_host() {
     }
 }
 
+/// `eval_tests::contended_wide_image_atomics_keep_every_update` on each
+/// device with 64-bit typed atomics (WARP on CI): 32 threads do one 64-bit
+/// atomic each on the same texel, in whatever order the device runs them,
+/// and what they leave must pass the same order-independent checks (no
+/// update or carry lost, one cmpswap winner, each old value one the texel
+/// held). Repeated, since an interleaving that loses an update need not
+/// come every time.
+#[test]
+fn contended_wide_image_atomics_on_the_host() {
+    use super::synth::{check_contended, contended_image_atomic, image_wave_program, user_data};
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let op = |name: &str| {
+        crate::gfx10::opcode(crate::gfx10::Encoding::Mimg, name).unwrap_or_else(|| panic!("{name}"))
+    };
+    const LANES: u32 = 32;
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let host = match Host::new(warp) {
+            Ok(host) => host,
+            Err(e) => {
+                eprintln!("{label}: skipped: {e}");
+                continue;
+            }
+        };
+        if !host.typed_atomics_64() {
+            eprintln!(
+                "{label}: skipped: {} has no 64-bit typed atomics",
+                host.adapter.0
+            );
+            continue;
+        }
+        eprintln!("{label}: on {}", host.adapter.0);
+        for name in [
+            "image_atomic_add",
+            "image_atomic_cmpswap",
+            "image_atomic_umax",
+        ] {
+            let body =
+                contended_image_atomic(op(name), name.ends_with("cmpswap"), name.ends_with("add"));
+            super::TEST_IMAGE_ATOMICS_64.set(true);
+            let lowered = super::synth::lower_native(&image_wave_program(&body, LANES));
+            super::TEST_IMAGE_ATOMICS_64.set(false);
+            let l = lowered.unwrap_or_else(|e| panic!("{name}: does not lower: {e}"));
+            let shader = HostShader {
+                stage: HwStage::Cs,
+                dxil: l.dxil.clone(),
+                user_data: l.user_data.clone(),
+                samplers: l.samplers.clone(),
+                static_samplers: Vec::new(),
+                root_cbvs: l.root_cbvs.clone(),
+                root_srvs: l.root_srvs.clone(),
+                probe: l.probe,
+            };
+            let (root, pso) = host
+                .compute_pipeline(&shader)
+                .unwrap_or_else(|e| panic!("{label} {name}: compute_pipeline failed: {e}"));
+            for round in 0..8 {
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &Dispatch {
+                            roots: vec![(0, Root::Constants(user_data(&l, [0; 4])))],
+                            views: &[View::RawUav(192), View::Uint2TextureUav(4, 4)],
+                            samplers: &[],
+                            groups: [1, 1, 1],
+                        },
+                    )
+                    .unwrap_or_else(|e| panic!("{label} {name}: dispatch failed: {e}"));
+                check_contended(name, LANES, &out[0], &out[1])
+                    .unwrap_or_else(|e| panic!("{label}, round {round}: {e}"));
+            }
+        }
+        ran += 1;
+    }
+    if ran == 0 {
+        eprintln!("no SM 6.6 device with 64-bit typed atomics; nothing ran");
+    }
+}
+
 /// Runs a lowered `synth::valu_program` on `host` for each input set: the
 /// four stored dwords (`v0, v5, v6, v7`) per set.
 fn run_lowered(host: &Host, l: &super::lower::Lowered, cases: &[[u32; 4]]) -> Vec<[u32; 4]> {

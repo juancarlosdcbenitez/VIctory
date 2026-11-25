@@ -413,6 +413,152 @@ pub(super) fn image_program(body: &[u32]) -> NativeProgram {
     native
 }
 
+/// [`wave_program`] of `lanes` lanes (wave32) with [`image_program`]'s
+/// texture UAV, its descriptor loaded into `s[12:19]` before `body` runs.
+pub(super) fn image_wave_program(body: &[u32], lanes: u32) -> NativeProgram {
+    let mut words = s_load_dwordx8(12, 4, 32).to_vec();
+    words.extend_from_slice(body);
+    let mut native = wave_program(&words, lanes, false);
+    native.used.push(UsedResource {
+        kind: ResourceType::Uav,
+        root: RootType::Table,
+        table_offset_dwords: 8,
+        lower_bound: 0,
+        stride: 0,
+        dwords: 8,
+        user_data: 4,
+        slot: 1,
+    });
+    native
+}
+
+/// Runs a lowered [`image_wave_program`] of `lanes` lanes on the evaluator,
+/// the buffer and a 4x4 two-dword texture starting zeroed: the buffer's
+/// dwords (the A, B and result arrays) and the texture's afterwards.
+pub(super) fn eval_image_wave(l: &Lowered, lanes: u32) -> Result<(Vec<u32>, Vec<u32>), String> {
+    let mut env = Env {
+        user_data: user_data(l, [0; 4]),
+        lanes,
+        wave_lanes: lanes,
+        group_size: [lanes, 1, 1],
+        ..Env::default()
+    };
+    env.heap.insert(0, vec![0; 3 * 256]);
+    env.heap.insert(IMAGE_INDEX, vec![0; 16 * 8]);
+    env.textures.insert(IMAGE_INDEX, [4, 4, 1]);
+    eval::run(&l.module, &mut env)?;
+    if env.out_of_bounds != 0 {
+        return Err(format!("{} accesses out of bounds", env.out_of_bounds));
+    }
+    let dwords = |b: &[u8]| -> Vec<u32> {
+        b.as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&w| u32::from_le_bytes(w))
+            .collect()
+    };
+    Ok((dwords(&env.heap[&0]), dwords(&env.heap[&IMAGE_INDEX])))
+}
+
+/// The texel [`contended_image_atomic`] programs change: (x, y) of 4x4.
+pub(super) const CONTENDED_TEXEL: (u32, u32) = (2, 1);
+
+/// The value lane `i` offers to a contended cmpswap or umax: distinct per
+/// lane, never 0, growing with the lane.
+pub(super) const fn contended_value(i: u64) -> u64 {
+    i << 32 | (i + 1)
+}
+
+/// The body of an [`image_wave_program`] in which every lane does one 64-bit
+/// image atomic (`op`, returning) on [`CONTENDED_TEXEL`]: add 0xFFFF_FFFF
+/// (so the low dword carries into the high one at every add but the
+/// first), or offer [`contended_value`] to cmpswap (comparing with 0) or
+/// umax. The old value goes back to the lane: its low dword to the result
+/// array, its high dword over the lane's B entry.
+pub(super) fn contended_image_atomic(op: u16, cmpswap: bool, add: bool) -> Vec<u32> {
+    let (x, y) = CONTENDED_TEXEL;
+    let mut body = vec![
+        vop1(0x001, 5, 128 + x as u16),
+        vop1(0x001, 6, 128 + y as u16),
+    ];
+    if add {
+        body.push(vop1(0x001, 1, 193)); // v1 = -1
+        body.push(vop1(0x001, 2, 128)); // v2 = 0
+    } else {
+        body.push(vop2(0x25, 1, 129, 0)); // v_add_nc_u32 v1, 1, v0
+        body.push(vop1(0x001, 2, 256)); // v2 = v0
+    }
+    if cmpswap {
+        body.push(vop1(0x001, 3, 128));
+        body.push(vop1(0x001, 4, 128));
+    }
+    body.extend(mimg(op, 1, 5, 12, if cmpswap { 0xF } else { 0x3 }, 1, true));
+    body.push(vop1(0x001, 4, 256 + 1));
+    body.extend(mubuf_offen(0x1C, 2, 9, 8, WAVE_B));
+    body
+}
+
+/// Checks what `lanes` lanes left after a [`contended_image_atomic`] named
+/// `name`, whatever order they ran in: `buffer` and `texture` as
+/// [`eval_image_wave`] gives them (or a host's views).
+pub(super) fn check_contended(
+    name: &str,
+    lanes: u32,
+    buffer: &[u32],
+    texture: &[u32],
+) -> Result<(), String> {
+    let n = u64::from(lanes);
+    let (x, y) = CONTENDED_TEXEL;
+    let at = 2 * (4 * y + x) as usize;
+    let texel = u64::from(texture[at]) | u64::from(texture[at + 1]) << 32;
+    let others = texture
+        .iter()
+        .enumerate()
+        .any(|(k, &w)| k / 2 != at / 2 && w != 0);
+    if others {
+        return Err(format!("{name}: other texels changed: {texture:08x?}"));
+    }
+    let old: Vec<u64> = (0..lanes as usize)
+        .map(|i| u64::from(buffer[128 + i]) | u64::from(buffer[64 + i]) << 32)
+        .collect();
+    let zeros = old.iter().filter(|&&o| o == 0).count();
+    let fail = |why: &str| Err(format!("{name}: {why}: texel {texel:#x}, old {old:#x?}"));
+    match name {
+        "image_atomic_add" => {
+            let step = 0xFFFF_FFFFu64;
+            if texel != n * step {
+                return fail("an update was lost or a carry dropped");
+            }
+            let mut got = old.clone();
+            got.sort_unstable();
+            if got != (0..n).map(|k| k * step).collect::<Vec<_>>() {
+                return fail("the old values are not each partial sum once");
+            }
+        }
+        "image_atomic_cmpswap" => {
+            if zeros != 1 || !(0..n).any(|i| contended_value(i) == texel) {
+                return fail("not exactly one lane swapped its value in");
+            }
+            if old.iter().any(|&o| o != 0 && o != texel) {
+                return fail("a losing lane did not get the winner's value");
+            }
+        }
+        "image_atomic_umax" => {
+            if texel != contended_value(n - 1) || zeros != 1 {
+                return fail("not the largest value, or not one first lane");
+            }
+            if old
+                .iter()
+                .any(|&o| o != 0 && !(0..n).any(|i| contended_value(i) == o))
+            {
+                return fail("an old value no lane offered");
+            }
+        }
+        _ => return Err(format!("{name}: no check")),
+    }
+    Ok(())
+}
+
 /// Runs a lowered [`image_program`] whose texture (`dims`: width, height,
 /// depth or layers) holds `texels`: the stored `v0, v5, v6, v7` and the
 /// texture's bytes afterwards.
