@@ -122,6 +122,7 @@ layer). Those marked *translation* get their own shader cache entries.
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | *translation*: shader loops stop after `n` iterations per lane instead of 2^20 | `translated loops stop sooner`; compare the 5 s frame lines with a run without it |
 | `VICTORY_SHADER_IMAGE_ATOMICS_64=1` | *translation*: 64-bit image atomics are translated (off by default; checked on WARP only); refused on devices without 64-bit typed atomics | `64-bit image atomics are translated`; pipeline errors naming them |
 | `VICTORY_QUEUE_WAITS=0` | queue waits no longer hold work back (the old behaviour, to compare) | `queue waits do not hold work back`; without it: `queues are held back by waits not reached` after 5 s, and the held counts after the frame lines |
+| `VICTORY_TEXTURE_THREADS=<n>` | texture checks use at most `n` threads, 1 to 8 (default: the machine's, at most 8; 1: only the thread submitting) | `texture checks use up to <n> thread(s)`; compare the 5 s lines' textures ms and ms/frame with a run without it |
 | `VICTORY_GPU_TIMING=1` | each command list of a submission run and timed on its own (slow); with `VICTORY_D3D12_DRED=1` the commands are noted too | slow lists, with their slowest commands when noted |
 | `VICTORY_SKIP_PIPELINES=<hash>,...` | draws and dispatches of pipelines with those shader hashes omitted | whether a failure or slowdown goes away |
 | `VICTORY_D3D12_WARP=1` | host device on the software adapter | `; on <adapter> (software)` in failure lines; a fault that WARP also shows points at translation, not the driver |

@@ -23,14 +23,42 @@ pub const PARALLEL_HASH_MIN: usize = 2 << 20;
 /// SIMD parallelism inside it.
 const LEAF_MIN: usize = 1 << 20;
 
-/// How many threads parallel work uses: the machine's, at most 8.
+/// The most threads parallel work uses.
+const MAX_THREADS: usize = 8;
+
+/// How many threads parallel work uses: the machine's, at most 8. In
+/// diagnostics builds `VICTORY_TEXTURE_THREADS=<n>` sets it (1 to 8; with 1
+/// everything runs on the calling thread and no pool is started), so a run
+/// can compare frame times with the title's own threads less contended
+/// (PERF-5): texture checks are the only parallel work.
 pub fn threads() -> usize {
     static THREADS: OnceLock<usize> = OnceLock::new();
     *THREADS.get_or_init(|| {
-        std::thread::available_parallelism()
-            .map_or(1, std::num::NonZeroUsize::get)
-            .min(8)
+        let machine = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        let asked = if cfg!(feature = "diagnostics") {
+            std::env::var("VICTORY_TEXTURE_THREADS").ok()
+        } else {
+            None
+        };
+        let n = chosen_threads(machine, asked.as_deref());
+        if let Some(asked) = asked {
+            tracing::warn!(
+                "VICTORY_TEXTURE_THREADS={asked}: texture checks use up to {n} thread(s) \
+                 (the machine has {machine})"
+            );
+        }
+        n
     })
+}
+
+/// The thread count on a machine with `machine` threads: `asked` if it is
+/// a number (kept within 1 to [`MAX_THREADS`]), else the machine's, at most
+/// [`MAX_THREADS`].
+fn chosen_threads(machine: usize, asked: Option<&str>) -> usize {
+    match asked.and_then(|a| a.trim().parse::<usize>().ok()) {
+        Some(n) => n.clamp(1, MAX_THREADS),
+        None => machine.clamp(1, MAX_THREADS),
+    }
 }
 
 /// The BLAKE3 hash of `bytes`, equal to `blake3::hash(bytes)`, computed on
@@ -295,7 +323,21 @@ mod tests {
 
     #[test]
     fn threads_are_bounded() {
-        assert!((1..=8).contains(&threads()));
+        assert!((1..=MAX_THREADS).contains(&threads()));
+    }
+
+    #[test]
+    fn a_thread_count_asked_for_is_kept_within_bounds() {
+        assert_eq!(chosen_threads(16, None), 8);
+        assert_eq!(chosen_threads(4, None), 4);
+        assert_eq!(chosen_threads(1, None), 1);
+        assert_eq!(chosen_threads(16, Some("1")), 1);
+        assert_eq!(chosen_threads(16, Some(" 3 ")), 3);
+        assert_eq!(chosen_threads(4, Some("6")), 6);
+        assert_eq!(chosen_threads(16, Some("0")), 1);
+        assert_eq!(chosen_threads(16, Some("64")), 8);
+        assert_eq!(chosen_threads(6, Some("many")), 6);
+        assert_eq!(chosen_threads(6, Some("")), 6);
     }
 
     /// Callers on several threads at once: one has the pool, the others

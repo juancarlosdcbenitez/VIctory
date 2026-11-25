@@ -133,6 +133,7 @@ test on a machine with a GPU, one switch at a time.
 | `VICTORY_SHADER_PROBES=1` | translated shaders count and record heap indices past the bound heap (checked before the descriptor is fetched, so a fault's failure report can name it) and lanes the loop limit stops, logged with the shader after each submission (nothing is clamped; own shader cache entries; a pipeline with a full root signature is dropped in such runs, and logged) |
 | `VICTORY_SHADER_IMAGE_ATOMICS_64=1` | translates 64-bit image atomics, off by default (checked on WARP only; own shader cache entries) |
 | `VICTORY_QUEUE_WAITS=0` | queue waits no longer hold back the work behind them (the earlier behaviour, to compare) |
+| `VICTORY_TEXTURE_THREADS=<n>` | texture checks (hashes of texture memory that cannot be write-watched) use at most `n` threads, 1 to 8 (default: the machine's, at most 8; 1: the submitting thread only), to compare frame times with the title's own threads less contended |
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |

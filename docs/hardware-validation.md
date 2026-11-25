@@ -210,7 +210,11 @@ frame time (SYNC-1, PERF-2 in the status page). These numbers are the baseline e
 optimization is measured against (target: 30 fps, 33 ms per frame; the
 README's machine had 0.5-1.8 s). One more run with `VICTORY_GPU_TIMING=1`
 names the slow command lists (with `VICTORY_D3D12_DRED=1` too, their
-slowest commands).
+slowest commands). Where the lines show textures taking more than a
+millisecond or two per frame, one more run, same route, with
+`VICTORY_TEXTURE_THREADS=1`: if ms per frame drops although textures ms
+rises, the texture checks' threads compete with the title's (PERF-5);
+if both rise, they help.
 
 The 5 s lines are averages. Presented-frame intervals one by one, which
 show stutter the averages hide: `VICTORY_LOG=victory_gpu::frame=debug,info`
