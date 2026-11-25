@@ -117,19 +117,43 @@ pub(crate) fn fence_moved(at: usize, value: u64) {
 
 /// Holds `held` back on `queue` if anything holds the queue; else gives it
 /// back to run now.
-fn hold(queue: usize, held: impl FnOnce() -> Held) -> bool {
+/// What a submission to a queue does.
+enum Submit {
+    /// Held back behind the queue's waits.
+    Held,
+    /// Run now by the submitting thread, the queue claimed until done.
+    Now(Claim),
+}
+
+/// A queue claimed for work its submitter runs at once: until this is
+/// dropped, waits and work other threads submit to the queue are held
+/// behind it, so they cannot run ahead of it on the worker.
+struct Claim(Option<usize>);
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        if let Some(queue) = self.0 {
+            queues().finished(queue);
+            MOVED.notify_all();
+        }
+    }
+}
+
+/// Holds `held` back if the queue has waits not reached (or work before
+/// it), else claims the queue for the caller to run it now.
+fn hold(queue: usize, held: impl FnOnce() -> Held) -> Submit {
     if !holding() {
-        return false;
+        return Submit::Now(Claim(None));
     }
     let mut q = queues();
-    if !q.holds(queue) {
-        return false;
+    if q.direct(queue) {
+        return Submit::Now(Claim(Some(queue)));
     }
     q.submit(queue, held());
     HELD[0].fetch_add(1, Ordering::Relaxed);
     start_worker();
     MOVED.notify_all();
-    true
+    Submit::Held
 }
 
 fn start_worker() {
@@ -341,14 +365,15 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
                     .collect(),
             )
         };
-        if hold(this as usize, shared) {
+        let Submit::Now(claim) = hold(this as usize, shared) else {
             return;
-        }
+        };
         let host_lists: Vec<_> = lists
             .iter()
             .filter_map(|&l| crate::list::host_list(l))
             .collect();
         host.execute(&host_lists);
+        drop(claim);
         return;
     }
     static ONCE: AtomicBool = AtomicBool::new(false);
@@ -387,10 +412,12 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
         return E_INVALIDARG;
     }
     let at = crate::fence::value_address(fence);
-    if hold(this as usize, || Held::Signal { fence: at, value }) {
+    let Submit::Now(claim) = hold(this as usize, || Held::Signal { fence: at, value }) else {
         return S_OK;
-    }
-    crate::fence::signal(fence, value)
+    };
+    let signalled = crate::fence::signal(fence, value);
+    drop(claim);
+    signalled
 }
 /// Holds back what is submitted to the queue after it until the fence
 /// reaches `value` (see the module).

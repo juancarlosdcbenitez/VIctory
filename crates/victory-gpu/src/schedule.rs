@@ -64,7 +64,20 @@ impl<T> Schedule<T> {
         self.busy.contains(&queue) || self.queues.get(&queue).is_some_and(|q| !q.is_empty())
     }
 
-    /// The operations [`Schedule::runnable`] gave out for `queue` have run.
+    /// Claims `queue` for work its submitter runs at once: true if nothing
+    /// holds it back. Until [`Schedule::finished`], the queue is busy, so
+    /// waits and work submitted meanwhile (from other threads) are held
+    /// behind it in order instead of running ahead of it.
+    pub(crate) fn direct(&mut self, queue: usize) -> bool {
+        if self.holds(queue) {
+            return false;
+        }
+        self.busy.insert(queue);
+        true
+    }
+
+    /// The operations [`Schedule::runnable`] gave out for `queue`, or the
+    /// work run at once under [`Schedule::direct`], have run.
     pub(crate) fn finished(&mut self, queue: usize) {
         self.busy.remove(&queue);
     }
@@ -220,6 +233,27 @@ mod tests {
 
     fn names(ops: Vec<(usize, Op)>) -> Vec<(usize, &'static str)> {
         ops.into_iter().map(|(q, op)| (q, op.0)).collect()
+    }
+
+    /// Work its submitter runs at once claims the queue: a wait and work
+    /// another thread submits meanwhile are held behind it, in order, and
+    /// run only once it has finished.
+    #[test]
+    fn work_run_at_once_holds_what_is_submitted_meanwhile() {
+        let mut s: Schedule<u32> = Schedule::new();
+        assert!(s.direct(A), "nothing held: run at once");
+        assert!(s.holds(A));
+        // Meanwhile, another thread: a wait already reached, then work.
+        s.wait(A, F, 1, 1);
+        assert_eq!(s.submit(A, 7), None, "held behind the running work");
+        assert!(s.runnable().is_empty(), "busy");
+        s.finished(A);
+        assert_eq!(s.runnable(), vec![(A, 7)]);
+        assert!(!s.direct(A), "busy with the released work");
+        s.finished(A);
+        assert!(s.direct(A));
+        s.finished(A);
+        assert!(!s.holds(A));
     }
 
     #[test]
