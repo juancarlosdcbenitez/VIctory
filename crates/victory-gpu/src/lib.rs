@@ -31,6 +31,7 @@ pub mod frame;
 mod host;
 #[cfg(windows)]
 mod indirect;
+mod inflight;
 pub mod list;
 #[cfg(any(windows, test))]
 mod merge;

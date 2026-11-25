@@ -103,3 +103,37 @@ runs the emitted module for one thread, and `emit::eval_tests` checks
 synthetic programs on it against the ISA. See [testing.md](testing.md);
 the engineering record and backlog are in
 [engineering-status.md](engineering-status.md).
+
+## GPU submission and its invariants
+
+Title command lists are recorded into host command lists as the title
+records them. A submission (`ExecuteCommandLists`, or held work the queue
+worker releases) runs one at a time in `host::Host::execute`, under one
+lock (decision 0007):
+
+1. preparation: the title memory the lists read is copied into host
+   copies, only what changed (buffers: `shadow`; textures:
+   `texture::Staging`, checked side by side on the parallel pool);
+2. the lists run on one host direct queue, and the CPU waits for them
+   (host fence, no timeout);
+3. what shaders wrote is copied back into title memory, then the
+   bottom-of-pipe writes (fence values, timestamps) are made and the probe
+   buffer is read.
+
+What this keeps true, and what any overlap of CPU and GPU work (PERF-2)
+has to keep true some other way:
+
+| | Invariant | Kept today by | Kept with overlap by |
+|-|-----------|---------------|----------------------|
+| C1 | A host copy has one writer at a time: preparation (CPU) or one submission's GPU work | the lock and the CPU wait | a version of the copy per submission in flight, or copy-on-write while in flight |
+| C2 | GPU-written ranges reach title memory before the submission's bottom-of-pipe writes and fence signals tell the title it finished | step order in `execute` | completion (copy-back, bottom-of-pipe writes, signals) run by the queue worker after the host fence |
+| C3 | Preparation reads title memory only after every earlier submission's copy-back of the ranges it reads | the CPU wait | `inflight::InFlight`: wait for exactly the submission that writes a range about to be read |
+| C4 | Work on one title queue runs in submission order, behind the waits it was submitted after | `schedule::Schedule`; work run at once claims its queue | unchanged |
+| O1 | A host list belongs to the submission running it; a title list reset meanwhile gets a fresh host list | `Arc` shared with held work | unchanged |
+| O2 | Host resources, allocators and descriptor slots a submission uses live until it finishes | released after `execute` returns, after the GPU finished | `inflight::Retire`, released by host fence value |
+| O3 | The probe buffer is read and cleared between submissions | the lock | a probe buffer per submission in flight |
+
+`inflight::Retire` and `inflight::InFlight` exist and are tested (WARP:
+eight submissions in flight with their own upload buffers and allocators,
+retired by fence value) but nothing uses them yet: every submission still
+waits, so neither has anything to do.
