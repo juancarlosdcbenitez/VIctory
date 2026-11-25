@@ -18,7 +18,11 @@ so; those read paths from environment variables and skip without them.
 
 The evaluator makes the choices DXIL leaves to drivers one way (FMax/FMin
 of two zeros give the first operand, FMad is unfused, float-to-integer
-conversions saturate) and refuses what LLVM leaves undefined (shifts by
+conversions saturate, fp32 denormals are kept) and models what D3D
+specifies as specified: `legacyF32ToF16` rounds toward zero and stops an
+overflow at the largest finite half (D3D11.3 22.13.2, 3.2.2; until the
+fifth session it was modelled as nearest-even, which hid a lowering
+defect) and refuses what LLVM leaves undefined (shifts by
 the bit width, division by zero, branches on undefined values), so a
 lowering that leans on either fails there. It runs one thread, or a whole
 wave in lockstep (`Env::lanes`). Wave operations are evaluated across the
@@ -159,12 +163,38 @@ the host, the probe constants and buffer are root parameters
 `Root::Uav(dwords)`: a zeroed buffer bound as a root UAV and read back).
 
 Float lowerings against a device:
-`valu_tests::float_lowerings_agree_with_the_evaluator_on_the_host`
-compares each stored dword with the evaluator's and names every
-difference D3D allows (`Leeway`: NaN payloads, denormals flushed under
-the default denormal mode, signs of zeros from min/max and approximate
-operations, FMad fused or not, approximate operations within tolerance);
-any other difference fails.
+`valu_tests::compare_float_lowerings` (VOP3 programs) and
+`compare_lowered_bodies` (any encoding) compare each stored dword with the
+evaluator's, in the result's domain (`Domain`: f32, integer bits, an f16
+in the low half, two f16 halves), and name every difference Microsoft's
+specifications leave to the device (`Leeway`, each with its citation: NaN
+bits; denormals flushed on input or output, never for halves; zero signs
+from min/max; FMad fused or not; approximate operations within the
+D3D11.3 chapter 22 bounds); any other difference fails, and every one is
+printed. Users: `float_lowerings_agree_with_the_evaluator_on_the_host`
+(43 f32 and conversion lowerings), `f16_lowerings_...` and
+`packed_f16_lowerings_...`. Conversions the ISA defines exactly are held
+to it on the evaluator by dense sweeps
+(`f16_conversion_rounds_to_nearest_even_on_any_device`,
+`integer_to_float_conversions_round_to_nearest_even_on_any_device`).
+
+Probes before a fault: `synth::eval_probed_fault` runs a probed program
+whose access has no descriptor (the evaluator stops there, its model of a
+fault) and returns the probe buffer as it stood
+(`a_heap_access_is_recorded_before_it_can_fault`).
+`emit::tests::a_pixel_shader_with_probes_is_valid_dxil` has `dxil.dll`
+judge a probed pixel shader.
+
+Typed stores: `synth::mtbuf_offen` encodes MTBUF with the format in the
+instruction, `eval_wave_buffer` runs a wave program over a 1 KiB buffer.
+
+Submissions in flight (victory-gpu): `inflight` holds the components
+overlap needs (`Retire`, `InFlight`) with model tests, and on Windows two
+WARP workloads: eight submissions in flight retired by fence value with
+their allocators reused, and a read waiting for exactly the newest writer
+of its range while later work is held. The parallel pool
+(victory-core `parallel`) has tests for concurrent callers, nested calls
+and panics.
 
 Queues (victory-gpu, any host): `schedule::Schedule` is the model of
 queue waits, tested on its own; `queue::tests` run queues end to end on
