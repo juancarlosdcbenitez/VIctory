@@ -393,6 +393,34 @@ DirectXShaderCompiler repository.
   Whether a record reaches memory before a device is removed still depends
   on the device. A test shows the record exists when the evaluator stops
   at the faulting access, and fails with the old placement.
+* **Audit of the fourth session** (three more defects, fixed; the rest
+  reviewed without change):
+  * *Thread creation per call* (PERF-5's parallel texture checks and split
+    hashes): scoped threads started on every call cost 58, 85 and 217
+    microseconds for 2, 4 and 8 threads here, taken whenever a group's
+    textures added up to 2 MiB, even unchanged ones. Now a pool started
+    once, workers parked between calls (3 to 8 microseconds a call here;
+    split and side-by-side hashing 3.1x to 3.6x on 4 threads, CPU
+    throughput only). One call uses the pool at a time; calls meanwhile
+    run on their caller's thread.
+  * *Queue order* (SYNC-1): a submission run at once released the queue
+    lock before running, so a Wait and work submitted by another thread
+    in that gap could run first on the worker. Now running at once claims
+    the queue until done, and what arrives meanwhile is held in order.
+  * *Probe-induced drops undiagnosed* (GPU-1): probes add 4 root
+    signature dwords; a pipeline already near D3D12's 64 is refused in
+    probe runs only. The log now names it (`probes do not fit this
+    pipeline's root signature`).
+  * Reviewed: the probe buffer is read after the submission's fence wait
+    from a CPU-visible heap (visible); probe counts are 32-bit and wrap
+    after 2^32 counted accesses in a submission (documented); the queue
+    worker drops its lock before fences or execution, re-checks after
+    each run, and needs no shutdown (Windows ends other threads before
+    DLLs detach); a title list reset while held work holds it gets a new
+    host list; texture checks touch only their own staging buffers and
+    state, and write-watch answers do not depend on order; SH-2's typed
+    stores reuse the raw-store path unchanged (addressing, index stride,
+    guard, alignment, bounds), which they equal for those formats.
 
 ## Backlog
 
