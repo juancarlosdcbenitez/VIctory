@@ -654,6 +654,79 @@ mod tests {
         assert_ne!(features & 0x200, 0, "SFI0 {features:#x}: no StencilRef");
     }
 
+    /// A pixel shader with probes: its heap access is checked before the
+    /// descriptor is fetched, and a record is followed by a global UAV fence
+    /// (barrier mode 2), the one barrier D3D allows outside compute stages.
+    /// The probe tests run compute programs; this has `dxil.dll` judge the
+    /// fence in a pixel shader, where every probed graphics pipeline has it.
+    #[test]
+    fn a_pixel_shader_with_probes_is_valid_dxil() {
+        use super::synth::{buffer_store_dword, s_load_dwordx4, s_mov_b32, sgpr, vop1};
+        use crate::native::{ResourceType, RootParam, RootType, UsedResource};
+        let mut words = vec![s_mov_b32(5, 0x80)];
+        words.extend_from_slice(&s_load_dwordx4(8, 4));
+        words.push(vop1(0x001, 1, sgpr(0))); // v_mov_b32 v1, s0
+        words.extend_from_slice(&buffer_store_dword(1, 8, 0));
+        words.push(0xBF81_0000); // s_endpgm
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 2,
+            layout: vec![
+                RootParam {
+                    root: RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 4,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            used: vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            }],
+            io: StageIo::Ps {
+                inputs: vec![],
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let osg1 = container::signature(&[], false);
+        let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
+        let c = Container::parse(&bytes).unwrap();
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        super::TEST_PROBES.set(true);
+        let out = emit(&c, &native, &p, &st, &io, &res);
+        super::TEST_PROBES.set(false);
+        let out = out.unwrap();
+        // The id hashes the container's program (none here).
+        assert!(out.probe.is_some(), "translated with probes");
+        #[cfg(windows)]
+        if let Some(mut v) = super::validator::Validator::for_tests() {
+            v.validate(&mut out.dxil.clone()).unwrap();
+        }
+    }
+
     /// A wave64 compute program that writes only EXEC's high dword
     /// (`s_mov_b32 exec_hi, 0`) before a vector instruction. The new mask is
     /// opaque and keyed by the unchanged low dword, so building its lane bit
