@@ -1426,7 +1426,27 @@ fn leeway(name: &str, domain: Domain, floats: u8, inputs: [u32; 4], want: u32, g
 /// device for `cases` and compares every stored dword with the evaluator's:
 /// prints every difference with its [`Leeway`], and fails on any `Other`.
 fn compare_float_lowerings(ops: &[(&str, u8, Domain)], cases: &[[u32; 4]]) {
-    use super::synth::{eval_valu, lower_valu, vgpr, vop3};
+    use super::synth::{vgpr, vop3};
+    let bodies: Vec<(&str, Vec<u32>, u8, Domain)> = ops
+        .iter()
+        .map(|&(name, floats, domain)| {
+            let op = crate::gfx10::opcode(crate::gfx10::Encoding::Vop3, name)
+                .unwrap_or_else(|| panic!("{name}: no opcode"));
+            (
+                name,
+                vop3(op, 0, vgpr(1), vgpr(2), vgpr(3)).to_vec(),
+                floats,
+                domain,
+            )
+        })
+        .collect();
+    compare_lowered_bodies(&bodies, cases);
+}
+
+/// [`compare_float_lowerings`] for programs encoded by the caller: (name,
+/// body writing `v0` from `v1..v3`, float operands, result domain).
+fn compare_lowered_bodies(ops: &[(&str, Vec<u32>, u8, Domain)], cases: &[[u32; 4]]) {
+    use super::synth::{eval_valu, lower_valu};
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
         let host = match Host::new(warp) {
@@ -1445,11 +1465,9 @@ fn compare_float_lowerings(ops: &[(&str, u8, Domain)], cases: &[[u32; 4]]) {
         let mut other = Vec::new();
         let mut counts: std::collections::BTreeMap<(&str, Leeway), usize> =
             std::collections::BTreeMap::new();
-        for &(name, floats, domain) in ops {
-            let op = crate::gfx10::opcode(crate::gfx10::Encoding::Vop3, name)
-                .unwrap_or_else(|| panic!("{name}: no opcode"));
-            let body = vop3(op, 0, vgpr(1), vgpr(2), vgpr(3)).to_vec();
-            let l = lower_valu(&body).unwrap_or_else(|e| panic!("{name}: does not lower: {e}"));
+        for (name, body, floats, domain) in ops {
+            let (name, floats, domain) = (*name, *floats, *domain);
+            let l = lower_valu(body).unwrap_or_else(|e| panic!("{name}: does not lower: {e}"));
             let got = run_lowered(&host, &l, cases);
             for (inputs, got) in cases.iter().zip(got) {
                 let want = eval_valu(&l, *inputs).unwrap_or_else(|e| panic!("{name}: {e}"));
@@ -1599,6 +1617,37 @@ fn float_lowerings_agree_with_the_evaluator_on_the_host() {
         })
         .collect();
     compare_float_lowerings(&ops, &cases);
+}
+
+/// Packed f16 arithmetic (VOP3P, each half on its own) on each SM 6.6
+/// device (WARP on CI) against the evaluator: both halves rounded to
+/// nearest even by the lowering's own conversion, so to the bit but for
+/// NaN bits. Every operand's two halves come from the same edge cases.
+#[test]
+fn packed_f16_lowerings_agree_with_the_evaluator_on_the_host() {
+    use super::synth::{vgpr, vop3p};
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let ops: Vec<(&str, Vec<u32>, u8, Domain)> = ["v_pk_add_f16", "v_pk_mul_f16", "v_pk_fma_f16"]
+        .into_iter()
+        .map(|name| {
+            let op = crate::gfx10::opcode(crate::gfx10::Encoding::Vop3p, name)
+                .unwrap_or_else(|| panic!("{name}: no opcode"));
+            let body = vop3p(op as u8, 0, vgpr(1), vgpr(2), vgpr(3)).to_vec();
+            (name, body, 0, Domain::F16x2)
+        })
+        .collect();
+    let halves: [u32; 20] = [
+        0x0000, 0x8000, 0x0001, 0x03FF, 0x0400, 0x3C00, 0x3C01, 0x0E00, 0x3E00, 0x1400, 0x7BFF,
+        0xFBFF, 0x7C00, 0xFC00, 0x7E00, 0x1000, 0x1800, 0x5BFF, 0x2E66, 0xB401,
+    ];
+    let n = halves.len();
+    let cases: Vec<[u32; 4]> = (0..60)
+        .map(|i| {
+            let h = |k: usize| halves[k % n] | halves[(k * 11 + 7) % n] << 16;
+            [h(i), h(i * 7 + 3), h(i * 13 + 5), 0]
+        })
+        .collect();
+    compare_lowered_bodies(&ops, &cases);
 }
 
 /// f16 arithmetic on each SM 6.6 device (WARP on CI) against the
