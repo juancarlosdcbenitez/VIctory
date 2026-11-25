@@ -373,6 +373,15 @@ mod tests {
     }
 }
 
+// SAFETY: D3D12 command lists and allocators are free-threaded objects
+// whose use D3D12 leaves the application to order: a list is recorded by
+// one thread at a time, and runs in a submission (here, or later for a
+// queue held back by a wait) while no thread records it. Its own state is
+// behind mutexes.
+unsafe impl Send for HostList {}
+// SAFETY: as above.
+unsafe impl Sync for HostList {}
+
 /// A host command list and its allocator, always used together.
 pub(crate) struct HostList {
     allocator: ID3D12CommandAllocator,
@@ -1643,11 +1652,13 @@ impl Meter {
                  {indirect:.0} indirect",
                 making = crate::pipeline::making()
             );
-            let ahead = crate::queue::take_ran_ahead();
-            if ahead > 0 {
+            let [held, ahead] = crate::queue::take_held();
+            if held + ahead > 0 {
                 tracing::warn!(
-                    "{ahead} submissions and signals since the last report ran ahead of a \
-                     queue wait not reached yet (our queues do not wait)"
+                    held,
+                    ahead,
+                    "since the last report: submissions and signals held back by queue waits \
+                     not reached, and presents or page mappings that ran ahead of held work"
                 );
             }
             #[cfg(feature = "diagnostics")]

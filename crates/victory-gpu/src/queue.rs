@@ -1,16 +1,25 @@
 //! Command queues. Submitted lists run on the host GPU and are waited for,
-//! so fence signals complete at once.
+//! so fence signals complete at once, while nothing holds the queue back.
 //!
-//! A queue's waits (`Wait(fence, value)`) are not carried out: what is
-//! submitted after one runs when it is submitted, reached or not. Blocking
-//! the submitting thread instead would deadlock a title that signals the
-//! fence from that thread after submitting (legal in D3D12, where only the
-//! queue waits), so waits not yet reached are recorded, and work that runs
-//! ahead of one is counted and logged ([`Queue::runs_ahead`]).
+//! A queue's `Wait(fence, value)` holds back what is submitted to the
+//! queue after it until the fence reaches the value, as on D3D12: those
+//! submissions and signals are kept in order ([`crate::schedule`]) and run
+//! by our queue worker thread once the fence gets there (by a signal, a
+//! bottom-of-pipe write, or a store we only see by polling). The submitting
+//! thread never waits: a title may signal the fence itself after
+//! submitting, which D3D12 allows since only the queue waits. A held
+//! submission keeps the host lists it was recorded into (a title list reset
+//! meanwhile records into a fresh one, `list::reset`).
+//!
+//! shortcut: presents and page mappings on a held queue run at once (they
+//! read title memory at the call); they are counted.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Condvar, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
+
+use crate::schedule::Schedule;
 
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, QUEUE, S_OK, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
@@ -42,9 +51,6 @@ struct Queue {
     object: Object,
     kind: u32,
     desc: QueueDesc,
-    /// Waits that were not reached when the title asked for them, until
-    /// they are: `(where the fence's value is, the value)`.
-    waits: Mutex<Vec<(usize, u64)>>,
 }
 const _: () = assert!(std::mem::offset_of!(Queue, kind) == 0x10);
 
@@ -53,43 +59,200 @@ fn queue<'a>(this: This) -> &'a Queue {
     unsafe { &*this.cast::<Queue>() }
 }
 
-/// Submissions and signals that ran ahead of a wait on their queue, since
-/// the frame-rate line last reported them.
-static RAN_AHEAD: AtomicU64 = AtomicU64::new(0);
+/// What a held queue runs later, in order.
+enum Held {
+    /// A submission: the host lists it was recorded into.
+    #[cfg(windows)]
+    Execute(Vec<std::sync::Arc<crate::host::HostList>>),
+    /// A signal of the fence whose value is at `fence`.
+    Signal { fence: usize, value: u64 },
+}
 
-/// How many runs ahead are logged one by one.
-const LOGGED_AHEAD: u32 = 8;
+/// The queues' held work, by queue object.
+static QUEUES: Mutex<Schedule<Held>> = Mutex::new(Schedule::new());
+/// Woken (under `QUEUES`) when a fence moves or work is held.
+static MOVED: Condvar = Condvar::new();
 
-impl Queue {
-    /// Drops the waits that are reached (or whose fence is gone) and says
-    /// whether one is left: then `what`, about to run, runs ahead of it,
-    /// where a real queue would hold it back.
-    fn runs_ahead(&self, what: &str) -> bool {
-        let mut waits = self.waits.lock().unwrap_or_else(|e| e.into_inner());
-        waits.retain(|&(at, value)| crate::fence::current(at).is_some_and(|now| now < value));
-        let Some(&(at, value)) = waits.first() else {
-            return false;
+fn queues() -> MutexGuard<'static, Schedule<Held>> {
+    QUEUES.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Submissions and signals held back since the frame-rate line last
+/// reported them, and presents or page mappings that ran ahead of held
+/// work (the shortcut above).
+static HELD: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// Since the last call (the frame-rate line): submissions and signals
+/// held back by waits, and presents and page mappings that ran ahead.
+#[cfg(windows)]
+pub(crate) fn take_held() -> [u64; 2] {
+    [0, 1].map(|i| HELD[i].swap(0, Ordering::Relaxed))
+}
+
+/// Whether queue waits hold work back (the default). With the
+/// `diagnostics` feature, `VICTORY_QUEUE_WAITS=0` makes queues run what is
+/// submitted at once, reached or not, as before, to compare.
+fn holding() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let off = cfg!(feature = "diagnostics")
+            && std::env::var("VICTORY_QUEUE_WAITS").is_ok_and(|v| v.trim() == "0");
+        if off {
+            tracing::warn!("VICTORY_QUEUE_WAITS=0: queue waits do not hold work back");
+        }
+        !off
+    })
+}
+
+/// A fence moved to `value` (its value lives at `at`): held waits it
+/// reaches are satisfied, and the worker runs what they held.
+pub(crate) fn fence_moved(at: usize, value: u64) {
+    let mut q = queues();
+    if q.blocked().is_empty() {
+        return;
+    }
+    q.fence_moved(at, value);
+    MOVED.notify_all();
+}
+
+/// Holds `held` back on `queue` if anything holds the queue; else gives it
+/// back to run now.
+fn hold(queue: usize, held: impl FnOnce() -> Held) -> bool {
+    if !holding() {
+        return false;
+    }
+    let mut q = queues();
+    if !q.holds(queue) {
+        return false;
+    }
+    q.submit(queue, held());
+    HELD[0].fetch_add(1, Ordering::Relaxed);
+    start_worker();
+    MOVED.notify_all();
+    true
+}
+
+fn start_worker() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        let spawned = std::thread::Builder::new()
+            .name("victory queue worker".into())
+            .spawn(worker);
+        if let Err(e) = spawned {
+            tracing::error!(error = %e, "no queue worker: held queue work will not run");
+        }
+    });
+}
+
+/// When a held wait that has lasted is logged: at 5 s, then each time it
+/// has doubled.
+fn warning_due(warned: u32) -> Duration {
+    Duration::from_secs(5).saturating_mul(1 << warned.min(20))
+}
+
+/// The queue worker: runs held work once nothing holds it back, in each
+/// queue's order; polls held fences for stores nothing reports; logs waits
+/// that last, with what could still satisfy them.
+fn worker() {
+    let mut since: Option<Instant> = None;
+    let mut warned = 0;
+    loop {
+        let (ready, blocked) = {
+            let mut q = queues();
+            let ready = q.runnable();
+            let blocked = if ready.is_empty() {
+                q.blocked()
+            } else {
+                Vec::new()
+            };
+            if ready.is_empty() && blocked.is_empty() {
+                since = None;
+                warned = 0;
+                drop(MOVED.wait(q).unwrap_or_else(|e| e.into_inner()));
+                continue;
+            }
+            (ready, blocked)
         };
-        RAN_AHEAD.fetch_add(1, Ordering::Relaxed);
-        static LOGGED: AtomicU32 = AtomicU32::new(0);
-        if LOGGED.fetch_add(1, Ordering::Relaxed) < LOGGED_AHEAD {
+        if !ready.is_empty() {
+            run(ready);
+            continue;
+        }
+        for &(_, at, value) in &blocked {
+            if let Some(now) = crate::fence::current(at)
+                && now >= value
+            {
+                queues().fence_moved(at, now);
+            }
+        }
+        let waited = since.get_or_insert_with(Instant::now).elapsed();
+        if waited >= warning_due(warned) {
+            warned += 1;
+            let q = queues();
+            let stuck = q.stuck(|h| match *h {
+                Held::Signal { fence, value } => Some((fence, value)),
+                #[cfg(windows)]
+                Held::Execute(_) => None,
+            });
             tracing::warn!(
-                fence = format_args!("{at:#x}"),
-                waits_for = value,
-                value = crate::fence::current(at),
-                "{what} runs ahead of a queue wait not reached yet: our queues run work \
-                 when it is submitted, where this one would wait"
+                seconds = waited.as_secs(),
+                held = q.held(),
+                blocked = ?q.blocked(),
+                only_held_work_signals = ?stuck,
+                "queues are held back by waits not reached: (queue, fence, value); a wait only \
+                 held work signals never ends unless a CPU thread signals its fence"
             );
         }
-        true
+        let q = queues();
+        let poll = Duration::from_millis(1);
+        let woken = MOVED.wait_timeout(q, poll);
+        drop(woken.unwrap_or_else(|e| e.into_inner()));
     }
 }
 
-/// Submissions and signals that ran ahead of a queue wait since the last
-/// call (the frame-rate line).
-#[cfg(windows)]
-pub(crate) fn take_ran_ahead() -> u64 {
-    RAN_AHEAD.swap(0, Ordering::Relaxed)
+/// Runs released work, then lets each queue it came from run on.
+fn run(ready: Vec<(usize, Held)>) {
+    let mut done: Vec<usize> = Vec::new();
+    for (queue, held) in ready {
+        match held {
+            #[cfg(windows)]
+            Held::Execute(lists) => {
+                if let Some(host) = crate::host::host() {
+                    let lists: Vec<&crate::host::HostList> = lists.iter().map(|l| &**l).collect();
+                    host.execute(&lists);
+                }
+            }
+            Held::Signal { fence, value } => {
+                if !crate::fence::signal_at(fence, value) {
+                    tracing::warn!(
+                        fence = format_args!("{fence:#x}"),
+                        value,
+                        "a held signal of a fence the title released"
+                    );
+                }
+            }
+        }
+        if !done.contains(&queue) {
+            done.push(queue);
+        }
+    }
+    let mut q = queues();
+    for queue in done {
+        q.finished(queue);
+    }
+    MOVED.notify_all();
+}
+
+/// Counts a present or page mapping that runs while its queue holds work
+/// back (the shortcut above).
+fn ran_ahead(queue: usize, what: &str) {
+    if !queues().holds(queue) {
+        return;
+    }
+    HELD[1].fetch_add(1, Ordering::Relaxed);
+    static LOGGED: AtomicU32 = AtomicU32::new(0);
+    if LOGGED.fetch_add(1, Ordering::Relaxed) < 8 {
+        tracing::warn!("{what} runs ahead of work its queue holds back for a wait");
+    }
 }
 
 pub(crate) extern "system" fn create(
@@ -111,7 +274,6 @@ pub(crate) extern "system" fn create(
         },
         kind: desc.kind,
         desc,
-        waits: Mutex::new(Vec::new()),
     });
     object::hand_out(QUEUE, queue, iid, &QUEUE_IIDS, out)
 }
@@ -161,16 +323,27 @@ extern "system" fn release(this: This) -> u32 {
     object::release_boxed::<Queue>(this)
 }
 
-/// Runs the lists' host lists and waits for them (decision 0007).
+/// Runs the lists' host lists and waits for them (decision 0007), or holds
+/// them back behind the queue's waits.
 extern "system" fn execute(this: This, count: u32, lists: *const This) {
     if lists.is_null() {
         return;
     }
-    queue(this).runs_ahead("a submission");
     #[cfg(windows)]
     if let Some(host) = crate::host::host() {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
+        let shared = || {
+            Held::Execute(
+                lists
+                    .iter()
+                    .filter_map(|&l| crate::list::host_list_shared(l))
+                    .collect(),
+            )
+        };
+        if hold(this as usize, shared) {
+            return;
+        }
         let host_lists: Vec<_> = lists
             .iter()
             .filter_map(|&l| crate::list::host_list(l))
@@ -213,19 +386,28 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {
         return E_INVALIDARG;
     }
-    queue(this).runs_ahead("a signal");
+    let at = crate::fence::value_address(fence);
+    if hold(this as usize, || Held::Signal { fence: at, value }) {
+        return S_OK;
+    }
     crate::fence::signal(fence, value)
 }
-/// Not carried out (see the module): a value not reached yet is recorded,
-/// so that work which runs ahead of it is counted.
+/// Holds back what is submitted to the queue after it until the fence
+/// reaches `value` (see the module).
 extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {
         return E_INVALIDARG;
     }
+    if !holding() {
+        return S_OK;
+    }
     let at = crate::fence::value_address(fence);
-    if crate::fence::current(at).is_some_and(|now| now < value) {
-        let mut waits = queue(this).waits.lock().unwrap_or_else(|e| e.into_inner());
-        waits.push((at, value));
+    let now = crate::fence::current(at).unwrap_or(0);
+    let mut q = queues();
+    q.wait(this as usize, at, value, now);
+    if q.holds(this as usize) {
+        start_worker();
+        MOVED.notify_all();
     }
     S_OK
 }
@@ -302,11 +484,12 @@ pub(crate) fn presented() -> u64 {
 /// shortcut: one plane, no scaling or placement, the source expected in
 /// the common state.
 extern "system" fn present(
-    _: This,
+    this: This,
     planes: u32,
     plane_parameters: *const Plane,
     _parameters: *const u8,
 ) -> HRESULT {
+    ran_ahead(this as usize, "a present");
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
@@ -427,13 +610,14 @@ const PAGE: u64 = 64 << 10;
 /// one constant page or of unmapped pages). Done at once: every earlier
 /// submission has run.
 extern "system" fn copy_page_mappings(
-    _: This,
+    this: This,
     count: u32,
     batches: *const PageBatch,
     pool: u64,
     pool_pages: u32,
     _flags: u32,
 ) -> HRESULT {
+    ran_ahead(this as usize, "a page mapping");
     let Some(map) = crate::resource::page_mapper() else {
         return E_INVALIDARG;
     };
@@ -598,11 +782,7 @@ mod tests {
         assert_eq!(new[35], execute_x as *const ()); // 0x118
     }
 
-    /// A wait for a value not reached is recorded; work and signals on
-    /// that queue run ahead of it until a signal reaches it. Waits already
-    /// reached, and waits on fences released since, are not counted.
-    #[test]
-    fn work_after_a_wait_not_reached_runs_ahead_of_it() {
+    fn new_queue() -> This {
         let null = std::ptr::null();
         let desc = QueueDesc {
             kind: 2,
@@ -612,26 +792,88 @@ mod tests {
         };
         let mut q = null;
         assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut q), S_OK);
-        let fence_iid = &crate::fence::FENCE_IIDS[0];
-        let (mut f, mut g) = (null, null);
-        assert_eq!(crate::fence::create(null, 3, 0, fence_iid, &mut f), S_OK);
-        assert_eq!(crate::fence::create(null, 0, 0, fence_iid, &mut g), S_OK);
+        q
+    }
+
+    fn new_fence(initial: u64) -> This {
+        let (null, mut f) = (std::ptr::null(), std::ptr::null());
+        let iid = &crate::fence::FENCE_IIDS[0];
+        assert_eq!(crate::fence::create(null, initial, 0, iid, &mut f), S_OK);
+        f
+    }
+
+    fn value(f: This) -> u64 {
+        slot::<extern "system" fn(This) -> u64>(f, 0x40)(f)
+    }
+
+    /// Waits up to 5 s for `f` to reach `v` (the queue worker runs held
+    /// work on its own thread).
+    fn reaches(f: This, v: u64) -> bool {
+        let started = std::time::Instant::now();
+        while started.elapsed() < Duration::from_secs(5) {
+            if value(f) >= v {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        false
+    }
+
+    /// A queue's signals behind a wait not reached are held, in order,
+    /// until a CPU signal reaches it; the submitting thread does not wait.
+    /// A wait already reached holds nothing; a null fence is refused.
+    #[test]
+    fn signals_behind_a_wait_not_reached_wait_for_it() {
+        let q = new_queue();
+        let (f, g) = (new_fence(3), new_fence(0));
         assert_eq!(wait(q, f, 3), S_OK, "reached already");
-        assert!(!queue(q).runs_ahead("test"));
-        assert_eq!(wait(q, f, 5), S_OK);
-        assert!(queue(q).runs_ahead("test"), "5 is not reached");
-        // A signal on the waiting queue itself runs ahead too.
         assert_eq!(signal(q, g, 1), S_OK);
-        assert!(queue(q).runs_ahead("test"));
+        assert_eq!(value(g), 1, "nothing held");
+        assert_eq!(wait(q, f, 5), S_OK);
+        assert_eq!(signal(q, g, 2), S_OK);
+        assert_eq!(signal(q, g, 3), S_OK);
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(value(g), 1, "held behind the wait for 5");
         assert_eq!(crate::fence::signal(f, 5), S_OK);
-        assert!(!queue(q).runs_ahead("test"), "reached");
-        assert!(queue(q).waits.lock().unwrap().is_empty());
-        // A wait on a fence that is then released is dropped, unread.
-        assert_eq!(wait(q, g, 9), S_OK);
-        assert_eq!(slot::<extern "system" fn(This) -> u32>(g, 0x10)(g), 0);
-        assert!(!queue(q).runs_ahead("test"));
-        assert!(queue(q).waits.lock().unwrap().is_empty());
-        assert_eq!(wait(q, null, 1), E_INVALIDARG);
+        assert!(reaches(g, 3), "released");
+        assert_eq!(value(g), 3, "in order: 2, then 3");
+        // Nothing holds the queue any more: signals run at once again.
+        std::thread::sleep(Duration::from_millis(10));
+        assert_eq!(signal(q, g, 4), S_OK);
+        assert!(reaches(g, 4));
+        assert_eq!(wait(q, std::ptr::null(), 1), E_INVALIDARG);
+    }
+
+    /// Queues chain through fences: the second waits for what the first,
+    /// held, signals once released.
+    #[test]
+    fn held_queues_chain_through_fences() {
+        let (q1, q2) = (new_queue(), new_queue());
+        let (f, g, h) = (new_fence(0), new_fence(0), new_fence(0));
+        assert_eq!(wait(q1, f, 1), S_OK);
+        assert_eq!(signal(q1, g, 1), S_OK);
+        assert_eq!(wait(q2, g, 1), S_OK);
+        assert_eq!(signal(q2, h, 1), S_OK);
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!((value(g), value(h)), (0, 0));
+        assert_eq!(crate::fence::signal(f, 1), S_OK);
+        assert!(reaches(h, 1), "the chain ran");
+        assert_eq!(value(g), 1);
+    }
+
+    /// A store into a fence's memory that nothing reports (neither a signal
+    /// nor a bottom-of-pipe write) still releases the queue: the worker
+    /// polls held fences.
+    #[test]
+    fn a_store_nothing_reports_releases_a_held_queue() {
+        let q = new_queue();
+        let (f, g) = (new_fence(0), new_fence(0));
+        assert_eq!(wait(q, f, 2), S_OK);
+        assert_eq!(signal(q, g, 1), S_OK);
+        let at = slot::<extern "system" fn(This) -> u64>(f, 0x60)(f) as *mut u64;
+        // SAFETY: the fence's value, as titles store it.
+        unsafe { at.write_volatile(2) };
+        assert!(reaches(g, 1));
     }
 
     #[test]

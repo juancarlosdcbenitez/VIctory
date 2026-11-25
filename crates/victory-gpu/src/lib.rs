@@ -43,6 +43,7 @@ mod probes;
 pub mod query;
 pub mod queue;
 pub mod resource;
+mod schedule;
 pub mod root;
 #[cfg(windows)]
 mod sampler;

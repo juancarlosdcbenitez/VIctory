@@ -124,16 +124,50 @@ pub(crate) fn current(at: usize) -> Option<u64> {
 /// through the fence's GPU address, and only `signal` used to wake waiters.
 pub(crate) fn written(at: usize, bytes: usize) {
     const VALUE: usize = size_of::<u64>();
-    let live = live();
-    // Fences whose value overlaps at..at + bytes.
-    for (_, &object) in live.range(at.saturating_sub(VALUE - 1)..at.saturating_add(bytes)) {
-        // SAFETY: a fence in `LIVE` is alive: it leaves `LIVE` (under the
-        // lock held here) before it is freed.
-        let fence = unsafe { &*(object as *const Fence) };
-        let mut waiters = fence.waiters();
-        waiters.reach(fence.value.load(Ordering::Acquire));
-        fence.moved.notify_all();
+    let mut moved = Vec::new();
+    {
+        let live = live();
+        // Fences whose value overlaps at..at + bytes.
+        for (&value_at, &object) in
+            live.range(at.saturating_sub(VALUE - 1)..at.saturating_add(bytes))
+        {
+            // SAFETY: a fence in `LIVE` is alive: it leaves `LIVE` (under
+            // the lock held here) before it is freed.
+            let fence = unsafe { &*(object as *const Fence) };
+            let mut waiters = fence.waiters();
+            let value = fence.value.load(Ordering::Acquire);
+            waiters.reach(value);
+            fence.moved.notify_all();
+            moved.push((value_at, value));
+        }
     }
+    // Queues held back by waits on them, after the fences' locks.
+    for (value_at, value) in moved {
+        crate::queue::fence_moved(value_at, value);
+    }
+}
+
+/// Signals the live fence whose value is at `at` (a signal a held queue
+/// runs later); false if the title released the fence meanwhile.
+pub(crate) fn signal_at(at: usize, value: u64) -> bool {
+    {
+        let live = live();
+        let Some(&object) = live.get(&at) else {
+            return false;
+        };
+        // SAFETY: a fence in `LIVE` is alive while the lock is held.
+        set(unsafe { &*(object as *const Fence) }, value);
+    }
+    crate::queue::fence_moved(at, value);
+    true
+}
+
+/// Sets `fence` to `value` and wakes what its value releases.
+fn set(fence: &Fence, value: u64) {
+    let mut waiters = fence.waiters();
+    fence.value.store(value, Ordering::Release);
+    waiters.reach(value);
+    fence.moved.notify_all();
 }
 
 pub(crate) extern "system" fn create(
@@ -263,10 +297,9 @@ fn block_until(
 
 pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
     let fence = fence(this);
-    let mut waiters = fence.waiters();
-    fence.value.store(value, Ordering::Release);
-    waiters.reach(value);
-    fence.moved.notify_all();
+    set(fence, value);
+    // Queues held back by waits on it, after the fence's lock.
+    crate::queue::fence_moved((&raw const fence.value) as usize, value);
     S_OK
 }
 

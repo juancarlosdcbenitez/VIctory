@@ -115,8 +115,11 @@ struct List {
     /// [`allocate_upload`], kept until the list is reset; the host list the
     /// calls record into (decision 0007), and the draw state the title set.
     uploads: std::sync::Mutex<Vec<Vec<u8>>>,
+    /// Shared with submissions a queue holds back (`queue`, `schedule`):
+    /// changed only by `reset`, on the thread that records the list, as
+    /// D3D12 has it.
     #[cfg(windows)]
-    host: Option<crate::host::HostList>,
+    host: std::cell::UnsafeCell<Option<std::sync::Arc<crate::host::HostList>>>,
     #[cfg(windows)]
     state: std::sync::Mutex<crate::draw::State>,
 }
@@ -139,8 +142,21 @@ pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
     if this.is_null() {
         return None;
     }
-    // SAFETY: the title passes one of our lists.
-    unsafe { (*this.cast::<List>()).host.as_ref() }
+    // SAFETY: the title passes one of our lists; its host list changes
+    // only in `reset`, on the thread recording the list, when nothing else
+    // reads it through the title list.
+    unsafe { (*(*this.cast::<List>()).host.get()).as_deref() }
+}
+
+/// The host list behind a title list, shared: for a submission that runs
+/// later (a queue held back by a wait).
+#[cfg(windows)]
+pub(crate) fn host_list_shared(this: This) -> Option<std::sync::Arc<crate::host::HostList>> {
+    if this.is_null() {
+        return None;
+    }
+    // SAFETY: as in `host_list`.
+    unsafe { (*(*this.cast::<List>()).host.get()).clone() }
 }
 
 pub(crate) extern "system" fn create_allocator(
@@ -216,13 +232,7 @@ fn new_list(kind: u32, allocator: This, iid: *const Iid, out: *mut This) -> HRES
         newer: [0; 256],
         uploads: Default::default(),
         #[cfg(windows)]
-        host: crate::host::host().and_then(|h| match h.new_list() {
-            Ok(list) => Some(list),
-            Err(e) => {
-                tracing::warn!(error = %e, "no host command list");
-                None
-            }
-        }),
+        host: std::cell::UnsafeCell::new(new_host_list()),
         #[cfg(windows)]
         state: Default::default(),
     });
@@ -258,19 +268,47 @@ extern "system" fn close(this: This) -> HRESULT {
     }
     S_OK
 }
+/// A fresh host list for a title list (none without a host GPU).
+#[cfg(windows)]
+fn new_host_list() -> Option<std::sync::Arc<crate::host::HostList>> {
+    crate::host::host().and_then(|h| match h.new_list() {
+        Ok(list) => Some(std::sync::Arc::new(list)),
+        Err(e) => {
+            tracing::warn!(error = %e, "no host command list");
+            None
+        }
+    })
+}
+
 extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT {
     if allocator.is_null() {
         return E_INVALIDARG;
     }
-    // Every submission of the list has run (submissions are waited for).
     // SAFETY: the title passes one of our lists.
     let uploads = unsafe { &(*this.cast::<List>()).uploads };
     uploads.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    // A submission a queue still holds back keeps the host list it was
+    // recorded into, as D3D12 lets a list be reset once submitted: the title
+    // list records into a fresh one. Other submissions have run (they are
+    // waited for), so the list's own is reset for reuse.
     #[cfg(windows)]
-    with_state(this, |host, state| {
-        host.reset();
+    {
+        // SAFETY: the title resets a list on the thread that records it;
+        // nothing reads it through the title list meanwhile.
+        let host = unsafe { &mut *(*this.cast::<List>()).host.get() };
+        if host
+            .as_ref()
+            .is_some_and(|h| std::sync::Arc::strong_count(h) > 1)
+        {
+            *host = new_host_list();
+        } else if let Some(h) = host.as_ref() {
+            h.reset();
+        }
+        // SAFETY: the title passes one of our lists.
+        let state = unsafe { &(*this.cast::<List>()).state };
+        let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
         state.reset(pipeline);
-    });
+    }
     #[cfg(not(windows))]
     let _ = (this, pipeline);
     S_OK
