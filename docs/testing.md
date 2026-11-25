@@ -45,10 +45,23 @@ newer push waits for a run in progress rather than cancelling it. Steps:
 both clippy configurations; the tests built; tests in crates that never
 open a D3D12 device, with victory-shader's evaluator tests (`dxil.dll`
 required); the translated-shader D3D12 tests; the GPU layer, runtime and
-app tests, after one that names the GPU layer's adapter; the capability
-report. Together the test steps are `cargo test --workspace --locked`.
-The job summary lists counts and adapters; logs are kept 14 days as the
+app tests, after one that names the GPU layer's adapter; the hashing
+benchmark (`hashing_throughput`, release build: CPU throughput of this
+runner, not a frame rate); the capability report. Together the test steps
+are `cargo test --workspace --locked`. The job summary lists counts,
+adapters and the benchmark's lines; logs are kept 14 days as the
 `windows-validation-logs` artifact.
+
+Once that job passes, a second job, `diagnostic-build`, builds
+`victory.exe` with the `diag` profile and the `diagnostics` feature and
+keeps it 14 days as the artifact `victory-diag-<version>-<commit>-windows-x64`
+with its symbols, checksums, build information, the license, the
+third-party notices (`cargo xtask notices`) and the two guides
+([diagnostic-build.md](diagnostic-build.md),
+[hardware-validation.md](hardware-validation.md)). It runs the asset
+policy check first, checks that the executable names its build
+(`--version`), and fails if the package holds any file not named. No game
+is run with it.
 
 Hosted runners have no GPU. Their adapters are the Basic Render Driver,
 twice (once as the primary adapter, without the software flag), and
@@ -129,6 +142,38 @@ lanes) whose lanes load their own `v1` and `v2` from two arrays and store
 their own `v4`. `eval_wave(body, lanes, wave64, a, b, constants)` runs
 it and returns each lane's result.
 
+Atomics from many lanes: `synth::image_wave_program(body, lanes)` is a
+wave program with the typed texture UAV; `contended_image_atomic` makes
+every lane do one 64-bit atomic on the same texel and
+`check_contended` checks what holds in any lane order (each partial sum
+handed out once, one cmpswap winner, umax's largest value);
+`eval_image_wave` runs it on the evaluator, and
+`valu_tests::contended_wide_image_atomics_on_the_host` on each device
+with 64-bit typed atomics.
+
+Probes (GPU-1): `emit::TEST_PROBES` set on the test's thread lowers with
+probes; `synth::eval_probed(lowered, inputs, slots, extra)` gives the
+probe buffer as the evaluator leaves it for given heap slot counts. On
+the host, the probe constants and buffer are root parameters
+`probe_param(stages)` and the next one (`Root::Constants`,
+`Root::Uav(dwords)`: a zeroed buffer bound as a root UAV and read back).
+
+Float lowerings against a device:
+`valu_tests::float_lowerings_agree_with_the_evaluator_on_the_host`
+compares each stored dword with the evaluator's and names every
+difference D3D allows (`Leeway`: NaN payloads, denormals flushed under
+the default denormal mode, signs of zeros from min/max and approximate
+operations, FMad fused or not, approximate operations within tolerance);
+any other difference fails.
+
+Queues (victory-gpu, any host): `schedule::Schedule` is the model of
+queue waits, tested on its own; `queue::tests` run queues end to end on
+the worker thread; on Windows, `schedule::d3d12` checks the model's rules
+against a real D3D12 queue on WARP.
+
 Benchmarks (ignored tests, release builds): `merge_speed` (victory-gpu,
 the copy-back merge), `detile_speed` (victory-formats), `bcpack_throughput`
-(victory-formats), `bench_write` (victory-shader, the bitcode writer).
+(victory-formats), `bench_write` (victory-shader, the bitcode writer),
+`hashing_throughput` (victory-core: one thread against split hashes and
+side-by-side inputs, as texture checks use them), `texture_checks_per_submission`
+(victory-gpu). They measure CPU throughput, never frame rates.

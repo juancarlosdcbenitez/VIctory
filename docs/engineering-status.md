@@ -223,6 +223,129 @@ result.
   refused); LLVM's ds_bpermute folding avoids indices at or above the wave
   size, so it settles nothing.
 
+### 2026-11-25, fourth session (same container; Windows CI)
+
+Baseline: `c594b90`, Windows runs 3 to 10 green. Each commit was pushed to
+the branch as it landed and ran on Windows CI: runs 11 (`6b2eab2`), 12
+(`b540592`), 13 (`b90281f`), 14 (`b4d753f`) and 15 (`fe69655`) passed;
+16 (`c8b6701`) and 17 (`b4b6a7b`) failed in one test, the new float
+differential (SH-7 below), the same 18 disagreements both times, and their
+diagnostic builds were skipped as designed. The last green run's package
+is `victory-diag-0.1.0-fe69655159b3-windows-x64` (run 15, 10.7 MB).
+Nothing here ran on a hardware GPU or with the game.
+
+* **GPU-1 and PERF-3 probes** (implemented; verified on WARP, run 11; not
+  run in the world): with the diagnostics feature and
+  `VICTORY_SHADER_PROBES=1`, translated shaders compare every heap index
+  they use with the bound heap's slot count (root constants) and count
+  and record, in a root UAV the GPU layer reads after each submission,
+  each index at or past it and each lane the loop limit stops (shader id,
+  site, index, slot count; a 64-record ring). Nothing is clamped or
+  substituted. The checks are added after the shader is lowered, by
+  moving each noted block's terminator behind them
+  (`Module::move_terminator`), so the lowering is unchanged without
+  probes. Evaluator tests cover in-range, boundary, past and wrapped
+  (address arithmetic below the table) indices and the ring; on WARP a
+  store through heap index 2 with the constants saying 3 or 2 slots
+  leaves the probe buffer word for word as the evaluator does, and lands
+  at index 2 both times. GPU failure reports add what the buffer holds.
+  The shader cache keys on the switch.
+* **Queue waits hold work back** (SYNC-1; implemented; the model verified
+  off-GPU, its rules checked against a real D3D12 queue on WARP, run 12;
+  no title evidence): `ID3D12CommandQueue::Wait` was a no-op. Now work
+  and signals submitted behind a wait not reached are held, in order,
+  without blocking the submitting thread, and a queue worker thread runs
+  them once fence moves reach their waits (`schedule::Schedule`, a model
+  tested on its own: rewinds, chains across queues, work submitted while
+  released work runs, waits only held work could satisfy). On WARP a
+  D3D12 queue's Wait holds a copy until a CPU signal, and a wait reached
+  then rewound (7 then 3, for 5) is satisfied, which is the model's rule.
+  Presents and page mappings on a held queue still run at once (they read
+  title memory at the call) and are counted; a title list reset while a
+  held submission holds it gets a fresh host list. Waits lasting 5 s or
+  more are logged with the waits only held work could satisfy. With the
+  diagnostics feature, `VICTORY_QUEUE_WAITS=0` restores the old
+  behaviour to compare.
+* **Diagnostic build download** (verified: run 13 built and packaged it;
+  no game run with it): the Windows workflow's second job builds
+  `victory.exe` as the README's Debugging section does, once the
+  validation job has passed, and keeps it 14 days as
+  `victory-diag-<version>-<commit>-windows-x64` with symbols, checksums,
+  build information, the license, the notices of the 83 crates compiled
+  in (`cargo xtask notices`) and two guides. It runs the asset policy
+  check, checks that `victory --version` names the build
+  (`<version>+diag.<commit>`, also the run summary's first line), and
+  fails on any file not named. Run 13's package:
+  `victory-diag-0.1.0-b90281f9eace-windows-x64`, 10.6 MB.
+  [diagnostic-build.md](diagnostic-build.md) has the exact commands to
+  collect logs; [hardware-validation.md](hardware-validation.md) is the
+  first hardware procedure (eleven stages, one diagnostic variable per
+  run, which log line settles which backlog item). Neither assumes anyone
+  has a suitable machine or the game.
+* **Texture checks side by side** (PERF-5; implemented; equivalence
+  tested; frame effect not measured): the textures a submission checks
+  between two steps that write title memory are independent, so they are
+  checked on up to 8 threads (from 2 MiB of texture memory in all), and a
+  hash of 2 MiB or more is split along BLAKE3's own tree
+  (`victory_core::parallel::blake3`, equal to `blake3::hash` bit for bit:
+  tested for 13 lengths on 1 to 8 threads). Write-watch answers do not
+  depend on the order textures ask, so nothing else changes.
+  `hashing_throughput` (CPU throughput, not a frame rate), 4 threads:
+
+  | Machine | 4 MiB split | 16 MiB split | 64 MiB split | 48 x 1 MiB side by side | 12 x 4 MiB side by side |
+  |---------|-------------|--------------|--------------|-------------------------|-------------------------|
+  | this Linux container | 1.7x | 2.8x | 1.9x | 2.9x | 3.5x |
+  | Windows runner, run 14 | 1.2x | 2.0x | 2.3x | 2.4x | 2.3x |
+
+  Inputs below 2 MiB stay on one thread (1.0x on both). Whether texture
+  checks matter in a world frame is still unknown: the frame line's
+  "textures ms" in a world run says.
+* **SH-1 under contention** (verified on the evaluator and on WARP, run
+  15):
+  32 lanes doing one 64-bit image atomic each on one texel: adds of
+  0xFFFF_FFFF carrying into the high dword (each partial sum handed out
+  exactly once), a cmpswap one lane wins, umax. The checks hold in any
+  lane order, and refuse a dropped carry, a lost update, two winners.
+  Still off by default.
+* **SH-7: the float lowerings on WARP** (failing, runs 16 and 17; being
+  fixed, see the next item): 43 lowerings (arithmetic,
+  fma and mad, min/max/med3, ldexp, frexp, rounding, the integer, f16 and
+  packed conversions, the cube-map ops, and the approximate ones) for 48
+  input sets of special and ordinary values, every stored dword against
+  the evaluator, with each difference D3D leaves to devices named
+  (`Leeway`: NaN payloads, denormals flushed, zero signs from min/max,
+  FMad fused or not, approximate results within tolerance) and any other
+  failing the test.
+* **CPU/GPU overlap** (PERF-2; analysed, not changed): what keeps each
+  submission synchronous, from the code: (1) host copies of title memory
+  are single-buffered, so preparing the next submission would overwrite
+  data the GPU may still read; (2) preparation copies whole dirty pages,
+  which would overwrite GPU-written ranges not yet copied back (their
+  pages are dirty when the title wrote elsewhere on them); (3) copy-back
+  and bottom-of-pipe writes, which tell the title the GPU is done, need
+  the GPU done; (4) host resources and descriptor slots a submission uses
+  are released right after it, which is safe only because it finished;
+  (5) the probe buffer is read after each submission. The queue worker
+  now exists and is where completion would move; the order to do it in
+  is in PERF-2. None of it can be shown correct without a GPU that runs
+  the title, so the synchronization stays.
+* **SH-2, the part that converts nothing** (implemented; verified on the
+  evaluator; DXIL-valid on Windows CI): typed stores with the format in
+  the instruction were all refused. Those whose channels are all 32-bit
+  UINT, SINT or FLOAT, all stored, put each register in memory unchanged,
+  so they are now the plain stores they amount to; four lanes' NaN
+  payloads, denormals, -0 and arbitrary words land unchanged through
+  formats 20, 62, 63, 64, 74 and 77 (LLVM's `UfmtGFX10` numbers), and
+  every format that converts, a partial store and d16 data stay refused
+  with the reason named. How often the title uses these is not known
+  here (`victory translate --list` on the game's shaders says).
+* **Left alone for lack of AMD's ISA guide** (amd.com and gpuopen.com are
+  still refused): `v_div_scale/fmas/fixup_f32`, `ds_permute_b32`,
+  ds_swizzle's rotate and FFT modes, `v_msad_u8`, typed-format stores;
+  they stay explicitly refused, as the probe of the lowering's float ops
+  showed (`v_div_fixup_f32` and `v_cvt_off_f32_i4` refused, 46 others
+  lowered).
+
 ## Backlog
 
 Priority order: P0 GPU stability, P1 shader correctness, P2 performance,
@@ -230,50 +353,51 @@ P3 runtime compatibility, P4 usability.
 
 | Id | P | State | Item |
 |----|---|-------|------|
-| GPU-1 | P0 | hypothesis, narrowed | **Out-of-range heap indices as a hang cause.** Audited (second session): table bases cannot leave the heaps (`draw::State::user_value` gives 0 for a table outside the bound heaps), and tables reaching past a smaller host heap get fresh slots (`draw::State::tables`). What remains unbounded is an index the shader computes per lane (bindless indexing, waterfall loops: `emit::lower::lane_heap_index`, `fetched_index`), read through `ResourceDescriptorHeap[]` with no clamp. Check: a world run with `VICTORY_D3D12_DRED=1`; the report's `near_heaps` part says whether the faulting address lies past a heap. If it does, pass each heap's slot count as user data and clamp the per-lane indices (or send them to a null slot) in the lowering. |
+| GPU-1 | P0 | hypothesis, instrumented | **Out-of-range heap indices as a hang cause.** Audited (second session): table bases cannot leave the heaps (`draw::State::user_value` gives 0 for a table outside the bound heaps), and tables reaching past a smaller host heap get fresh slots (`draw::State::tables`). What remains unbounded is an index the shader computes per lane (bindless indexing, waterfall loops: `emit::lower::lane_heap_index`, `fetched_index`), read through `ResourceDescriptorHeap[]` with no clamp. Since the fourth session, probes (`VICTORY_SHADER_PROBES=1`, diagnostics) record every such index at or past the bound heap's slots, with the shader, without clamping. Check: hardware-validation.md stages 4 and 5. Records name the shaders whose index computation to fix; none, with DRED placing a fault past a heap, would mean an index inside the slots naming the wrong descriptor, which probes do not see. Clamping stays out: it would hide the defect. |
 | GPU-2 | P0 | verified off-GPU | Fence waits follow D3D12's rules (third session): no timeout, rewinds, bottom-of-pipe writes wake waiters. Next: a world run; a "blocking fence wait has not been reached" warning names a fence nothing signals, or a title deadlock. |
-| SYNC-1 | P0 | hypothesis, instrumented | Queue waits are not carried out (`queue::wait`): work submitted after a wait for a value not yet reached runs ahead of it, which on a title's async compute would read data not yet written. Counted since the third session. Check: the frame-rate report's "ran ahead of a queue wait" count in a world run. If not zero, queues need to defer work behind unreached waits (a per-queue worker that blocks on the fence), which also starts PERF-2. |
-| PERF-2 | P2 | open (design) | Every submission runs synchronously: `host::Host::execute` holds a lock, executes, signals and waits `INFINITE` before returning (decision 0007). This makes lifetimes safe by construction, but CPU and GPU never overlap, and one submission past about 2 s is a TDR. Making submission asynchronous needs per-submission dependency tracking for copy-back and fences. It is a design change to plan after measurements (`VICTORY_GPU_TIMING`, the `SUBMISSION_US` counters). |
-| PERF-3 | P2 | hypothesis | Loops stopped only at `LOOP_LIMIT` (2^20 per lane) can cost about a second in a full-screen pass, the order of the world's frame times. Since the third session a lane the limit stops leaves the program at every back edge (it used to run on at conditional ones). Check: a diagnostics build in the world with `VICTORY_SHADER_LOOP_LIMIT=4096`; if frames get much faster, find the loops (`VICTORY_GPU_TIMING=1` names slow lists and their commands). Next instrument: count the lanes the limit stops (a diagnostics UAV the host reads after each submission), which also tells whether it hides translation bugs. |
+| SYNC-1 | P0 | implemented, not run in the world | Queue waits were not carried out (work behind a wait not reached ran ahead of it). Since the fourth session the work is held and a queue worker runs it once the fence gets there (`schedule`, `queue`; the rules checked on WARP). Left running ahead, and counted: presents and page mappings on a held queue. Check: hardware-validation.md stage 6 (held counts after the frame lines; waits held 5 s or more; `VICTORY_QUEUE_WAITS=0` to compare). A wait that only held work could satisfy would hang: the log names it. |
+| PERF-2 | P2 | open (design, dependencies mapped) | Every submission runs synchronously: `host::Host::execute` holds a lock, executes, signals and waits `INFINITE` before returning (decision 0007). This makes lifetimes safe by construction, but CPU and GPU never overlap, and one submission past about 2 s is a TDR. The fourth session listed what depends on it (session log): single-buffered host copies, dirty-page copies over GPU-written ranges not yet copied back, completion writes, releases right after a submission, the probe buffer. Order: (1) a registry of in-flight GPU-written ranges that preparation consults (wait for that submission only, or skip the range); (2) host copies versioned per submission, or copied on write while in flight; (3) host resources and descriptor slots retired by host fence value; (4) completion (copy-back, bottom-of-pipe writes, probe reads) moved to the queue worker; (5) only then `execute` returning before the GPU finishes. Each step needs a world run on a GPU to show it changes nothing but timing; measure first (`VICTORY_GPU_TIMING`, the frame line's CPU and GPU times). |
+| PERF-3 | P2 | hypothesis, instrumented | Loops stopped only at `LOOP_LIMIT` (2^20 per lane) can cost about a second in a full-screen pass, the order of the world's frame times. Since the third session a lane the limit stops leaves the program at every back edge; since the fourth, probes count and record such lanes with their shader. Check: hardware-validation.md stages 5 and 7 (`VICTORY_SHADER_LOOP_LIMIT=4096`); if frames get much faster, `VICTORY_GPU_TIMING=1` names the slow lists. Recorded stops in shaders whose loops should end tell whether the limit hides translation bugs. |
 | PERF-4 | P2 | hypothesis | Host copies of title buffers are custom-heap, write-back L0 (system memory; `host::Host::shared_buffer`), so a discrete GPU reads every vertex, index and constant there over PCIe. Check by timing a heavy pass with its inputs moved to a default heap. |
-| PERF-5 | P2 | hypothesis | Textures in memory that cannot be write-watched are hashed whole (BLAKE3) at every submission that samples them (`texture::Staging::refresh_now`), once per submission. Exact elimination across submissions needs to see writes through every view of the texture pool's pages (third session); a bit-identical parallel hash (blake3 `hazmat`) is the other option. Check first: the frame-rate line's "textures ms, MB" and the `TexHashed` counter (diagnostics, copystat) per world frame. |
-| SH-1 | P1 | verified on WARP, off by default | **64-bit image atomics** (README). Shader side done in the third session behind `emit::image_atomics_64` (evaluator tests from the ISA; `dxil.dll` on Windows; six operations on WARP on an R32G32_UINT UAV, `valu_tests::wide_image_atomics_on_the_host`). The view format is R32G32_UINT by Microsoft's SM 6.6 atomics spec (no R64 views are needed; the second session's plan was wrong), which the title's two-dword views should already be. The GPU layer refuses such pipelines on devices without OPTIONS9 AtomicInt64OnTypedResourceSupported and OPTIONS11 AtomicInt64OnDescriptorHeapResourceSupported. Next: a diagnostics world run with `VICTORY_SHADER_IMAGE_ATOMICS_64=1`, `VICTORY_D3D12_DEBUG=1` and `VICTORY_D3D12_GBV=1` (the debug layer names a view whose format does not fit), then `victory translate` counts; if clean, turn it on by default. |
-| SH-2 | P1 | not implemented | `tbuffer_store_format_*`: typed-format stores are refused (`buffer()`); the inverse of `format_load` (pack, round and saturate per numeric format). |
+| PERF-5 | P2 | parallel (equivalent), effect in a frame unmeasured | Textures in memory that cannot be write-watched are hashed whole (BLAKE3) at every submission that samples them, once per submission. Since the fourth session a submission's textures are checked side by side and big hashes split along BLAKE3's tree (bit-identical; 2.0-2.4x CPU throughput on the Windows runner for 16 MiB and more or groups of textures). Skipping hashes across submissions would need to see writes through every view of the texture pool's pages (third session). Check: the frame line's "textures ms, MB" in a world run (hardware-validation.md stage 9). |
+| SH-1 | P1 | verified on WARP, off by default | **64-bit image atomics** (README). Shader side done in the third session behind `emit::image_atomics_64` (evaluator tests from the ISA; `dxil.dll` on Windows; six operations on WARP on an R32G32_UINT UAV, `valu_tests::wide_image_atomics_on_the_host`). The view format is R32G32_UINT by Microsoft's SM 6.6 atomics spec (no R64 views are needed; the second session's plan was wrong), which the title's two-dword views should already be. The GPU layer refuses such pipelines on devices without OPTIONS9 AtomicInt64OnTypedResourceSupported and OPTIONS11 AtomicInt64OnDescriptorHeapResourceSupported. Fourth session: 32 lanes contending on one texel (add with carries, cmpswap, umax) pass order-independent checks on the evaluator and on WARP (run 15, 8 dispatches each). Next: hardware-validation.md stage 8 (the switch alone, then with `VICTORY_D3D12_DEBUG=1`, then GBV: the debug layer names a view whose format does not fit), then `victory translate` counts; if clean, turn it on by default. |
+| SH-2 | P1 | part implemented | `tbuffer_store_format_*` (the format in the instruction): since the fourth session, formats whose channels are all 32-bit UINT, SINT or FLOAT, all stored, are lowered as the plain stores they are (evaluator tests; DXIL-valid on Windows). Every other format is refused with its reason: the inverse of `format_load` (pack, round and saturate per numeric format) and what is written for channels a store leaves out need AMD's ISA guide. |
 | SH-3 | P1 | not implemented | Double precision (`v_*_f64`, `v_cvt_*_f64`, f64 compares): the DXIL writer has no `double` type. |
 | SH-4 | P1 | not implemented | `v_div_scale/fmas/fixup_f32` (the precise division sequence). |
 | SH-5 | P1 | not implemented | `ds_permute_b32` (forward permute), ds_swizzle's rotate and FFT modes (refused; encodings confirmed from LLVM, semantics need AMD's ISA guide), `v_msad_u8`, `v_qsad/mqsad`, `image_msaa_load`, `image_*_pck*`, flat and scratch memory, `s_getreg_b32`, scalar stores and atomics, clamped integer mads. (v_permlane16/x16, v_dot2(c)_f32_f16, ds_bpermute and integer clamp on adds, subtracts and dots were done in the second session.) |
 | SH-6 | P1 | not implemented | Merged geometry stages; 64-lane cross-lane code on 32-lane hosts (README). |
-| SH-7 | P1 | DXIL verified; integers on WARP | The evaluator programs, the 59 lowerings of the first session among them, pass `dxil.dll` on Windows CI, and the integer ones agree with WARP (third session). Left: the float ones (`v_ldexp_f32`, `v_frexp_*`, conversions) on WARP, where NaN payloads and signed zeros may differ by driver choice, and everything on hardware. |
+| SH-7 | P1 | DXIL verified; integers and floats on WARP | The evaluator programs, the 59 lowerings of the first session among them, pass `dxil.dll` on Windows CI; the integer ones agree with WARP (third session), and 43 float lowerings were compared in the fourth (runs 16 and 17: three conversions disagree, being fixed). Left: everything on hardware, and the f16 and packed float ops (VOP3P) on WARP. |
 | SH-8 | P1 | not verified | ds_bpermute's index in wave32 (we wrap at 32) against AMD's RDNA2 ISA guide (DS_BPERMUTE_B32), which this environment cannot reach. |
-| CI-1 | P1 | verified | Windows validation workflow (third session). It never claims a hardware result: hosted runners have no GPU. A hardware result needs a self-hosted runner with a GPU or a run on the owner's machine. |
+| CI-1 | P1 | verified | Windows validation workflow (third session). It never claims a hardware result: hosted runners have no GPU. A hardware result needs a self-hosted runner with a GPU or a run on a machine with one. Since the fourth session it also builds the diagnostic download once the checks pass, and runs the hashing benchmark. |
+| HW-1 | P0 | blocked (no machine) | The first hardware validation: [hardware-validation.md](hardware-validation.md), eleven stages on a Windows machine with a hardware D3D12 GPU and game files one may use, with the diagnostic download. Nothing in this repository's CI can stand in for it. |
 | PERF-1 | P2 | open | World frames take 0.5-1.8 s (README, one machine). No measurement possible here. The existing switches (`VICTORY_GPU_TIMING`, `VICTORY_SHADER_LOOP_LIMIT`) are where to start. |
 
 ## Next session
 
-Remote branch head at the end of the third session: the last commit of
+Remote branch head at the end of the fourth session: the last commit of
 `claude/sharp-thompson-o8cl4c` (the docs commit that adds this
-paragraph); Windows validation run 10 (`adfdd3f`) is the last code run,
-green.
+paragraph). The last green Windows validation run is 15 (`fe69655`); runs
+16 and 17 fail in the float differential until the conversions it caught
+are fixed.
 
-1. Check the latest Windows validation run of the branch (Actions tab or
-   the job summary): it must stay green, and its summary must say no
-   hardware GPU was present.
-2. On a machine with the game (diagnostics build): `victory translate
-   <game dir> --validate --list` for the counts and most frequent
-   reasons; then a world run with `VICTORY_D3D12_DRED=1`, reading the log
-   for the device-removal report (GPU-1), "ran ahead of a queue wait"
-   counts (SYNC-1), fence-wait warnings (GPU-2), and the frame-rate
-   line's texture time (PERF-5); then one with
-   `VICTORY_SHADER_LOOP_LIMIT=4096` (PERF-3).
-3. SH-1 is done but for its world check: run step 2's world run once
-   more with `VICTORY_SHADER_IMAGE_ATOMICS_64=1` (diagnostics build, with
-   `VICTORY_D3D12_DEBUG=1` and `VICTORY_D3D12_GBV=1`). If the debug layer
-   reports nothing about these views, make `image_atomics_64` default on.
-   The exact next implementation task otherwise: **GPU-1 instrumentation**
-   (a diagnostics UAV that translated shaders write when a per-lane heap
-   index reaches past the bound heap, and when the loop limit stops a
-   lane, read back after each submission and logged with the pipeline),
-   which settles GPU-1 and PERF-3 from one world run without clamping
-   anything.
-4. If step 2 shows SYNC-1 run-aheads, deferring queue work behind
-   unreached waits comes first.
+1. Check the latest Windows validation run (Actions tab or the job
+   summary): both jobs green, the summary saying no hardware GPU was
+   present, and a `victory-diag-...` artifact for the head commit.
+2. Whoever has a Windows machine with a hardware D3D12 GPU and game files
+   they may use: [hardware-validation.md](hardware-validation.md) with
+   that artifact, one stage and one variable at a time. Its stages settle
+   the open P0 items in order: the world hang (3, 4), GPU-1 (5), SYNC-1
+   (6), PERF-3 (7), SH-1 (8), the frame and memory baselines (9, 10).
+   Nothing in this repository's CI can stand in for it (HW-1).
+3. Without such a machine, the next implementation tasks, in order:
+   * PERF-2 step 1: the registry of in-flight GPU-written ranges, with
+     preparation consulting it, built and tested while submissions still
+     wait (so it changes nothing yet), then step 3, retirement by host
+     fence value. Steps 4 and 5 only after a world run measures the CPU
+     and GPU split.
+   * SH-7: the f16 and packed float ops (VOP3P) against WARP, as the f32
+     ones now are; any difference not in `Leeway` is a lowering to fix.
+   * With the game's shaders at hand (`victory translate <game dir>
+     --list`), the most frequent refusal reasons decide the next lowering;
+     those needing AMD's ISA guide (SH-2's converting formats, SH-4, SH-5)
+     wait for it.
