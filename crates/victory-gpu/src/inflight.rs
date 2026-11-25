@@ -174,7 +174,7 @@ mod d3d12 {
     use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
     use windows::core::Interface;
 
-    use super::Retire;
+    use super::{InFlight, Retire};
 
     fn buffer(
         d: &ID3D12Device,
@@ -320,6 +320,112 @@ mod d3d12 {
                 .collect();
             assert_eq!(words, &want[..], "each copy read its own upload buffer");
             back.Unmap(0, None);
+        }
+    }
+
+    /// [`InFlight`] against a real D3D12 queue on WARP: reading a range
+    /// needs the newest submission writing it to have finished, and that
+    /// alone: two copies run, a third one writing the first one's range is
+    /// held behind a queue wait, and the second one's range is read while
+    /// it is held (its data, the fence short of the third), then the first
+    /// range once the third has run (the third's data).
+    #[test]
+    fn d3d12_a_read_waits_for_exactly_the_newest_writer_of_its_range() {
+        // SAFETY: plain D3D12 calls on objects of ours; each upload buffer
+        // is written before its copy is submitted, and the readback buffer
+        // is read only where the fence says the copies writing it are done.
+        unsafe {
+            let factory: IDXGIFactory4 =
+                CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).expect("DXGI");
+            let Ok(adapter) = factory.EnumWarpAdapter::<IDXGIAdapter1>() else {
+                eprintln!("no WARP adapter; skipped");
+                return;
+            };
+            let mut device: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).is_err() {
+                eprintln!("no WARP device; skipped");
+                return;
+            }
+            let d = device.expect("a device");
+            eprintln!("on WARP (software)");
+            let queue: ID3D12CommandQueue = d
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    ..Default::default()
+                })
+                .expect("a queue");
+            let (fence, gate): (ID3D12Fence, ID3D12Fence) = (
+                d.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("a fence"),
+                d.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("a fence"),
+            );
+            let back = buffer(
+                &d,
+                D3D12_HEAP_TYPE_READBACK,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                256,
+            );
+            let alloc: ID3D12CommandAllocator = d
+                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                .expect("an allocator");
+            let mut kept = Vec::new();
+            let mut flight = InFlight::default();
+            // Submission `value` copies `word` to bytes `at..at + 4`.
+            let mut copy = |value: u64, at: u64, word: u32| {
+                let upload = buffer(
+                    &d,
+                    D3D12_HEAP_TYPE_UPLOAD,
+                    D3D12_RESOURCE_STATE_GENERIC_READ,
+                    256,
+                );
+                let mut p = std::ptr::null_mut();
+                upload.Map(0, None, Some(&mut p)).expect("map");
+                *p.cast::<u32>() = word;
+                upload.Unmap(0, None);
+                let list: ID3D12GraphicsCommandList = d
+                    .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None)
+                    .expect("a list");
+                list.CopyBufferRegion(&back, at, &upload, 0, 4);
+                list.Close().expect("close");
+                queue.ExecuteCommandLists(&[Some(list.cast().expect("a list"))]);
+                queue.Signal(&fence, value).expect("signal");
+                flight.writes(value, at as usize, 4);
+                kept.push((upload, list));
+            };
+            copy(1, 0, 0x11);
+            copy(2, 4, 0x22);
+            queue.Wait(&gate, 1).expect("wait");
+            copy(3, 0, 0x33);
+            let event = CreateEventW(None, false, false, None).expect("an event");
+            let wait_for = |value: u64| {
+                fence
+                    .SetEventOnCompletion(value, event)
+                    .expect("an event wait");
+                WaitForSingleObject(event, INFINITE);
+            };
+            let word = |at: usize| {
+                let mut p = std::ptr::null_mut();
+                back.Map(0, None, Some(&mut p)).expect("map");
+                let w = *p.cast::<u8>().add(at).cast::<u32>();
+                back.Unmap(0, None);
+                w
+            };
+            // The second range: its newest writer is 2, and that is enough.
+            let writer = flight.latest_writer(4, 4).expect("written in flight");
+            assert_eq!(writer, 2);
+            wait_for(writer);
+            assert_eq!(word(4), 0x22);
+            assert!(
+                fence.GetCompletedValue() < 3,
+                "the third copy is still held"
+            );
+            // The first range: its newest writer is 3, held until the gate.
+            let writer = flight.latest_writer(0, 4).expect("written in flight");
+            assert_eq!(writer, 3);
+            gate.Signal(1).expect("a CPU signal");
+            wait_for(writer);
+            flight.finished(fence.GetCompletedValue());
+            assert!(flight.is_empty());
+            assert_eq!(word(0), 0x33, "the newest writer's data");
         }
     }
 }
