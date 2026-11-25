@@ -121,7 +121,16 @@ view index <i>, <k> past the bound heap's <s> slots` records. No records
 for heap accesses means no shader indexed past its heap in that run (GPU-1
 refuted for it; probes do not see an index inside the heap that names the
 wrong descriptor). Records name the shader to fix. Nothing is clamped: a
-run with records may still fault, as it would without probes.
+run with records may still fault, as it would without probes. Each access
+is checked before it fetches its descriptor, and its record is fenced to
+memory first, so the failure line's `; probes: ...` can name the access
+that removed the device; that the record survives the removal is likely,
+not guaranteed. Two limits: the counts are 32-bit and wrap after 2^32
+counted accesses in one submission (the records are still the first 64);
+and a pipeline whose root signature has no room for the probes' 4 dwords
+is dropped in this run only, logged as `probes do not fit this pipeline's
+root signature` -- compare the dropped draws with stage 3 before reading
+anything into missing geometry.
 
 ### 6. Queue waits
 

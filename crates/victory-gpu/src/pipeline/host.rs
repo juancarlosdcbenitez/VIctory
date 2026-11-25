@@ -409,6 +409,17 @@ impl HostPipeline {
         let probed = stages
             .iter()
             .any(|(s, _)| s.translated().is_some_and(|t| t.host.probe.is_some()));
+        // D3D12 allows 64 dwords; the shaders with probes need the 4 more,
+        // so a pipeline they do not fit is dropped in a run with probes only.
+        let cost = root_cost(&params);
+        if probed && cost <= 64 && cost + 4 > 64 {
+            tracing::warn!(
+                dwords = cost,
+                ?shaders,
+                "probes do not fit this pipeline's root signature (4 more than the 64 \
+                 dwords D3D12 allows): its draws are dropped in runs with probes"
+            );
+        }
         let probes = probed.then(|| {
             let at = params.len() as u32;
             params.push(D3D12_ROOT_PARAMETER1 {
@@ -656,6 +667,23 @@ fn code_bytes(code: &D3D12_SHADER_BYTECODE) -> Vec<u8> {
     unsafe { std::slice::from_raw_parts(code.pShaderBytecode.cast::<u8>(), code.BytecodeLength) }.to_vec()
 }
 
+/// A root signature's size in dwords, as D3D12 counts it against its limit
+/// of 64: a root constant one, a descriptor table one, a root descriptor
+/// two.
+fn root_cost(params: &[D3D12_ROOT_PARAMETER1]) -> u32 {
+    params
+        .iter()
+        .map(|p| match p.ParameterType {
+            // SAFETY: the union's constants member, for constants.
+            D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS => unsafe {
+                p.Anonymous.Constants.Num32BitValues
+            },
+            D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE => 1,
+            _ => 2,
+        })
+        .sum()
+}
+
 fn root_signature(
     device: &ID3D12Device,
     params: &[D3D12_ROOT_PARAMETER1],
@@ -700,5 +728,44 @@ fn root_signature(
         let bytes =
             std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
         Ok((device.CreateRootSignature(0, bytes)?, bytes.to_vec()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// D3D12's count: root constants a dword each, a descriptor table one,
+    /// a root descriptor two (the probes' constants and buffer add 4).
+    #[test]
+    fn root_signature_cost_counts_dwords_as_d3d12_does() {
+        let constants = |n| D3D12_ROOT_PARAMETER1 {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                Constants: D3D12_ROOT_CONSTANTS {
+                    ShaderRegister: 0,
+                    RegisterSpace: 0,
+                    Num32BitValues: n,
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        };
+        let descriptor = |kind| D3D12_ROOT_PARAMETER1 {
+            ParameterType: kind,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                Descriptor: D3D12_ROOT_DESCRIPTOR1::default(),
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        };
+        let params = [
+            constants(16),
+            constants(12),
+            descriptor(D3D12_ROOT_PARAMETER_TYPE_CBV),
+            descriptor(D3D12_ROOT_PARAMETER_TYPE_SRV),
+            descriptor(D3D12_ROOT_PARAMETER_TYPE_UAV),
+            descriptor(D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE),
+        ];
+        assert_eq!(root_cost(&params), 16 + 12 + 2 + 2 + 2 + 1);
+        assert_eq!(root_cost(&[]), 0);
     }
 }
