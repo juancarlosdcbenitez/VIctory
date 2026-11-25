@@ -1276,6 +1276,258 @@ fn integer_lowerings_agree_with_the_evaluator_on_the_host() {
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
 
+/// How a device's result may differ from the evaluator's where D3D leaves
+/// the choice to the device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Leeway {
+    /// Both NaN, with different payloads.
+    NanPayload,
+    /// A denormal input or result flushed to zero (fp32 denormal mode
+    /// "any", which the translated shaders declare by default).
+    DenormalFlush,
+    /// Zeros of different signs, from operations D3D lets return either
+    /// (min and max of -0 and +0; the approximate ones).
+    ZeroSign,
+    /// `FMad`, which the device may fuse or not: the result is one of the
+    /// two roundings.
+    FusedOrNot,
+    /// An approximate operation within the tolerance checked here.
+    Approximate,
+    /// None of the above: a real disagreement.
+    Other,
+}
+
+/// Classifies a differing dword of float lowering `name` (`floats`: which
+/// of its three operands are floats).
+fn leeway(name: &str, floats: u8, inputs: [u32; 4], want: u32, got: u32) -> Leeway {
+    let (w, g) = (f32::from_bits(want), f32::from_bits(got));
+    let denormal = |b: u32| b & 0x7F80_0000 == 0 && b & 0x007F_FFFF != 0;
+    let approximate = matches!(
+        name,
+        "v_sqrt_f32"
+            | "v_rsq_f32"
+            | "v_rcp_f32"
+            | "v_exp_f32"
+            | "v_log_f32"
+            | "v_sin_f32"
+            | "v_cos_f32"
+    );
+    if w.is_nan() && g.is_nan() {
+        return Leeway::NanPayload;
+    }
+    let float_input_denormal = (0..3).any(|k| floats >> k & 1 != 0 && denormal(inputs[k]));
+    if float_input_denormal || (denormal(want) && g == 0.0) || (denormal(got) && w == 0.0) {
+        return Leeway::DenormalFlush;
+    }
+    let min_max = matches!(
+        name,
+        "v_min_f32" | "v_max_f32" | "v_min3_f32" | "v_max3_f32" | "v_med3_f32"
+    );
+    if w == 0.0 && g == 0.0 && (min_max || approximate) {
+        return Leeway::ZeroSign;
+    }
+    if name == "v_fma_f32" {
+        let [a, b, c] = [0, 1, 2].map(|k| f32::from_bits(inputs[k]));
+        let (fused, unfused) = (a.mul_add(b, c), a * b + c);
+        if [fused, unfused]
+            .iter()
+            .any(|r| r.to_bits() == got || r.is_nan() && g.is_nan())
+        {
+            return Leeway::FusedOrNot;
+        }
+    }
+    if approximate && w.is_finite() && g.is_finite() {
+        let x = f32::from_bits(inputs[0]);
+        let close = match name {
+            // D3D bounds sin and cos within [-100 pi, 100 pi] radians; the
+            // ISA's input is in revolutions.
+            "v_sin_f32" | "v_cos_f32" => x.abs() > 50.0 || (w - g).abs() <= 1.0 / 1024.0,
+            "v_log_f32" => (w - g).abs() <= w.abs().max(1.0) / (1 << 20) as f32,
+            _ => (w - g).abs() <= w.abs() / (1 << 20) as f32,
+        };
+        if close {
+            return Leeway::Approximate;
+        }
+    }
+    Leeway::Other
+}
+
+/// The float lowerings (SH-7), checked until now on the evaluator only, on
+/// each SM 6.6 device (WARP on CI): every stored dword matches the
+/// evaluator's for 48 input sets of special and ordinary values (zeros,
+/// denormals, infinities, NaNs, ties, f16 rounding and range edges, integer
+/// range edges), but where D3D leaves the result to the device
+/// ([`Leeway`]). Every difference is printed with its kind; a difference
+/// of no allowed kind fails the test.
+#[test]
+fn float_lowerings_agree_with_the_evaluator_on_the_host() {
+    use super::synth::{eval_valu, lower_valu, vgpr, vop3};
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    // (name, which of the three operands are floats)
+    let ops: [(&str, u8); 43] = [
+        ("v_add_f32", 0b011),
+        ("v_sub_f32", 0b011),
+        ("v_mul_f32", 0b011),
+        ("v_mul_legacy_f32", 0b011),
+        ("v_min_f32", 0b011),
+        ("v_max_f32", 0b011),
+        ("v_fma_f32", 0b111),
+        ("v_mad_f32", 0b111),
+        ("v_min3_f32", 0b111),
+        ("v_max3_f32", 0b111),
+        ("v_med3_f32", 0b111),
+        ("v_ldexp_f32", 0b001),
+        ("v_frexp_mant_f32", 0b001),
+        ("v_frexp_exp_i32_f32", 0b001),
+        ("v_fract_f32", 0b001),
+        ("v_floor_f32", 0b001),
+        ("v_ceil_f32", 0b001),
+        ("v_trunc_f32", 0b001),
+        ("v_rndne_f32", 0b001),
+        ("v_cvt_f32_i32", 0),
+        ("v_cvt_f32_u32", 0),
+        ("v_cvt_i32_f32", 0b001),
+        ("v_cvt_u32_f32", 0b001),
+        ("v_cvt_flr_i32_f32", 0b001),
+        ("v_cvt_rpi_i32_f32", 0b001),
+        ("v_cvt_f16_f32", 0b001),
+        ("v_cvt_f32_f16", 0),
+        ("v_cvt_pkrtz_f16_f32", 0b011),
+        ("v_cvt_pknorm_i16_f32", 0b011),
+        ("v_cvt_pknorm_u16_f32", 0b011),
+        ("v_cvt_pk_u8_f32", 0b001),
+        ("v_cvt_f32_ubyte0", 0),
+        ("v_cubeid_f32", 0b111),
+        ("v_cubesc_f32", 0b111),
+        ("v_cubetc_f32", 0b111),
+        ("v_cubema_f32", 0b111),
+        ("v_sqrt_f32", 0b001),
+        ("v_rsq_f32", 0b001),
+        ("v_rcp_f32", 0b001),
+        ("v_exp_f32", 0b001),
+        ("v_log_f32", 0b001),
+        ("v_sin_f32", 0b001),
+        ("v_cos_f32", 0b001),
+    ];
+    let values: [u32; 40] = [
+        0x0000_0000, // +0
+        0x8000_0000, // -0
+        0x3F80_0000, // 1
+        0xBF80_0000, // -1
+        0x3F00_0000, // 0.5
+        0xBF00_0000, // -0.5
+        0x3FC0_0000, // 1.5
+        0x4020_0000, // 2.5
+        0xC020_0000, // -2.5
+        0x4060_0000, // 3.5
+        0x3DCC_CCCD, // 0.1
+        0xBDCC_CCCD, // -0.1
+        0x0000_0001, // the smallest denormal (also the integer 1)
+        0x007F_FFFF, // the largest denormal
+        0x8000_0001, // a negative denormal
+        0x0080_0000, // the smallest normal
+        0x7F7F_FFFF, // the largest finite
+        0xFF7F_FFFF,
+        0x7F80_0000, // +inf
+        0xFF80_0000, // -inf
+        0x7FC0_0000, // a quiet NaN
+        0xFFC0_0000, // a negative quiet NaN
+        0x7F80_0001, // a signaling NaN
+        0x4F00_0000, // 2^31
+        0x4F80_0000, // 2^32
+        0xCF00_0000, // -2^31
+        0x4F7F_FFFF, // the largest float below 2^32
+        0x477F_E000, // 65504, the largest f16
+        0x477F_F000, // 65520, which rounds to the f16 infinity
+        0x3F80_1000, // 1 + 2^-11: an f16 tie
+        0x3F80_1800, // 1 + 3 * 2^-12: rounds up to nearest, down toward zero
+        0x3F80_3000, // 1 + 3 * 2^-11: a tie to the even f16 above
+        0x4049_0FDB, // pi
+        0x42C8_8000, // 100.25
+        0x5015_02F9, // 1e10
+        0xD015_02F9, // -1e10
+        2,
+        3,
+        0xFFFF_FFFF, // -1 as an integer
+        0xFFFF_FF6B, // -149 as an integer
+    ];
+    let n = values.len();
+    let cases: Vec<[u32; 4]> = (0..48)
+        .map(|i| {
+            [
+                values[i % n],
+                values[(i * 7 + 3) % n],
+                values[(i * 13 + 5) % n],
+                values[(i * 3 + 1) % n],
+            ]
+        })
+        .collect();
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let host = match Host::new(warp) {
+            Ok(host) => host,
+            Err(e) => {
+                eprintln!("{label}: skipped: {e}");
+                continue;
+            }
+        };
+        let kind = if host.adapter.1 {
+            "software"
+        } else {
+            "hardware"
+        };
+        eprintln!("{label}: on {} ({kind})", host.adapter.0);
+        // (op, kind) -> how many, and the first.
+        let mut seen: std::collections::BTreeMap<(&str, Leeway), (usize, String)> =
+            std::collections::BTreeMap::new();
+        for &(name, floats) in &ops {
+            let op = crate::gfx10::opcode(crate::gfx10::Encoding::Vop3, name)
+                .unwrap_or_else(|| panic!("{name}: no opcode"));
+            let body = vop3(op, 0, vgpr(1), vgpr(2), vgpr(3)).to_vec();
+            let l = lower_valu(&body).unwrap_or_else(|e| panic!("{name}: does not lower: {e}"));
+            let got = run_lowered(&host, &l, &cases);
+            for (inputs, got) in cases.iter().zip(got) {
+                let want = eval_valu(&l, *inputs).unwrap_or_else(|e| panic!("{name}: {e}"));
+                for k in 0..4 {
+                    if got[k] == want[k] {
+                        continue;
+                    }
+                    let kind = if k == 0 {
+                        leeway(name, floats, *inputs, want[k], got[k])
+                    } else {
+                        Leeway::Other
+                    };
+                    let entry = seen.entry((name, kind)).or_insert_with(|| {
+                        (
+                            0,
+                            format!(
+                                "dword {k} of ({inputs:08x?}): evaluator {:#010x}, {label} {:#010x}",
+                                want[k], got[k]
+                            ),
+                        )
+                    });
+                    entry.0 += 1;
+                }
+            }
+        }
+        for ((name, kind), (count, first)) in &seen {
+            eprintln!("{label}: {name}: {count} x {kind:?}, first {first}");
+        }
+        let other: Vec<_> = seen
+            .iter()
+            .filter(|((_, kind), _)| *kind == Leeway::Other)
+            .map(|((name, _), (count, first))| format!("{name}: {count}, first {first}"))
+            .collect();
+        assert!(
+            other.is_empty(),
+            "{label}: float lowerings disagree with the evaluator:\n{}",
+            other.join("\n")
+        );
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
 /// Probes (GPU-1) on each SM 6.6 device (WARP on CI): a store through the
 /// descriptor at heap index `s1 >> 5`, with three UAVs in the heap and the
 /// probe constants saying the heap has 3 slots (the index is in range) or
