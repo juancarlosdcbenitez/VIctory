@@ -2771,6 +2771,78 @@ fn contended_wide_image_atomics_keep_every_update() {
     }
 }
 
+/// Typed stores with the format in the instruction (MTBUF) whose channels
+/// are all 32-bit UINT, SINT or FLOAT, all stored: each lane's registers
+/// land in the buffer unchanged (a NaN's payload, a denormal and -0
+/// included), as `buffer_store_dwordxN` would put them (SH-2's part that
+/// needs no conversion). Formats: LLVM's `UfmtGFX10` numbers.
+#[test]
+fn typed_stores_of_32_bit_channels_store_their_registers() {
+    use super::synth::{eval_wave_buffer, mtbuf_offen, wave_program};
+    let a = [0x7FC0_1234, 0x0000_0001, 0x8000_0000, 0xDEAD_BEEF];
+    let b = [0x7F80_0001, 0xFFFF_FFFF, 0x3F80_0000, 0x0123_4567];
+    // (instruction, format, channels)
+    let cases = [
+        ("tbuffer_store_format_x", 20, 1),    // 32_UINT
+        ("tbuffer_store_format_xy", 62, 2),   // 32_32_UINT
+        ("tbuffer_store_format_xy", 63, 2),   // 32_32_SINT
+        ("tbuffer_store_format_xy", 64, 2),   // 32_32_FLOAT
+        ("tbuffer_store_format_xyz", 74, 3),  // 32_32_32_FLOAT
+        ("tbuffer_store_format_xyzw", 77, 4), // 32_32_32_32_FLOAT
+    ];
+    for (name, format, channels) in cases {
+        let op = crate::gfx10::opcode(crate::gfx10::Encoding::Mtbuf, name)
+            .unwrap_or_else(|| panic!("{name}")) as u8;
+        // v10 = lane * 16; v3 = v2, v4 = v1; the store of v[1:4] at 768 + v10.
+        let mut body = vec![
+            vop2(0x1A, 10, 130, 9),
+            vop1(0x001, 3, vgpr(2)),
+            vop1(0x001, 4, vgpr(1)),
+        ];
+        body.extend(mtbuf_offen(op, format, 1, 10, 8, 768));
+        let out = eval_wave_buffer(&wave_program(&body, 4, false), 4, &a, &b)
+            .unwrap_or_else(|e| panic!("{name} format {format}: {e}"));
+        for lane in 0..4 {
+            let want = [a[lane], b[lane], b[lane], a[lane]];
+            let at = 192 + 4 * lane;
+            for k in 0..4 {
+                let expected = if k < channels { want[k] } else { 0 };
+                assert_eq!(
+                    out[at + k],
+                    expected,
+                    "{name} format {format}, lane {lane}, channel {k}"
+                );
+            }
+        }
+    }
+}
+
+/// Every other typed store with the format in the instruction is refused,
+/// not guessed: formats that convert (UNORM, 16-bit FLOAT), a store of
+/// fewer channels than the format has, and d16 data.
+#[test]
+fn typed_stores_that_convert_are_refused() {
+    use super::synth::mtbuf_offen;
+    for (name, format) in [
+        ("tbuffer_store_format_x", 56),      // 8_8_8_8_UNORM
+        ("tbuffer_store_format_x", 13),      // 16_FLOAT
+        ("tbuffer_store_format_xy", 77),     // two of 32_32_32_32's channels
+        ("tbuffer_store_format_xyzw", 62),   // more channels than 32_32 has
+        ("tbuffer_store_format_d16_xy", 64), // 16-bit data
+    ] {
+        let op = crate::gfx10::opcode(crate::gfx10::Encoding::Mtbuf, name)
+            .unwrap_or_else(|| panic!("{name}")) as u8;
+        let body = mtbuf_offen(op, format, 1, 9, 8, 768).to_vec();
+        let refused = super::synth::lower_native(&super::synth::wave_program(&body, 4, false))
+            .map(|_| ())
+            .expect_err(name);
+        assert!(
+            refused.to_string().contains("typed buffer store"),
+            "{name} format {format}: {refused}"
+        );
+    }
+}
+
 /// `synth::check_contended` refuses what a broken 64-bit atomic would
 /// leave: 32-bit halves updated apart (the carry dropped), a lost update
 /// (an old value twice), two cmpswap winners, a umax short of the largest.

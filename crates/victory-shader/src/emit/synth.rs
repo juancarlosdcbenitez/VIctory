@@ -354,6 +354,66 @@ pub(super) const fn mubuf_offen(
     ]
 }
 
+/// MTBUF `op vdata, vaddr, s[srsrc:srsrc+3], 0 format:format offen
+/// offset:byte_off` (the format in the instruction: LLVM's `UfmtGFX10`
+/// numbers, as `lower::buffer_format` reads them).
+pub(super) const fn mtbuf_offen(
+    op: u8,
+    format: u8,
+    vdata: u8,
+    vaddr: u8,
+    srsrc: u8,
+    byte_off: u16,
+) -> [u32; 2] {
+    [
+        0x3A << 26
+            | (format as u32 & 0x7F) << 19
+            | (op as u32 & 7) << 16
+            | 1 << 12
+            | (byte_off as u32 & 0xFFF),
+        0x80 << 24
+            | (op as u32 >> 3 & 1) << 21
+            | ((srsrc as u32 >> 2) & 0x1F) << 16
+            | (vdata as u32) << 8
+            | vaddr as u32,
+    ]
+}
+
+/// Runs `native` (a [`wave_program`]) of `lanes` lanes on the evaluator as
+/// [`eval_native`] does, with a buffer of 1 KiB (the A, B and result
+/// arrays, then 256 bytes free): all of the buffer's dwords afterwards.
+pub(super) fn eval_wave_buffer(
+    native: &NativeProgram,
+    lanes: u32,
+    a: &[u32],
+    b: &[u32],
+) -> Result<Vec<u32>, String> {
+    let l = lower_native(native).map_err(|e| format!("does not lower: {e}"))?;
+    let mut bytes = vec![0u8; 4 * 256];
+    for (i, (&x, &y)) in a.iter().zip(b).take(lanes as usize).enumerate() {
+        bytes[4 * i..4 * i + 4].copy_from_slice(&x.to_le_bytes());
+        bytes[256 + 4 * i..256 + 4 * i + 4].copy_from_slice(&y.to_le_bytes());
+    }
+    let mut env = Env {
+        user_data: user_data(&l, [0; 4]),
+        lanes,
+        wave_lanes: lanes,
+        group_size: [lanes, 1, 1],
+        ..Env::default()
+    };
+    env.heap.insert(0, bytes);
+    eval::run(&l.module, &mut env)?;
+    if env.out_of_bounds != 0 {
+        return Err(format!("{} accesses out of bounds", env.out_of_bounds));
+    }
+    Ok(env.heap[&0]
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|&w| u32::from_le_bytes(w))
+        .collect())
+}
+
 /// Where a wave program's lanes find their inputs and leave their result
 /// in the UAV at heap index 0 (each 64 dwords, one per lane).
 pub(super) const WAVE_A: u16 = 0;

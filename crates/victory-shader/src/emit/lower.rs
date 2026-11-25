@@ -7177,13 +7177,38 @@ impl<'a> Lower<'a> {
         if *lds || *tfe {
             return Err("a buffer access to LDS or with tfe");
         }
-        if format.is_some() && !name.starts_with("tbuffer_load_format_") {
+        // A typed store with its format in the instruction stores each
+        // register unchanged when every channel of the format is a 32-bit
+        // UINT, SINT or FLOAT and the instruction stores all of them: it is
+        // then `buffer_store_dwordxN`. Any other format converts, which
+        // waits for AMD's ISA guide (SH-2).
+        let plain_store = name
+            .strip_prefix("tbuffer_store_format_")
+            .and_then(|channels| {
+                let n = match channels {
+                    "x" => 1,
+                    "xy" => 2,
+                    "xyz" => 3,
+                    "xyzw" => 4,
+                    _ => return None,
+                };
+                let (bits, numeric) = buffer_format((*format)?)?;
+                let wide = bits.iter().all(|&w| w == 32)
+                    && matches!(numeric, Numeric::Uint | Numeric::Sint | Numeric::Float);
+                (wide && bits.len() == n).then_some(n as u32)
+            });
+        if name.starts_with("tbuffer_store_") && plain_store.is_none() {
+            return Err(
+                "a typed buffer store whose format converts its data, or of some of its channels",
+            );
+        }
+        if format.is_some() && !name.starts_with("tbuffer_load_format_") && plain_store.is_none() {
             return Err(name);
         }
         let site = (b, i);
         let guard = self.guard(b, i)?;
         let c = self.cur;
-        let store = name.starts_with("buffer_store_");
+        let store = name.starts_with("buffer_store_") || plain_store.is_some();
         // DXIL atomic operations: add, and, or, xor, signed and unsigned
         // min and max, exchange; compare-exchange apart.
         let atomic = match name.strip_prefix("buffer_atomic_") {
@@ -7209,6 +7234,7 @@ impl<'a> Lower<'a> {
             .or(plain.strip_prefix("tbuffer_load_"))
         {
             _ if atomic.is_some() => (false, 1),
+            _ if plain_store.is_some() => (false, plain_store.unwrap_or(1)),
             Some("dword") => (false, 1),
             Some("dwordx2") => (false, 2),
             Some("dwordx3") => (false, 3),
