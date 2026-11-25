@@ -3101,6 +3101,36 @@ fn probe_records(probe: &[u32]) -> Vec<[u32; 4]> {
         .collect()
 }
 
+/// The probe for a heap access runs before the access fetches its
+/// descriptor: with no descriptor at the index (the evaluator stops there,
+/// its model of the fault that removes a device), the access past the heap
+/// is already counted and recorded. Until the fifth session the checks ran
+/// at the end of the block, after the access, so a faulting access left no
+/// record.
+#[test]
+fn a_heap_access_is_recorded_before_it_can_fault() {
+    use super::probe::{PAST_HEAP, RECORDS};
+    let l = lower_probed(&store_at_index_from_s1(), None);
+    // Index 3 (byte 96 of the table) with 2 slots, and nothing at index 3.
+    let (error, probe) = super::synth::eval_probed_fault(&l, [0, 96, 0x5EED, 0], [2, 16]);
+    assert!(
+        !error.is_empty(),
+        "the access to a missing descriptor stops the run"
+    );
+    assert!(
+        probe[PAST_HEAP] >= 1,
+        "not counted before the fault ({error}): {probe:x?}"
+    );
+    assert_eq!(probe[RECORDS], probe[PAST_HEAP]);
+    let records = probe_records(&probe);
+    assert!(
+        records
+            .iter()
+            .any(|&[id, _, at, of]| (id, at, of) == (super::TEST_PROBE_ID, 3, 2)),
+        "no record of index 3 against 2 slots before the fault: {records:x?}"
+    );
+}
+
 /// A heap access with its index below the bound heap's slot count leaves
 /// the probe buffer as it was; one at the count, past it, or at an index
 /// the address arithmetic wrapped to, is counted and recorded with the

@@ -489,6 +489,34 @@ impl Module {
         }
     }
 
+    /// Splits `block` before its instruction `inst`: that instruction, the
+    /// rest of the body and the terminator move to a new block, which takes
+    /// `block`'s place as its successors' predecessor (as
+    /// [`Module::move_terminator`]). `block` is left without a terminator,
+    /// for the caller to give it one that reaches the new block. `None`, with
+    /// nothing changed, if `inst` is not in `block`'s body.
+    pub fn split_before(&mut self, block: usize, inst: V) -> Option<usize> {
+        let V::Inst(i) = inst else { return None };
+        let at = self.blocks[block].body.iter().position(|&b| b == i)?;
+        let to = self.new_block();
+        self.move_terminator(block, to);
+        let tail = self.blocks[block].body.split_off(at);
+        self.blocks[to].body = tail;
+        Some(to)
+    }
+
+    /// Whether `inst` is in `block`'s body (so [`Module::split_before`]
+    /// would split it there).
+    pub fn split_before_ok(&self, block: usize, inst: V) -> bool {
+        matches!(inst, V::Inst(i) if self.blocks[block].body.contains(&i))
+    }
+
+    /// The block whose body holds instruction `inst`.
+    pub fn block_holding(&self, inst: V) -> Option<usize> {
+        let V::Inst(i) = inst else { return None };
+        self.blocks.iter().position(|b| b.body.contains(&i))
+    }
+
     pub fn md_str(&mut self, s: &str) -> Md {
         self.mds.push(MdDef::Str(s.into()));
         Md(self.mds.len() as u32 - 1)

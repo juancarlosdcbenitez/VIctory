@@ -325,6 +325,36 @@ pub(super) fn eval_probed(
     Ok(([dword(0), dword(1), dword(2), dword(3)], probe, env.heap))
 }
 
+/// Runs a lowered program with probes as [`eval_probed`] does, but for an
+/// access the evaluator cannot make (no descriptor at its heap index: the
+/// evaluator's model of a fault): the error it stops with, and the probe
+/// buffer's dwords as they stood then.
+pub(super) fn eval_probed_fault(
+    l: &Lowered,
+    inputs: [u32; 4],
+    slots: [u32; 2],
+) -> (String, Vec<u32>) {
+    let mut env = Env {
+        user_data: user_data(l, inputs),
+        probe_slots: slots,
+        probe: vec![0; 4 * super::probe::DWORDS],
+        ..Env::default()
+    };
+    env.heap.insert(0, vec![0; 16]);
+    let error = match eval::run(&l.module, &mut env) {
+        Ok(()) => String::new(),
+        Err(e) => e,
+    };
+    let probe = env
+        .probe
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|&w| u32::from_le_bytes(w))
+        .collect();
+    (error, probe)
+}
+
 /// Lowers `body` and runs it on the evaluator for each input set: the
 /// results per case ([`eval_valu`]). Panics with the reason when either
 /// step fails.

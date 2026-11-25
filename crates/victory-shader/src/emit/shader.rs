@@ -119,8 +119,9 @@ pub(crate) struct Shader {
     /// The probe buffer's handle and the view and sampler heaps' slot
     /// counts, made in the entry block.
     probe_handles: Option<(V, V, V)>,
-    /// Heap accesses to check: block, index, site word.
-    probed: Vec<(usize, V, u32)>,
+    /// Heap accesses to check: block, index, site word, and the
+    /// `createHandleFromHeap` that fetches the descriptor.
+    probed: Vec<(usize, V, u32, V)>,
 }
 
 impl Shader {
@@ -340,10 +341,9 @@ impl Shader {
         };
         self.nonuniform_handles += u32::from(nonuniform);
         if self.probe_id.is_some() {
-            let site = (self.probed.len() as u32 & probe::SITE)
-                | if sampler { probe::SAMPLER } else { 0 }
-                | if nonuniform { probe::PER_LANE } else { 0 };
-            self.probed.push((block, index, site));
+            // The slot counts are loaded now, in the entry block, so they
+            // come before any access checked there.
+            let _ = self.probe_handles();
         }
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
         let h = self.op(
@@ -354,6 +354,12 @@ impl Shader {
             218,
             &[index, s, n],
         );
+        if self.probe_id.is_some() {
+            let site = (self.probed.len() as u32 & probe::SITE)
+                | if sampler { probe::SAMPLER } else { 0 }
+                | if nonuniform { probe::PER_LANE } else { 0 };
+            self.probed.push((block, index, site, h));
+        }
         self.annotate(block, h, props.0, props.1)
     }
 
@@ -463,50 +469,49 @@ impl Shader {
     }
 
     /// Checks every heap access the shader makes against the bound heap's
-    /// slot count. A block that made some moves its terminator to a new
-    /// block it falls into; where an index is at or past the count, a block
-    /// between the two counts and records each such access. Nothing about
-    /// the access changes: it reads what it would without probes.
+    /// slot count, just before the access fetches its descriptor: the block
+    /// is split there, and where the index is at or past the count a block
+    /// between the two halves counts and records the access, then fences
+    /// UAV memory (global), so the record is on its way to memory before a
+    /// descriptor fetch that may fault is issued. A device removed by that
+    /// fetch can still leave the record for the failure report, which a
+    /// check after the access could not. Nothing about the access changes:
+    /// it reads what it would without probes.
     fn instrument(&mut self) {
         let Some(id) = self.probe_id else { return };
         if self.probed.is_empty() {
             return;
         }
         let (_, views, samplers) = self.probe_handles();
-        let mut probed = std::mem::take(&mut self.probed);
-        probed.sort_by_key(|p| p.0);
+        let probed = std::mem::take(&mut self.probed);
         let id = self.m.i32(id);
-        let mut i = 0;
-        while i < probed.len() {
-            let block = probed[i].0;
-            let n = probed[i..].iter().take_while(|p| p.0 == block).count();
-            let accesses = probed[i..i + n].to_vec();
-            i += n;
-            let rest = self.m.new_block();
-            self.m.move_terminator(block, rest);
-            let mut past = Vec::new();
-            let mut any = None;
-            for &(_, index, site) in &accesses {
-                let slots = if site & probe::SAMPLER != 0 {
-                    samplers
-                } else {
-                    views
-                };
-                let p = self.m.cmp(block, pred::IUGE, index, slots);
-                any = Some(match any {
-                    None => p,
-                    Some(a) => self.m.bin(block, Bin::Or, a, p),
-                });
-                past.push((p, index, site, slots));
-            }
+        let fence = self.m.i32(2);
+        let void = self.t.void;
+        for (block, index, site, handle) in probed {
+            // Earlier splits move the rest of a block on.
+            let Some(block) = [block]
+                .into_iter()
+                .chain(self.m.block_holding(handle))
+                .find(|&b| self.m.split_before_ok(b, handle))
+            else {
+                continue;
+            };
+            let rest = self
+                .m
+                .split_before(block, handle)
+                .expect("the handle is in the block");
+            let slots = if site & probe::SAMPLER != 0 {
+                samplers
+            } else {
+                views
+            };
+            let past = self.m.cmp(block, pred::IUGE, index, slots);
             let record = self.m.new_block();
-            for (p, index, site, slots) in past {
-                let site = self.m.i32(site);
-                self.probe_record(record, probe::PAST_HEAP, p, [id, site, index, slots]);
-            }
+            let word = self.m.i32(site);
+            self.probe_record(record, probe::PAST_HEAP, past, [id, word, index, slots]);
+            self.op(record, "barrier", Attr::NoDuplicate, void, 80, &[fence]);
             self.m.terminate(record, Term::Br(rest));
-            let any = any.expect("accesses");
-            self.m.terminate(block, Term::CondBr(any, record, rest));
+            self.m.terminate(block, Term::CondBr(past, record, rest));
         }
     }
 
