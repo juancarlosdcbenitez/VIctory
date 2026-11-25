@@ -1296,6 +1296,122 @@ fn f16_toward_zero(x: f32) -> u32 {
     sign | lo
 }
 
+/// `v_cvt_f16_f32` rounds to nearest even, the MODE default, on any
+/// device, although D3D's own conversion (`legacyF32ToF16`) rounds toward
+/// zero and stops overflows at the largest finite half (D3D11.3 22.13.2,
+/// 3.2.2), which it did on every device until the fifth session. Cases:
+/// halves' values, the midpoints between neighbouring halves (ties, to
+/// even) and the floats on either side of them, in both signs, through the
+/// denormal and normal ranges and up to overflow; infinities, NaNs and f32
+/// denormals. Reference: the ISA's rounding.
+#[test]
+fn f16_conversion_rounds_to_nearest_even_on_any_device() {
+    use super::bitcode::eval::{f16_to_f32, f32_to_f16_nearest_even};
+    let mut xs: Vec<u32> = vec![
+        0x0000_0000,
+        0x8000_0000,
+        0x7F80_0000,
+        0xFF80_0000,
+        0x7FC0_0000,
+        0xFFC0_0001,
+        0x7F80_0001,
+        0x0000_0001,
+        0x807F_FFFF,
+        0x7F7F_FFFF,
+        0x477F_EFFF, // just below 65520: the largest finite half
+        0x477F_F000, // 65520: a tie that rounds to infinity
+        0x4780_0000, // 65536
+        0x3300_0000, // 2^-25: a tie that rounds to zero
+        0x3300_0001,
+        0x3380_0000, // 2^-24: the smallest half
+    ];
+    let halves = (0u16..0x7BFF)
+        .step_by(13)
+        .chain(0..40)
+        .chain(0x3F0..0x410)
+        .chain(0x7BE0..0x7BFF);
+    for h in halves {
+        let (a, b) = (f16_to_f32(h), f16_to_f32(h + 1));
+        // Exact: 12 significant bits.
+        let mid = ((f64::from(a) + f64::from(b)) / 2.0) as f32;
+        for x in [
+            a.to_bits(),
+            mid.to_bits() - 1,
+            mid.to_bits(),
+            mid.to_bits() + 1,
+        ] {
+            xs.extend([x, x | 0x8000_0000]);
+        }
+    }
+    let op = crate::gfx10::opcode(crate::gfx10::Encoding::Vop3, "v_cvt_f16_f32").unwrap();
+    let body = vop3(op, 0, vgpr(1), vgpr(2), vgpr(3)).to_vec();
+    let cases: Vec<[u32; 4]> = xs.iter().map(|&x| [x, 0, 0, 0]).collect();
+    for (&x, out) in xs.iter().zip(eval_cases(&body, &cases)) {
+        let want = u32::from(f32_to_f16_nearest_even(f32::from_bits(x)));
+        assert_eq!(out[0], want, "v_cvt_f16_f32({x:#010x})");
+    }
+}
+
+/// `v_cvt_f32_u32` and `v_cvt_f32_i32` round to nearest even on any device,
+/// although D3D only "strongly recommends" it for integers too large to
+/// convert exactly (D3D11.3 22.13.5-6; WARP rounds 0xFFFFFF6B up to 2^32):
+/// the ties at every rounding position (both ways to even), their
+/// neighbours, range edges, and 512 others, against IEEE nearest-even
+/// conversion (Rust's).
+#[test]
+fn integer_to_float_conversions_round_to_nearest_even_on_any_device() {
+    let mut xs: Vec<u32> = vec![
+        0,
+        1,
+        2,
+        (1 << 24) - 1,
+        1 << 24,
+        (1 << 24) + 1,
+        (1 << 24) + 3,
+        (1 << 25) + 2,
+        (1 << 25) + 6,
+        0x7FFF_FFFF,
+        0x8000_0000,
+        0x8000_0001,
+        0xFFFF_FF6B,
+        0xFFFF_FF80,
+        0xFFFF_FE80,
+        0xFFFF_FFFF,
+        0xFF00_0001,
+        0x7FFF_FFC0,
+        0x7FFF_FF40,
+    ];
+    for drop in 1..=8u32 {
+        for m in [0x80_0000u32, 0x80_0001, 0xAB_CDEF, 0xFF_FFFE, 0xFF_FFFF] {
+            let (base, half) = (m << drop, 1u32 << (drop - 1));
+            xs.extend([
+                base,
+                base + half - 1,
+                base + half,
+                base + half + 1,
+                base + ((1 << drop) - 1),
+            ]);
+        }
+    }
+    let mut r = 0x1234_5678u32;
+    for _ in 0..512 {
+        r ^= r << 13;
+        r ^= r >> 17;
+        r ^= r << 5;
+        xs.push(r);
+    }
+    let cases: Vec<[u32; 4]> = xs.iter().map(|&x| [x, 0, 0, 0]).collect();
+    let unsigned: fn(u32) -> u32 = |x| (x as f32).to_bits();
+    let signed: fn(u32) -> u32 = |x| (x as i32 as f32).to_bits();
+    for (name, reference) in [("v_cvt_f32_u32", unsigned), ("v_cvt_f32_i32", signed)] {
+        let op = crate::gfx10::opcode(crate::gfx10::Encoding::Vop3, name).unwrap();
+        let body = vop3(op, 0, vgpr(1), vgpr(2), vgpr(3)).to_vec();
+        for (&x, out) in xs.iter().zip(eval_cases(&body, &cases)) {
+            assert_eq!(out[0], reference(x), "{name}({x:#010x})");
+        }
+    }
+}
+
 #[test]
 fn conversions_match_the_isa() {
     let cases: Vec<[u32; 4]> = FLOATS
@@ -1333,7 +1449,7 @@ fn conversions_match_the_isa() {
         }),
         ("v_cvt_f32_ubyte3", 0, |x| ((x >> 24) as f32).to_bits()),
         ("v_cvt_f16_f32", 0, |x| {
-            u32::from(super::bitcode::eval::f32_to_f16(f(x)))
+            u32::from(super::bitcode::eval::f32_to_f16_nearest_even(f(x)))
         }),
         ("v_trunc_f32", 0, |x| f(x).trunc().to_bits()),
         ("v_floor_f32", 0, |x| f(x).floor().to_bits()),
@@ -1811,7 +1927,7 @@ fn f16_arithmetic_rounds_once_as_the_isa() {
             cases.push([a, b, 0, 0]);
         }
     }
-    let to_h = |x: f32| u32::from(super::bitcode::eval::f32_to_f16(x));
+    let to_h = |x: f32| u32::from(super::bitcode::eval::f32_to_f16_nearest_even(x));
     let h = |x: u32| f16_to_f32(x as u16);
     type HalfOp = (&'static str, fn(f32, f32) -> f32);
     let ops: &[HalfOp] = &[
@@ -1984,7 +2100,7 @@ fn dot_product_clamp_saturates_the_exact_sum() {
 fn half_dot_products_match_the_isa() {
     // Values whose products and sums are exact in f32, then infinities and
     // NaNs.
-    let h = |x: f32| u32::from(super::bitcode::eval::f32_to_f16(x));
+    let h = |x: f32| u32::from(super::bitcode::eval::f32_to_f16_nearest_even(x));
     let pack = |lo: f32, hi: f32| h(lo) | h(hi) << 16;
     let cases: Vec<[u32; 4]> = [
         ((1.0, 2.0), (3.0, 4.0), 0.5),
@@ -2321,7 +2437,7 @@ fn packed_half_floats_round_each_half_as_the_isa() {
         }
     }
     let h = |x: u32| f16_to_f32(x as u16);
-    let to_h = |x: f32| u32::from(super::bitcode::eval::f32_to_f16(x));
+    let to_h = |x: f32| u32::from(super::bitcode::eval::f32_to_f16_nearest_even(x));
     type PkF = (&'static str, fn(f32, f32, f32) -> f32);
     let ops: &[PkF] = &[
         ("v_pk_add_f16", |a, b, _| a + b),

@@ -193,8 +193,11 @@ fn sext(bits: u32, v: u64) -> i64 {
     }
 }
 
-/// `f32` to binary16 bits, rounded to nearest even (D3D's `f32tof16`).
-pub(crate) fn f32_to_f16(f: f32) -> u16 {
+/// `f32` to binary16 bits, rounded to nearest even: what GFX10's f16
+/// conversions and f16 arithmetic do in the MODE register's default
+/// rounding, so the reference the tests hold f16 results to. Not what
+/// D3D's `f32tof16` does: see [`f32_to_f16_d3d`].
+pub(crate) fn f32_to_f16_nearest_even(f: f32) -> u16 {
     let x = f.to_bits();
     let sign = ((x >> 16) & 0x8000) as u16;
     let exp = ((x >> 23) & 0xFF) as i32;
@@ -235,6 +238,39 @@ pub(crate) fn f32_to_f16(f: f32) -> u16 {
         r += 1;
     }
     sign | r as u16
+}
+
+/// `f32` to binary16 bits as D3D's `f32tof16` (DXIL `legacyF32ToF16`)
+/// converts them. The D3D11.3 functional specification's entry (22.13.2)
+/// "Follows D3D rules for floating point conversion", which (3.2.2) are:
+/// round toward zero; a value too large becomes the largest finite value
+/// of its sign, "NOT including signed infinity"; infinity stays infinity;
+/// NaN stays NaN (its bits are not specified, 3.1.3.2: kept quiet with the
+/// payload's top bits here); a denormal becomes the half denormal it
+/// truncates to, or zero.
+pub(crate) fn f32_to_f16_d3d(f: f32) -> u16 {
+    let x = f.to_bits();
+    let sign = ((x >> 16) & 0x8000) as u16;
+    let ax = x & 0x7FFF_FFFF;
+    if ax > 0x7F80_0000 {
+        return sign | 0x7E00 | ((ax >> 13) & 0x3FF) as u16;
+    }
+    if ax == 0x7F80_0000 {
+        return sign | 0x7C00;
+    }
+    if ax >= 0x4780_0000 {
+        return sign | 0x7BFF;
+    }
+    let exp = ax >> 23;
+    if exp < 113 {
+        // Below 2^-14: a half denormal (counts of 2^-24), or zero.
+        if exp < 103 {
+            return sign;
+        }
+        let m = (ax & 0x7F_FFFF) | 0x80_0000;
+        return sign | (m >> (126 - exp)) as u16;
+    }
+    sign | ((ax >> 13) - (112 << 10)) as u16
 }
 
 /// Binary16 bits to `f32`, exactly.
@@ -811,7 +847,7 @@ impl Exec<'_, '_> {
             }
             111 => Val::i32(self.lane as u32),
             112 => Val::i32(self.env.wave_lanes),
-            130 => Val::i32(u32::from(f32_to_f16(f(0)?))),
+            130 => Val::i32(u32::from(f32_to_f16_d3d(f(0)?))),
             131 => float(f16_to_f32(u(0)? as u16)),
             139 => {
                 let Some(Val::Handle(h)) = a.first() else {
@@ -1275,7 +1311,7 @@ fn rmw(op: Rmw, old: &Val, v: &Val) -> Result<Val, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{f16_to_f32, f32_to_f16};
+    use super::{f16_to_f32, f32_to_f16_d3d, f32_to_f16_nearest_even as f32_to_f16};
 
     #[test]
     fn half_conversions_round_trip_and_round_to_nearest_even() {
@@ -1299,5 +1335,46 @@ mod tests {
         assert_eq!(f32_to_f16(65504.0), 0x7BFF);
         assert_eq!(f32_to_f16(65520.0), 0x7C00);
         assert_eq!(f32_to_f16(-1e10), 0xFC00);
+    }
+
+    /// D3D's `f32tof16` (D3D11.3 3.2.2): exact on every half, toward zero
+    /// otherwise, the largest finite half on overflow, infinity and NaN
+    /// kept, and never further from the value than nearest-even rounding's
+    /// neighbour toward zero.
+    #[test]
+    fn d3d_half_conversion_rounds_toward_zero_and_clamps() {
+        for h in 0..=u16::MAX {
+            let f = f16_to_f32(h);
+            let back = f32_to_f16_d3d(f);
+            if f.is_nan() {
+                assert_eq!(back & 0x7C00, 0x7C00, "{h:#06x}");
+                assert_ne!(back & 0x3FF, 0, "{h:#06x}");
+            } else {
+                assert_eq!(back, h, "{h:#06x} -> {f} -> {back:#06x}");
+            }
+        }
+        // Toward zero where nearest-even goes up.
+        assert_eq!(f32_to_f16_d3d(1.0 + 3.0 * 2f32.powi(-12)), 0x3C00);
+        assert_eq!(f32_to_f16_d3d(-(1.0 + 3.0 * 2f32.powi(-11))), 0xBC01);
+        assert_eq!(f32_to_f16_d3d(3.0 * 2f32.powi(-25)), 0x0001);
+        assert_eq!(f32_to_f16_d3d(2f32.powi(-25)), 0x0000);
+        // Overflow stops at the largest finite half; infinity stays.
+        assert_eq!(f32_to_f16_d3d(65520.0), 0x7BFF);
+        assert_eq!(f32_to_f16_d3d(f32::MAX), 0x7BFF);
+        assert_eq!(f32_to_f16_d3d(-1e10), 0xFBFF);
+        assert_eq!(f32_to_f16_d3d(f32::INFINITY), 0x7C00);
+        assert_eq!(f32_to_f16_d3d(f32::NEG_INFINITY), 0xFC00);
+        // An f32 denormal is far below the smallest half: a zero of its sign.
+        assert_eq!(f32_to_f16_d3d(f32::from_bits(0x8000_0001)), 0x8000);
+        // Everywhere: the truncation of the value, so nearest-even's result
+        // or one step below it in magnitude.
+        let mut x = 0x2F00_0000u32;
+        while x < 0x4780_0000 {
+            let f = f32::from_bits(x);
+            let (d3d, nearest) = (f32_to_f16_d3d(f), f32_to_f16(f));
+            assert!(f16_to_f32(d3d) <= f, "{x:#010x}");
+            assert!(d3d == nearest || d3d + 1 == nearest, "{x:#010x}");
+            x += 0x0000_1F3B;
+        }
     }
 }

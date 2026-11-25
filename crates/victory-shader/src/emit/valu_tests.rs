@@ -1276,138 +1276,274 @@ fn integer_lowerings_agree_with_the_evaluator_on_the_host() {
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
 
-/// How a device's result may differ from the evaluator's where D3D leaves
-/// the choice to the device.
+/// Where a float lowering's result lives, for comparing it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Domain {
+    /// An f32.
+    F32,
+    /// Integer bits: conversions to integers, packed integers.
+    Int,
+    /// An f16 in the low half; the high half compared as bits.
+    F16Lo,
+    /// Two f16 halves.
+    F16x2,
+}
+
+/// How a device's result may differ from the evaluator's for the same
+/// DXIL, each only where Microsoft's specifications leave it to the device
+/// (the D3D11.3 functional specification, v1.17, and DXIL.rst).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Leeway {
-    /// Both NaN, with different payloads.
+    /// Both NaN, with other bits: "the exact bit pattern of the NaN is not
+    /// required to stay the same" (D3D11.3 3.1.3.2); halves too (3.2.2:
+    /// NaN converts to "NaN representation").
     NanPayload,
-    /// A denormal input or result flushed to zero (fp32 denormal mode
-    /// "any", which the translated shaders declare by default).
+    /// A float operand is a denormal, or the evaluator's f32 result is one
+    /// and the device gives the zero of its sign: "Denorms MUST be flushed
+    /// to sign-preserved zero on input and output of any floating point
+    /// mathematical operation" (3.1.3.2), under the default fp32 denormal
+    /// mode the translated shaders keep; the evaluator preserves them.
+    /// Halves keep denormals (3.1.5), so never for f16 results.
     DenormalFlush,
-    /// Zeros of different signs, from operations D3D lets return either
-    /// (min and max of -0 and +0; the approximate ones).
+    /// Zeros of different signs from min/max-like operations: "it is
+    /// permissible for the result of comparing zeros to be dependent on the
+    /// order of parameters" (3.1.3.2).
     ZeroSign,
-    /// `FMad`, which the device may fuse or not: the result is one of the
-    /// two roundings.
+    /// `v_fma_f32`'s `FMad`, fused or not: DXIL.rst says it "is not fused
+    /// for 'precise' operations", and the lowering's is not marked precise.
+    /// The device's result must be one of the two roundings.
     FusedOrNot,
-    /// An approximate operation within the tolerance checked here.
+    /// An approximate operation within its D3D11.3 bound (chapter 22), plus
+    /// the evaluator's own error (2^-23 relative): rcp, rsq and exp 2^-21
+    /// relative; sqrt 1 ULP; log 2^-21 absolute on [0.5, 2], else
+    /// relative; sin and cos 0.0008 absolute within [-100 pi, 100 pi]
+    /// radians, and only "[-1 to +1]" outside it.
     Approximate,
     /// None of the above: a real disagreement.
     Other,
 }
 
-/// Classifies a differing dword of float lowering `name` (`floats`: which
-/// of its three operands are floats).
-fn leeway(name: &str, floats: u8, inputs: [u32; 4], want: u32, got: u32) -> Leeway {
+/// Whether `got` is within D3D11.3's bound for approximate operation `name`
+/// of the evaluator's `want` (`x`: the input); `None` for other operations.
+fn approximate(name: &str, x: f32, want: f32, got: f32) -> Option<bool> {
+    let (w, g) = (f64::from(want), f64::from(got));
+    let finite = want.is_finite() && got.is_finite();
+    let ours = 2f64.powi(-23);
+    let relative = |bound: f64| finite && (w - g).abs() <= w.abs() * (bound + ours);
+    Some(match name {
+        "v_rcp_f32" | "v_rsq_f32" | "v_exp_f32" => relative(2f64.powi(-21)),
+        // The evaluator's sqrt is correctly rounded: one step apart at most.
+        "v_sqrt_f32" => {
+            finite
+                && want.is_sign_negative() == got.is_sign_negative()
+                && want.to_bits().abs_diff(got.to_bits()) <= 1
+        }
+        "v_log_f32" if (0.5..=2.0).contains(&x) => {
+            finite && (w - g).abs() <= 2f64.powi(-21) + ours * w.abs().max(1.0)
+        }
+        "v_log_f32" => relative(2f64.powi(-21)),
+        // The ISA's input is in revolutions.
+        "v_sin_f32" | "v_cos_f32" => {
+            let radians = f64::from(x) * std::f64::consts::TAU;
+            if radians.abs() <= 100.0 * std::f64::consts::PI {
+                finite && (w - g).abs() <= 0.0008 + ours
+            } else {
+                got.is_finite() && (-1.0..=1.0).contains(&got)
+            }
+        }
+        _ => return None,
+    })
+}
+
+/// Classifies a differing f32 result of float lowering `name` (`floats`:
+/// which of its three operands are floats).
+fn leeway_f32(name: &str, floats: u8, inputs: [u32; 4], want: u32, got: u32) -> Leeway {
     let (w, g) = (f32::from_bits(want), f32::from_bits(got));
     let denormal = |b: u32| b & 0x7F80_0000 == 0 && b & 0x007F_FFFF != 0;
-    let approximate = matches!(
-        name,
-        "v_sqrt_f32"
-            | "v_rsq_f32"
-            | "v_rcp_f32"
-            | "v_exp_f32"
-            | "v_log_f32"
-            | "v_sin_f32"
-            | "v_cos_f32"
-    );
     if w.is_nan() && g.is_nan() {
         return Leeway::NanPayload;
     }
-    let float_input_denormal = (0..3).any(|k| floats >> k & 1 != 0 && denormal(inputs[k]));
-    if float_input_denormal || (denormal(want) && g == 0.0) || (denormal(got) && w == 0.0) {
+    let input = (0..3).any(|k| floats >> k & 1 != 0 && denormal(inputs[k]));
+    let output = denormal(want) && got == want & 0x8000_0000;
+    if input || output {
         return Leeway::DenormalFlush;
     }
     let min_max = matches!(
         name,
         "v_min_f32" | "v_max_f32" | "v_min3_f32" | "v_max3_f32" | "v_med3_f32"
     );
-    if w == 0.0 && g == 0.0 && (min_max || approximate) {
+    if min_max && w == 0.0 && g == 0.0 {
         return Leeway::ZeroSign;
     }
     if name == "v_fma_f32" {
         let [a, b, c] = [0, 1, 2].map(|k| f32::from_bits(inputs[k]));
-        let (fused, unfused) = (a.mul_add(b, c), a * b + c);
-        if [fused, unfused]
+        if [a.mul_add(b, c), a * b + c]
             .iter()
-            .any(|r| r.to_bits() == got || r.is_nan() && g.is_nan())
+            .any(|r| r.to_bits() == got)
         {
             return Leeway::FusedOrNot;
         }
     }
-    if approximate && w.is_finite() && g.is_finite() {
-        let x = f32::from_bits(inputs[0]);
-        let close = match name {
-            // D3D bounds sin and cos within [-100 pi, 100 pi] radians; the
-            // ISA's input is in revolutions.
-            "v_sin_f32" | "v_cos_f32" => x.abs() > 50.0 || (w - g).abs() <= 1.0 / 1024.0,
-            "v_log_f32" => (w - g).abs() <= w.abs().max(1.0) / (1 << 20) as f32,
-            _ => (w - g).abs() <= w.abs() / (1 << 20) as f32,
-        };
-        if close {
-            return Leeway::Approximate;
-        }
+    match approximate(name, f32::from_bits(inputs[0]), w, g) {
+        Some(true) => Leeway::Approximate,
+        _ => Leeway::Other,
     }
-    Leeway::Other
 }
 
-/// The float lowerings (SH-7), checked until now on the evaluator only, on
-/// each SM 6.6 device (WARP on CI): every stored dword matches the
-/// evaluator's for 48 input sets of special and ordinary values (zeros,
-/// denormals, infinities, NaNs, ties, f16 rounding and range edges, integer
-/// range edges), but where D3D leaves the result to the device
-/// ([`Leeway`]). Every difference is printed with its kind; a difference
-/// of no allowed kind fails the test.
+/// Classifies a differing f16 result: only NaN bits may differ.
+fn leeway_f16(want: u16, got: u16) -> Leeway {
+    let nan = |h: u16| h & 0x7C00 == 0x7C00 && h & 0x3FF != 0;
+    if nan(want) && nan(got) {
+        Leeway::NanPayload
+    } else {
+        Leeway::Other
+    }
+}
+
+/// Classifies a differing result dword of a lowering whose result is in
+/// `domain` (`floats`: which operands are floats).
+fn leeway(name: &str, domain: Domain, floats: u8, inputs: [u32; 4], want: u32, got: u32) -> Leeway {
+    let denormal = |b: u32| b & 0x7F80_0000 == 0 && b & 0x007F_FFFF != 0;
+    let halves = |x: u32| [x as u16, (x >> 16) as u16];
+    match domain {
+        Domain::F32 => leeway_f32(name, floats, inputs, want, got),
+        // A conversion of a flushed operand.
+        Domain::Int if (0..3).any(|k| floats >> k & 1 != 0 && denormal(inputs[k])) => {
+            Leeway::DenormalFlush
+        }
+        Domain::Int => Leeway::Other,
+        Domain::F16Lo if want >> 16 != got >> 16 => Leeway::Other,
+        Domain::F16Lo => leeway_f16(want as u16, got as u16),
+        Domain::F16x2 => {
+            let (w, g) = (halves(want), halves(got));
+            let kinds = [0, 1].map(|k| (w[k] != g[k]).then(|| leeway_f16(w[k], g[k])));
+            kinds.into_iter().flatten().max().unwrap_or(Leeway::Other)
+        }
+    }
+}
+
+/// Runs each of `ops` (name, float operands, result domain) on each SM 6.6
+/// device for `cases` and compares every stored dword with the evaluator's:
+/// prints every difference with its [`Leeway`], and fails on any `Other`.
+fn compare_float_lowerings(ops: &[(&str, u8, Domain)], cases: &[[u32; 4]]) {
+    use super::synth::{eval_valu, lower_valu, vgpr, vop3};
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let host = match Host::new(warp) {
+            Ok(host) => host,
+            Err(e) => {
+                eprintln!("{label}: skipped: {e}");
+                continue;
+            }
+        };
+        let kind = if host.adapter.1 {
+            "software"
+        } else {
+            "hardware"
+        };
+        eprintln!("{label}: on {} ({kind})", host.adapter.0);
+        let mut other = Vec::new();
+        let mut counts: std::collections::BTreeMap<(&str, Leeway), usize> =
+            std::collections::BTreeMap::new();
+        for &(name, floats, domain) in ops {
+            let op = crate::gfx10::opcode(crate::gfx10::Encoding::Vop3, name)
+                .unwrap_or_else(|| panic!("{name}: no opcode"));
+            let body = vop3(op, 0, vgpr(1), vgpr(2), vgpr(3)).to_vec();
+            let l = lower_valu(&body).unwrap_or_else(|e| panic!("{name}: does not lower: {e}"));
+            let got = run_lowered(&host, &l, cases);
+            for (inputs, got) in cases.iter().zip(got) {
+                let want = eval_valu(&l, *inputs).unwrap_or_else(|e| panic!("{name}: {e}"));
+                for k in 0..4 {
+                    if got[k] == want[k] {
+                        continue;
+                    }
+                    let kind = if k == 0 {
+                        leeway(name, domain, floats, *inputs, want[k], got[k])
+                    } else {
+                        Leeway::Other
+                    };
+                    let line = format!(
+                        "{name}({inputs:08x?}) dword {k}: evaluator {:#010x}, {label} {:#010x}: {kind:?}",
+                        want[k], got[k]
+                    );
+                    eprintln!("{label}: {line}");
+                    *counts.entry((name, kind)).or_default() += 1;
+                    if kind == Leeway::Other {
+                        other.push(line);
+                    }
+                }
+            }
+        }
+        for ((name, kind), count) in &counts {
+            eprintln!("{label}: {name}: {count} x {kind:?}");
+        }
+        assert!(
+            other.is_empty(),
+            "{label}: float lowerings disagree with the evaluator:\n{}",
+            other.join("\n")
+        );
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+/// The float lowerings (SH-7) on each SM 6.6 device (WARP on CI) against
+/// the evaluator, 43 of them for 48 input sets of special and ordinary
+/// values (zeros, denormals, infinities, NaNs, ties, f16 rounding and range
+/// edges, integer range edges): every stored dword the same but where
+/// Microsoft's specifications leave the result to the device ([`Leeway`],
+/// each with its citation), f16 results compared as halves. Runs 16 and 17
+/// found three conversions disagreeing; their lowerings were wrong (see
+/// `f16_nearest_even` and `int_to_f32` in the lowering).
 #[test]
 fn float_lowerings_agree_with_the_evaluator_on_the_host() {
-    use super::synth::{eval_valu, lower_valu, vgpr, vop3};
+    use Domain::{F16Lo, F16x2, F32, Int};
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-    // (name, which of the three operands are floats)
-    let ops: [(&str, u8); 43] = [
-        ("v_add_f32", 0b011),
-        ("v_sub_f32", 0b011),
-        ("v_mul_f32", 0b011),
-        ("v_mul_legacy_f32", 0b011),
-        ("v_min_f32", 0b011),
-        ("v_max_f32", 0b011),
-        ("v_fma_f32", 0b111),
-        ("v_mad_f32", 0b111),
-        ("v_min3_f32", 0b111),
-        ("v_max3_f32", 0b111),
-        ("v_med3_f32", 0b111),
-        ("v_ldexp_f32", 0b001),
-        ("v_frexp_mant_f32", 0b001),
-        ("v_frexp_exp_i32_f32", 0b001),
-        ("v_fract_f32", 0b001),
-        ("v_floor_f32", 0b001),
-        ("v_ceil_f32", 0b001),
-        ("v_trunc_f32", 0b001),
-        ("v_rndne_f32", 0b001),
-        ("v_cvt_f32_i32", 0),
-        ("v_cvt_f32_u32", 0),
-        ("v_cvt_i32_f32", 0b001),
-        ("v_cvt_u32_f32", 0b001),
-        ("v_cvt_flr_i32_f32", 0b001),
-        ("v_cvt_rpi_i32_f32", 0b001),
-        ("v_cvt_f16_f32", 0b001),
-        ("v_cvt_f32_f16", 0),
-        ("v_cvt_pkrtz_f16_f32", 0b011),
-        ("v_cvt_pknorm_i16_f32", 0b011),
-        ("v_cvt_pknorm_u16_f32", 0b011),
-        ("v_cvt_pk_u8_f32", 0b001),
-        ("v_cvt_f32_ubyte0", 0),
-        ("v_cubeid_f32", 0b111),
-        ("v_cubesc_f32", 0b111),
-        ("v_cubetc_f32", 0b111),
-        ("v_cubema_f32", 0b111),
-        ("v_sqrt_f32", 0b001),
-        ("v_rsq_f32", 0b001),
-        ("v_rcp_f32", 0b001),
-        ("v_exp_f32", 0b001),
-        ("v_log_f32", 0b001),
-        ("v_sin_f32", 0b001),
-        ("v_cos_f32", 0b001),
+    // (name, which of the three operands are floats, result)
+    let ops: [(&str, u8, Domain); 43] = [
+        ("v_add_f32", 0b011, F32),
+        ("v_sub_f32", 0b011, F32),
+        ("v_mul_f32", 0b011, F32),
+        ("v_mul_legacy_f32", 0b011, F32),
+        ("v_min_f32", 0b011, F32),
+        ("v_max_f32", 0b011, F32),
+        ("v_fma_f32", 0b111, F32),
+        ("v_mad_f32", 0b111, F32),
+        ("v_min3_f32", 0b111, F32),
+        ("v_max3_f32", 0b111, F32),
+        ("v_med3_f32", 0b111, F32),
+        ("v_ldexp_f32", 0b001, F32),
+        ("v_frexp_mant_f32", 0b001, F32),
+        ("v_frexp_exp_i32_f32", 0b001, Int),
+        ("v_fract_f32", 0b001, F32),
+        ("v_floor_f32", 0b001, F32),
+        ("v_ceil_f32", 0b001, F32),
+        ("v_trunc_f32", 0b001, F32),
+        ("v_rndne_f32", 0b001, F32),
+        ("v_cvt_f32_i32", 0, F32),
+        ("v_cvt_f32_u32", 0, F32),
+        ("v_cvt_i32_f32", 0b001, Int),
+        ("v_cvt_u32_f32", 0b001, Int),
+        ("v_cvt_flr_i32_f32", 0b001, Int),
+        ("v_cvt_rpi_i32_f32", 0b001, Int),
+        ("v_cvt_f16_f32", 0b001, F16Lo),
+        ("v_cvt_f32_f16", 0, F32),
+        ("v_cvt_pkrtz_f16_f32", 0b011, F16x2),
+        ("v_cvt_pknorm_i16_f32", 0b011, Int),
+        ("v_cvt_pknorm_u16_f32", 0b011, Int),
+        ("v_cvt_pk_u8_f32", 0b001, Int),
+        ("v_cvt_f32_ubyte0", 0, F32),
+        ("v_cubeid_f32", 0b111, F32),
+        ("v_cubesc_f32", 0b111, F32),
+        ("v_cubetc_f32", 0b111, F32),
+        ("v_cubema_f32", 0b111, F32),
+        ("v_sqrt_f32", 0b001, F32),
+        ("v_rsq_f32", 0b001, F32),
+        ("v_rcp_f32", 0b001, F32),
+        ("v_exp_f32", 0b001, F32),
+        ("v_log_f32", 0b001, F32),
+        ("v_sin_f32", 0b001, F32),
+        ("v_cos_f32", 0b001, F32),
     ];
     let values: [u32; 40] = [
         0x0000_0000, // +0
@@ -1462,70 +1598,36 @@ fn float_lowerings_agree_with_the_evaluator_on_the_host() {
             ]
         })
         .collect();
-    let mut ran = 0;
-    for (label, warp) in [("hardware", false), ("warp", true)] {
-        let host = match Host::new(warp) {
-            Ok(host) => host,
-            Err(e) => {
-                eprintln!("{label}: skipped: {e}");
-                continue;
-            }
-        };
-        let kind = if host.adapter.1 {
-            "software"
-        } else {
-            "hardware"
-        };
-        eprintln!("{label}: on {} ({kind})", host.adapter.0);
-        // (op, kind) -> how many, and the first.
-        let mut seen: std::collections::BTreeMap<(&str, Leeway), (usize, String)> =
-            std::collections::BTreeMap::new();
-        for &(name, floats) in &ops {
-            let op = crate::gfx10::opcode(crate::gfx10::Encoding::Vop3, name)
-                .unwrap_or_else(|| panic!("{name}: no opcode"));
-            let body = vop3(op, 0, vgpr(1), vgpr(2), vgpr(3)).to_vec();
-            let l = lower_valu(&body).unwrap_or_else(|e| panic!("{name}: does not lower: {e}"));
-            let got = run_lowered(&host, &l, &cases);
-            for (inputs, got) in cases.iter().zip(got) {
-                let want = eval_valu(&l, *inputs).unwrap_or_else(|e| panic!("{name}: {e}"));
-                for k in 0..4 {
-                    if got[k] == want[k] {
-                        continue;
-                    }
-                    let kind = if k == 0 {
-                        leeway(name, floats, *inputs, want[k], got[k])
-                    } else {
-                        Leeway::Other
-                    };
-                    let entry = seen.entry((name, kind)).or_insert_with(|| {
-                        (
-                            0,
-                            format!(
-                                "dword {k} of ({inputs:08x?}): evaluator {:#010x}, {label} {:#010x}",
-                                want[k], got[k]
-                            ),
-                        )
-                    });
-                    entry.0 += 1;
-                }
-            }
-        }
-        for ((name, kind), (count, first)) in &seen {
-            eprintln!("{label}: {name}: {count} x {kind:?}, first {first}");
-        }
-        let other: Vec<_> = seen
-            .iter()
-            .filter(|((_, kind), _)| *kind == Leeway::Other)
-            .map(|((name, _), (count, first))| format!("{name}: {count}, first {first}"))
-            .collect();
-        assert!(
-            other.is_empty(),
-            "{label}: float lowerings disagree with the evaluator:\n{}",
-            other.join("\n")
-        );
-        ran += 1;
-    }
-    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+    compare_float_lowerings(&ops, &cases);
+}
+
+/// f16 arithmetic on each SM 6.6 device (WARP on CI) against the
+/// evaluator: its results are rounded to nearest even by the lowering's own
+/// conversion (D3D's rounds toward zero), so they must agree to the bit but
+/// for NaN bits. Operands are halves in the low 16 bits (the high bits
+/// filled, to be ignored): ties after 1.0, denormals, the largest finite
+/// half, infinities, NaNs, zeros of both signs.
+#[test]
+fn f16_lowerings_agree_with_the_evaluator_on_the_host() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let ops = [
+        ("v_add_f16", 0, Domain::F16Lo),
+        ("v_sub_f16", 0, Domain::F16Lo),
+        ("v_mul_f16", 0, Domain::F16Lo),
+        ("v_fma_f16", 0, Domain::F16Lo),
+    ];
+    let halves: [u32; 20] = [
+        0x0000, 0x8000, 0x0001, 0x03FF, 0x0400, 0x3C00, 0x3C01, 0x0E00, 0x3E00, 0x1400, 0x7BFF,
+        0xFBFF, 0x7C00, 0xFC00, 0x7E00, 0x1000, 0x1800, 0x5BFF, 0x2E66, 0xB401,
+    ];
+    let n = halves.len();
+    let cases: Vec<[u32; 4]> = (0..60)
+        .map(|i| {
+            let h = |k: usize| halves[k % n] | 0xABCD_0000;
+            [h(i), h(i * 7 + 3), h(i * 13 + 5), 0]
+        })
+        .collect();
+    compare_float_lowerings(&ops, &cases);
 }
 
 /// Probes (GPU-1) on each SM 6.6 device (WARP on CI): a store through the

@@ -1439,9 +1439,126 @@ impl<'a> Lower<'a> {
         )
     }
 
-    /// `f` as an f16 in the low bits, rounded toward zero: the nearest-even
-    /// conversion, one step back toward zero where it rounded away (which
-    /// also turns an overflow to infinity into the largest finite half).
+    /// `f` as an f16 in the low bits (the rest zero), rounded to nearest
+    /// even: what GFX10's f16 conversions and f16 arithmetic do in the MODE
+    /// default. D3D's own conversion (`legacyF32ToF16`) rounds toward zero
+    /// and stops overflows at the largest finite half (D3D11.3 22.13.2 and
+    /// 3.2.2), so this uses only operations D3D defines exactly: integer
+    /// arithmetic on the bits for normal halves, and for half denormals a
+    /// power-of-two scale (exact) and `round_ne` (22.10.14). Overflow gives
+    /// infinity; a NaN stays quiet with the payload's top bits.
+    fn f16_nearest_even(&mut self, f: V) -> V {
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let k = |l: &mut Self, x: u32| l.s.m.i32(x);
+        let bits = self.as_int(f);
+        let (k16, k13, h8000, abs_mask) = (
+            k(self, 16),
+            k(self, 13),
+            k(self, 0x8000),
+            k(self, 0x7FFF_FFFF),
+        );
+        let sign = self.s.m.bin(c, Bin::LShr, bits, k16);
+        let sign = self.s.m.bin(c, Bin::And, sign, h8000);
+        let ax = self.s.m.bin(c, Bin::And, bits, abs_mask);
+        // Normal halves: the exponent rebiased by 112, the 13 dropped bits
+        // rounded to nearest even (a carry may reach the exponent, up to
+        // infinity at 65520).
+        let (one, fff, rebias) = (k(self, 1), k(self, 0xFFF), k(self, 112 << 10));
+        let top = self.s.m.bin(c, Bin::LShr, ax, k13);
+        let odd = self.s.m.bin(c, Bin::And, top, one);
+        let n = self.s.m.bin(c, Bin::Add, ax, fff);
+        let n = self.s.m.bin(c, Bin::Add, n, odd);
+        let n = self.s.m.bin(c, Bin::LShr, n, k13);
+        let n = self.s.m.bin(c, Bin::Sub, n, rebias);
+        // Below 2^-14: |f| * 2^24 counts half denormals; rounding it to the
+        // nearest even integer is the result (1024 is the smallest normal
+        // half's bits).
+        let af = self.as_float(ax);
+        let scale = self.s.m.f32(16_777_216f32.to_bits());
+        let y = self.s.m.bin(c, Bin::Mul, af, scale);
+        let y = self.unary(26, y);
+        let d = self.s.m.cast(c, Cast::FpToUi, y, i32t);
+        let small = k(self, 0x3880_0000);
+        let is_small = self.s.m.cmp(c, pred::IULT, ax, small);
+        let r = self.s.m.select(c, is_small, d, n);
+        let (big, inf) = (k(self, 0x4780_0000), k(self, 0x7C00));
+        let is_big = self.s.m.cmp(c, pred::IUGE, ax, big);
+        let r = self.s.m.select(c, is_big, inf, r);
+        let (payload, quiet, nan_from) = (k(self, 0x3FF), k(self, 0x7E00), k(self, 0x7F80_0000));
+        let q = self.s.m.bin(c, Bin::And, top, payload);
+        let q = self.s.m.bin(c, Bin::Or, q, quiet);
+        let is_nan = self.s.m.cmp(c, pred::IUGT, ax, nan_from);
+        let r = self.s.m.select(c, is_nan, q, r);
+        self.s.m.bin(c, Bin::Or, r, sign)
+    }
+
+    /// `x` converted to f32 rounded to nearest even, as `v_cvt_f32_i32` and
+    /// `v_cvt_f32_u32` do in the MODE default, on every device: D3D only
+    /// "strongly recommends" nearest-even rounding for integers too large to
+    /// convert exactly (D3D11.3 22.13.5-6), and WARP rounds some from 2^31
+    /// the other way. Magnitudes below 2^24 convert exactly anywhere; larger
+    /// ones are built from their bits (24 kept, the rest rounded).
+    fn int_to_f32(&mut self, x: V, signed: bool) -> V {
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+        let (mag, sign) = if signed {
+            let k31 = k(self, 31);
+            let s = self.s.m.bin(c, Bin::AShr, x, k31);
+            let flipped = self.s.m.bin(c, Bin::Xor, x, s);
+            let mag = self.s.m.bin(c, Bin::Sub, flipped, s);
+            let top = k(self, 0x8000_0000);
+            (mag, Some(self.s.m.bin(c, Bin::And, x, top)))
+        } else {
+            (x, None)
+        };
+        let small = self.s.m.cast(c, Cast::UiToFp, mag, self.s.t.f32);
+        // From 2^24: the top bit at 31 - lz, so 8 - lz bits (1 to 8) drop.
+        let lz = self
+            .s
+            .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 33, &[mag]);
+        let (one, eight) = (k(self, 1), k(self, 8));
+        let drop = self.s.m.bin(c, Bin::Sub, eight, lz);
+        // Kept in 1..=9 where unused, so no shift goes out of range.
+        let above = self.s.m.cmp(c, pred::SGT, drop, one);
+        let drop = self.s.m.select(c, above, drop, one);
+        let mant = self.s.m.bin(c, Bin::LShr, mag, drop);
+        let unit = self.s.m.bin(c, Bin::Shl, one, drop);
+        let mask = self.s.m.bin(c, Bin::Sub, unit, one);
+        let rest = self.s.m.bin(c, Bin::And, mag, mask);
+        let half = self.s.m.bin(c, Bin::LShr, unit, one);
+        let odd = self.s.m.bin(c, Bin::And, mant, one);
+        let rest = self.s.m.bin(c, Bin::Add, rest, odd);
+        let up = self.s.m.cmp(c, pred::IUGT, rest, half);
+        let zero = k(self, 0);
+        let up = self.s.m.select(c, up, one, zero);
+        // ((127 + 23 + drop) << 23) + mant - 2^23 (the implicit bit), plus
+        // the rounding, which carries into the exponent when it must.
+        let bias = k(self, 149);
+        let e = self.s.m.bin(c, Bin::Add, drop, bias);
+        let k23 = k(self, 23);
+        let e = self.s.m.bin(c, Bin::Shl, e, k23);
+        let large = self.s.m.bin(c, Bin::Add, e, mant);
+        let large = self.s.m.bin(c, Bin::Add, large, up);
+        let large = self.as_float(large);
+        let limit = k(self, 1 << 24);
+        let is_large = self.s.m.cmp(c, pred::IUGE, mag, limit);
+        let r = self.s.m.select(c, is_large, large, small);
+        match sign {
+            None => r,
+            Some(sign) => {
+                let bits = self.as_int(r);
+                let bits = self.s.m.bin(c, Bin::Or, bits, sign);
+                self.as_float(bits)
+            }
+        }
+    }
+
+    /// `f` as an f16 in the low bits, rounded toward zero (pkrtz). D3D's
+    /// conversion already rounds toward zero, with an overflow to the
+    /// largest finite half (D3D11.3 3.2.2); a device that rounded otherwise
+    /// is stepped back toward zero where it rounded away.
     fn f16_toward_zero(&mut self, f: V) -> V {
         let c = self.cur;
         let i32t = self.s.t.i32;
@@ -4527,12 +4644,12 @@ impl<'a> Lower<'a> {
                     a = self.s.m.bin(c, Bin::LShr, a, sh);
                     a = self.s.m.bin(c, Bin::And, a, ff);
                 }
-                let op = if name == "v_cvt_f32_i32" {
-                    Cast::SiToFp
+                // Bytes convert exactly anywhere; whole dwords need rounding.
+                let r = if name.starts_with("v_cvt_f32_ubyte") {
+                    self.s.m.cast(c, Cast::UiToFp, a, self.s.t.f32)
                 } else {
-                    Cast::UiToFp
+                    self.int_to_f32(a, name == "v_cvt_f32_i32")
                 };
-                let r = self.s.m.cast(c, op, a, self.s.t.f32);
                 float(self, r)
             }
             "v_fma_mix_f32" | "v_fma_mixlo_f16" | "v_fma_mixhi_f16" => {
@@ -4578,9 +4695,7 @@ impl<'a> Lower<'a> {
                     Some(o) => self.i32_of(o)?,
                     None => self.s.m.i32(0),
                 };
-                let h = self
-                    .s
-                    .op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[r]);
+                let h = self.f16_nearest_even(r);
                 let (keep, h) = if name == "v_fma_mixhi_f16" {
                     let k16 = self.s.m.i32(16);
                     (0xFFFF, self.s.m.bin(c, Bin::Shl, h, k16))
@@ -4605,9 +4720,7 @@ impl<'a> Lower<'a> {
             "v_cvt_f16_f32" if v.opsel == 0 => {
                 // Rounded to nearest even (the MODE default) into the low half.
                 let a = f(self, 0)?;
-                let r = self
-                    .s
-                    .op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[a]);
+                let r = self.f16_nearest_even(a);
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
                     return Err("a 16-bit result outside a VGPR");
                 };
@@ -5160,8 +5273,7 @@ impl<'a> Lower<'a> {
             if v.clamp {
                 f = l.unary(7, f);
             }
-            let h =
-                l.s.op(l.cur, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f]);
+            let h = l.f16_nearest_even(f);
             l.write_half(inst, h, guard)
         };
         if name == "v_cvt_f16_f32" {
@@ -5593,7 +5705,7 @@ impl<'a> Lower<'a> {
             return Err("modifiers on a packed integer operation");
         }
         let c = self.cur;
-        let (i32t, f32t) = (self.s.t.i32, self.s.t.f32);
+        let f32t = self.s.t.f32;
         let mut halves = Vec::new();
         for high in [false, true] {
             let mut xs = Vec::new();
@@ -5625,8 +5737,7 @@ impl<'a> Lower<'a> {
                 if v.clamp {
                     f = self.unary(7, f);
                 }
-                self.s
-                    .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
+                self.f16_nearest_even(f)
             } else {
                 let k16 = self.s.m.i32(16);
                 let sext = |l: &mut Self, x: V| {
@@ -6482,15 +6593,7 @@ impl<'a> Lower<'a> {
                     };
                     let x = channel(l, row, ch)?;
                     let f = l.as_float(x);
-                    let i32t = l.s.t.i32;
-                    Ok(Some(l.s.op(
-                        l.cur,
-                        "legacyF32ToF16",
-                        Attr::ReadNone,
-                        i32t,
-                        130,
-                        &[f],
-                    )))
+                    Ok(Some(l.f16_nearest_even(f)))
                 };
                 let h = 2 * attribute.channel;
                 let c = self.cur;
@@ -7090,8 +7193,11 @@ impl<'a> Lower<'a> {
         for ch in channels {
             let x = self.s.m.extract(c, r, ch);
             xs.push(if *d16 {
-                // shortcut: d16 results are taken as floats (rounded to
-                // nearest even); integer formats would keep 16 bits.
+                // shortcut: d16 results are taken as floats, converted as D3D
+                // converts (toward zero, D3D11.3 3.2.2): how the texture unit
+                // rounds them is not documented here, and an exact
+                // nearest-even conversion per channel would cost 25
+                // instructions a sample; integer formats would keep 16 bits.
                 let i32t = self.s.t.i32;
                 self.s
                     .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[x])
@@ -7486,7 +7592,8 @@ impl<'a> Lower<'a> {
             return Err("a buffer result");
         };
         if d16 {
-            // Two f16 channels per VGPR (an odd last high half 0).
+            // Two f16 channels per VGPR (an odd last high half 0), converted
+            // as D3D converts (toward zero; shortcut, as for d16 images).
             let k16 = self.s.m.i32(16);
             let i32t = self.s.t.i32;
             for k in 0..count.div_ceil(2) {
