@@ -10,6 +10,10 @@ name: Windows validation
 # Hosted runners have no GPU. Their D3D12 adapters are WARP and the Basic
 # Render Driver, both software; the tests and the summary say which adapter
 # each D3D12 run used. Nothing here is hardware GPU validation.
+#
+# Once those checks pass, a second job builds the diagnostic executable and
+# keeps it as a download (docs/diagnostic-build.md): experimental, never
+# run with a game here, and holding nothing from one.
 
 on:
   push:
@@ -172,3 +176,103 @@ jobs:
           name: windows-validation-logs
           path: logs/
           retention-days: 14
+
+  # The diagnostic build (docs/diagnostic-build.md), for testing on a machine
+  # with a GPU: the executable as the README's Debugging section builds it,
+  # its symbols, the license, the notices of the crates it is built from,
+  # the build's identity and the guides. Only files named here go in; none
+  # comes from a game (the runner has no game files). Not a release.
+  diagnostic-build:
+    needs: validate
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Asset policy
+        shell: bash
+        run: cargo xtask policy
+
+      # The build's name: the workspace version and the commit, which
+      # `victory --version` and the run summary print (VICTORY_BUILD).
+      - name: Name the build
+        shell: bash
+        run: |
+          version=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)
+          [ -n "$version" ] || { echo "::error::no workspace version in Cargo.toml"; exit 1; }
+          echo "VICTORY_BUILD=$version+diag.${GITHUB_SHA::12}" >> "$GITHUB_ENV"
+          echo "PACKAGE=victory-diag-$version-${GITHUB_SHA::12}-windows-x64" >> "$GITHUB_ENV"
+
+      - name: Build
+        shell: bash
+        run: cargo build --locked --profile diag -p victory --features diagnostics
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          dist="dist/$PACKAGE"
+          mkdir -p "$dist/docs"
+          cp target/diag/victory.exe target/diag/victory.pdb LICENSE victory.example.toml "$dist/"
+          cp docs/diagnostic-build.md docs/hardware-validation.md "$dist/docs/"
+          cargo xtask notices --target x86_64-pc-windows-msvc --out "$dist/THIRD-PARTY-NOTICES.txt"
+          # The executable starts and names this build.
+          reported=$("$dist/victory.exe" --version | tr -d '\r')
+          [ "$reported" = "victory $VICTORY_BUILD" ] || {
+            echo "::error::victory --version printed '$reported', not 'victory $VICTORY_BUILD'"
+            exit 1
+          }
+          "$dist/victory.exe" --help > /dev/null
+          url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
+          {
+            echo "VIctory diagnostic build: EXPERIMENTAL, NOT VERIFIED FOR GAMEPLAY"
+            echo
+            echo "Build:        $VICTORY_BUILD (victory.exe --version prints it)"
+            echo "Commit:       $GITHUB_SHA"
+            echo "Branch:       $GITHUB_REF_NAME"
+            echo "Source:       $url/tree/$GITHUB_SHA (crates: the versions its Cargo.lock pins, from crates.io)"
+            echo "Workflow run: $url/actions/runs/$GITHUB_RUN_ID"
+            echo "Built:        $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "Command:      cargo build --locked --profile diag -p victory --features diagnostics"
+            echo "Profile:      diag (release code generation, line tables) with the diagnostics feature"
+            echo "Target:       x86_64-pc-windows-msvc"
+            echo "Toolchain:    $(rustc -V), $(cargo -V)"
+            echo "Checks:       the validate job of the same run passed (lints, tests, DXIL"
+            echo "              validation, D3D12 tests on WARP and the Basic Render Driver)"
+            echo
+            echo "No game has been run with this build: the machine that built it has no GPU"
+            echo "and no game files. The checks above are software rendering and unit tests,"
+            echo "not hardware GPU validation and not gameplay. This package holds VIctory's"
+            echo "executable and symbols, its license (GPL-3.0-or-later), the notices of the"
+            echo "crates it is built from and two guides; nothing from any game (no game"
+            echo "files, shaders, caches, saves or keys). See docs/diagnostic-build.md."
+          } > "$dist/BUILD-INFO.txt"
+          (cd "$dist" && sha256sum victory.exe victory.pdb > SHA256SUMS.txt)
+          # Exactly these files, nothing else.
+          expected="BUILD-INFO.txt LICENSE SHA256SUMS.txt THIRD-PARTY-NOTICES.txt docs/diagnostic-build.md docs/hardware-validation.md victory.example.toml victory.exe victory.pdb"
+          actual=$(cd "$dist" && find . -type f | sed 's|^\./||' | LC_ALL=C sort | tr '\n' ' ' | sed 's/ $//')
+          [ "$actual" = "$expected" ] || { echo "::error::package holds: $actual"; exit 1; }
+          cat "$dist/BUILD-INFO.txt" "$dist/SHA256SUMS.txt"
+
+      - name: Keep the package
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PACKAGE }}
+          path: dist/
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Summary
+        shell: bash
+        run: |
+          {
+            echo "## Diagnostic build (experimental, not verified for gameplay)"
+            echo
+            echo "Artifact \`$PACKAGE\` (kept 14 days): \`victory.exe\` $VICTORY_BUILD with its symbols, license, notices and guides. Nothing from any game is in it. No game was run with it: this runner has no GPU and no game files."
+            echo
+            echo '```'
+            cat "dist/$PACKAGE/SHA256SUMS.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

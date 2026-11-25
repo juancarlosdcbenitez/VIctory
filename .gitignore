@@ -9,6 +9,8 @@
 
 # Build output
 /target/
+# The diagnostic build's package (docs/diagnostic-build.md)
+/dist/
 /tests/fixtures/*/target/
 
 # Local configuration (contains paths to YOUR files)

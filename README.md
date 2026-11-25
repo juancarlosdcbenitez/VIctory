@@ -109,6 +109,12 @@ A release build has no debugging aids. Build them in with
 cargo build --profile diag -p victory --features diagnostics   # target\diag\victory.exe
 ```
 
+CI keeps the same build as a download after each push's checks pass:
+experimental and not verified with the game; see
+[docs/diagnostic-build.md](docs/diagnostic-build.md), and
+[docs/hardware-validation.md](docs/hardware-validation.md) for a first
+test on a machine with a GPU, one switch at a time.
+
 | Variable | Effect |
 |----------|--------|
 | `VICTORY_LOG=<target>=debug,...` | debug and trace output |
@@ -124,6 +130,9 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
 | `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
 | `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
+| `VICTORY_SHADER_PROBES=1` | translated shaders count and record heap indices past the bound heap and lanes the loop limit stops, logged with the shader after each submission (nothing is clamped; own shader cache entries) |
+| `VICTORY_SHADER_IMAGE_ATOMICS_64=1` | translates 64-bit image atomics, off by default (checked on WARP only; own shader cache entries) |
+| `VICTORY_QUEUE_WAITS=0` | queue waits no longer hold back the work behind them (the earlier behaviour, to compare) |
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |

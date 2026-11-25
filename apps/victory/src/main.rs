@@ -14,10 +14,18 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 
+/// This build, as `--version` and the run summary name it: `VICTORY_BUILD`
+/// when it was compiled (the diagnostic build workflow sets
+/// `<version>+diag.<commit>`), else the package version.
+const BUILD: &str = match option_env!("VICTORY_BUILD") {
+    Some(build) => build,
+    None => env!("CARGO_PKG_VERSION"),
+};
+
 #[derive(Parser)]
 #[command(
     name = "victory",
-    version,
+    version = BUILD,
     about = "Run an Xbox Series title natively on Windows"
 )]
 struct Cli {

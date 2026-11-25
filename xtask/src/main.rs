@@ -1,5 +1,6 @@
 //! Repository maintenance. Run with `cargo xtask <command>`.
 
+mod notices;
 mod policy;
 
 use std::path::{Path, PathBuf};
@@ -26,6 +27,16 @@ enum Cmd {
     },
     /// Point git at .githooks/ so every commit runs the policy check.
     InstallHooks,
+    /// Write the notices a binary of `victory` carries: the crates it is
+    /// built from for `target`, their licenses and their license files.
+    Notices {
+        /// The target the executable is built for.
+        #[arg(long, default_value = "x86_64-pc-windows-msvc")]
+        target: String,
+        /// The file to write.
+        #[arg(long)]
+        out: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -45,6 +56,7 @@ fn main() -> Result<()> {
             println!("hooks installed: commits now run `cargo xtask policy --staged`");
             Ok(())
         }
+        Cmd::Notices { target, out } => notices::run(&root, &target, &out),
     }
 }
 
