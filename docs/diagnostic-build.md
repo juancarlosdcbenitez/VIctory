@@ -93,8 +93,11 @@ missing imports). With `--execute` the title starts:
 
 The window caption shows `VIctory <n> fps <n> ms/frame <n> draws/frame`,
 and every 5 s the log has a line `<n> fps, <n> ms/frame (<n> preparing:
-copies ..., textures ...; <n> on the GPU; <n> copying back ...), <n>
-draws/frame, dropped <n> without a host pipeline ...`.
+copies ..., textures ...; <n> on the GPU; <n> copying back ...; <n>
+waiting for another thread's submission), <n> draws/frame, dropped <n>
+without a host pipeline ...`. The figures are milliseconds per frame,
+averaged over the 5 s; the last one is how long title threads waited for
+each other because submissions run one at a time.
 
 Before sharing a log, read it: logs hold paths of your machine (and your
 user name in them). Frame captures and saves hold the game's content;

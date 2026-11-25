@@ -203,8 +203,10 @@ from being turned on by default.
 
 Variable: none. In the world, stand still at one place for two minutes,
 then move for two. Keep the 5 s lines: fps, ms per frame, ms preparing
-(copies, textures, with MB), ms on the GPU, ms copying back, draws and
-dropped draws per frame. These numbers are the baseline every
+(copies, textures, with MB), ms on the GPU, ms copying back, ms waiting
+for another thread's submission, draws and dropped draws per frame. The
+waiting figure says whether running submissions one at a time costs
+frame time (SYNC-1, PERF-2 in the status page). These numbers are the baseline every
 optimization is measured against (target: 30 fps, 33 ms per frame; the
 README's machine had 0.5-1.8 s). One more run with `VICTORY_GPU_TIMING=1`
 names the slow command lists (with `VICTORY_D3D12_DRED=1` too, their
