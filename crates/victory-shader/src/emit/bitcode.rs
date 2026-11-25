@@ -472,6 +472,23 @@ impl Module {
         self.blocks[block].term = Some(t);
     }
 
+    /// Ends `block` where it is now and moves its terminator to the end of
+    /// `to` (an empty block), which takes `block`'s place as the
+    /// predecessor of its successors: their phis' incoming edges from
+    /// `block` become edges from `to`. `block` is left without a
+    /// terminator, for the caller to give it one that reaches `to`.
+    pub fn move_terminator(&mut self, block: usize, to: usize) {
+        debug_assert!(self.blocks[to].body.is_empty() && self.blocks[to].term.is_none());
+        self.blocks[to].term = self.blocks[block].term.take();
+        for inst in &mut self.insts {
+            if let Op::Phi(incoming) = &mut inst.op {
+                for (_, from) in incoming.iter_mut().filter(|(_, from)| *from == block) {
+                    *from = to;
+                }
+            }
+        }
+    }
+
     pub fn md_str(&mut self, s: &str) -> Md {
         self.mds.push(MdDef::Str(s.into()));
         Md(self.mds.len() as u32 - 1)

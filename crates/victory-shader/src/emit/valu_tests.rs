@@ -137,6 +137,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        probe: None,
     })
     .expect("lower");
 
@@ -148,6 +149,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
+        probe: lowered.probe,
     };
 
     if let Some(mut v) = validator::Validator::for_tests() {
@@ -1028,6 +1030,7 @@ fn wide_image_atomics_on_the_host() {
                 static_samplers: Vec::new(),
                 root_cbvs: l.root_cbvs.clone(),
                 root_srvs: l.root_srvs.clone(),
+                probe: l.probe,
             };
             let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
             for u in &shader.user_data {
@@ -1081,6 +1084,7 @@ fn run_lowered(host: &Host, l: &super::lower::Lowered, cases: &[[u32; 4]]) -> Ve
         static_samplers: Vec::new(),
         root_cbvs: l.root_cbvs.clone(),
         root_srvs: l.root_srvs.clone(),
+        probe: l.probe,
     };
     let (root, pso) = host.compute_pipeline(&shader).expect("compute_pipeline");
     cases
@@ -1186,6 +1190,93 @@ fn integer_lowerings_agree_with_the_evaluator_on_the_host() {
                 let want = eval_valu(&l, *inputs).unwrap_or_else(|e| panic!("{name}: {e}"));
                 assert_eq!(got, want, "{label} {name}({inputs:08x?})");
             }
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+/// Probes (GPU-1) on each SM 6.6 device (WARP on CI): a store through the
+/// descriptor at heap index `s1 >> 5`, with three UAVs in the heap and the
+/// probe constants saying the heap has 3 slots (the index is in range) or
+/// 2 (it is past the heap, though the device's heap holds it, so nothing
+/// faults). The probe buffer the device leaves matches the evaluator's
+/// word for word, and the store lands at index 2 either way: nothing is
+/// clamped.
+#[test]
+fn probes_record_heap_indices_past_the_bound_heap_on_the_host() {
+    use super::synth::{buffer_store_dword, eval_probed, lower_valu, user_data};
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    // s_load_dwordx4 s[12:15], s[4:5], s1; buffer_store_dword v3 (= s2).
+    let mut body = vec![0x3D << 26 | 0x02 << 18 | 12 << 6 | 2, 1 << 25];
+    body.extend(buffer_store_dword(3, 12, 0));
+    super::TEST_PROBES.set(true);
+    let lowered = lower_valu(&body);
+    super::TEST_PROBES.set(false);
+    let l = lowered.unwrap_or_else(|e| panic!("does not lower with probes: {e}"));
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: l.dxil.clone(),
+        user_data: l.user_data.clone(),
+        samplers: l.samplers.clone(),
+        static_samplers: Vec::new(),
+        root_cbvs: l.root_cbvs.clone(),
+        root_srvs: l.root_srvs.clone(),
+        probe: l.probe,
+    };
+    assert!(shader.probe.is_some());
+    let param = Host::probe_param(&[&shader]);
+    let dwords = super::probe::DWORDS as u32;
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let host = match Host::new(warp) {
+            Ok(host) => host,
+            Err(e) => {
+                eprintln!("{label}: skipped: {e}");
+                continue;
+            }
+        };
+        let kind = if host.adapter.1 {
+            "software"
+        } else {
+            "hardware"
+        };
+        eprintln!("{label}: on {} ({kind})", host.adapter.0);
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        for slots in [3u32, 2] {
+            let inputs = [0, 64, 0x5EED, 0];
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![
+                            (0, Root::Constants(user_data(&l, inputs))),
+                            (param, Root::Constants(vec![slots, 16])),
+                            (param + 1, Root::Uav(dwords)),
+                        ],
+                        views: &[View::RawUav(4), View::RawUav(4), View::RawUav(4)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            assert_eq!(
+                out[2][0], 0x5EED,
+                "{label}, {slots} slots: the store at index 2"
+            );
+            let extra = [(1, vec![0; 16]), (2, vec![0; 16])];
+            let (_, want, _) = eval_probed(&l, inputs, [slots, 16], &extra)
+                .unwrap_or_else(|e| panic!("evaluator: {e}"));
+            assert_eq!(out[3], want, "{label}, {slots} slots: the probe buffer");
+            let past = want[super::probe::PAST_HEAP];
+            assert_eq!(
+                past > 0,
+                slots == 2,
+                "{label}, {slots} slots: {past} counted"
+            );
         }
         ran += 1;
     }

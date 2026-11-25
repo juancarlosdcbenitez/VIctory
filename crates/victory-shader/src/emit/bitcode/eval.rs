@@ -89,6 +89,11 @@ pub(crate) struct Env {
     /// layers. Their texels (4 bytes, or 8 for a 64-bit component type) lie
     /// in `heap` row by row, slice by slice.
     pub textures: HashMap<u32, [u32; 3]>,
+    /// The probe constants (`b0, space 2`): the view and sampler heaps'
+    /// slot counts.
+    pub probe_slots: [u32; 2],
+    /// The probe buffer (`u0, space 2`), as bytes.
+    pub probe: Vec<u8>,
     pub group_size: [u32; 3],
     pub group: [u32; 3],
     /// The id in its group of the wave's first thread; lane n is n further
@@ -113,6 +118,8 @@ impl Default for Env {
             root_srvs: HashMap::new(),
             heap: HashMap::new(),
             textures: HashMap::new(),
+            probe_slots: [0, 0],
+            probe: Vec::new(),
             group_size: [1, 1, 1],
             group: [0, 0, 0],
             thread: [0, 0, 0],
@@ -930,6 +937,11 @@ impl Exec<'_, '_> {
                 .get(&register)
                 .cloned()
                 .ok_or(format!("no root CBV b{register}")),
+            Place::Binding {
+                class: 2,
+                space: 2,
+                register: 0,
+            } => Ok(vec![self.env.probe_slots[0], self.env.probe_slots[1], 0, 0]),
             Place::Heap { index, .. } => {
                 let bytes = self
                     .env
@@ -969,6 +981,11 @@ impl Exec<'_, '_> {
                 .root_srvs
                 .get_mut(&register)
                 .ok_or(format!("no root SRV t{register}")),
+            Place::Binding {
+                class: 1,
+                space: 2,
+                register: 0,
+            } => Ok(&mut self.env.probe),
             p => Err(format!("a buffer at {p:?}")),
         }
     }

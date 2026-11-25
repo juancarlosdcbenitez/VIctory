@@ -101,7 +101,7 @@ use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
 pub use sampler::StaticSampler;
-pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+pub use shader::{PROBE_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE, probe};
 
 /// Whether a DXGI adapter renders in software, from its description: the
 /// Basic Render Driver (WARP), which carries `DXGI_ADAPTER_FLAG_SOFTWARE`,
@@ -138,6 +138,51 @@ pub fn image_atomics_64() -> bool {
     *ON.get_or_init(|| {
         let value = std::env::var("VICTORY_SHADER_IMAGE_ATOMICS_64").ok();
         cfg!(feature = "diagnostics") && switched_on(value.as_deref())
+    })
+}
+
+/// Whether translated shaders carry probes (GPU-1, PERF-3): each heap
+/// access checks its index against the bound heap's slot count, and with
+/// the lanes the loop limit stops, what it finds is counted and recorded in
+/// a probe buffer ([`probe`], bound as [`PROBE_SPACE`]). Nothing is
+/// clamped: an access past a heap still goes ahead. With the `diagnostics`
+/// feature, `VICTORY_SHADER_PROBES=1`; part of the translation, so the
+/// shader cache keys on it.
+pub fn probes() -> bool {
+    #[cfg(test)]
+    if TEST_PROBES.get() {
+        return true;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let value = std::env::var("VICTORY_SHADER_PROBES").ok();
+        cfg!(feature = "diagnostics") && switched_on(value.as_deref())
+    })
+}
+
+// Probes for lowerings on this thread, for tests.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TEST_PROBES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The probe id lowerings on this thread take in tests: with
+/// [`TEST_PROBES`] set, [`TEST_PROBE_ID`].
+#[cfg(test)]
+pub(crate) fn test_probe() -> Option<u32> {
+    TEST_PROBES.get().then_some(TEST_PROBE_ID)
+}
+
+/// The probe id of shaders lowered in tests.
+#[cfg(test)]
+pub(crate) const TEST_PROBE_ID: u32 = 0x7E57_1D00;
+
+/// A translated shader's id in probe records: FNV-1a of the console
+/// program it comes from (the container's DXIL part), so a record names
+/// the shader the GPU layer logged at translation.
+pub fn probe_id(console_program: &[u8]) -> u32 {
+    console_program.iter().fold(0x811C_9DC5u32, |h, &b| {
+        (h ^ u32::from(b)).wrapping_mul(0x0100_0193)
     })
 }
 
@@ -223,6 +268,9 @@ pub struct HostShader {
     /// Root SRVs (raw buffers) the shader reads: `t<index>` in
     /// [`ROOT_CBV_SPACE`].
     pub root_srvs: Vec<u8>,
+    /// With probes: the shader's [`probe_id`]. Its root signature then
+    /// needs the probe constants and buffer ([`PROBE_SPACE`]).
+    pub probe: Option<u32>,
 }
 
 impl HostShader {
@@ -358,6 +406,10 @@ pub fn emit(
         }
         _ => 0,
     };
+    let probe = probes().then(|| {
+        let program = c.part(FourCC::DXIL).map_or(&[][..], |p| p.data);
+        probe_id(program)
+    });
     let l = lower::lower(&lower::Parts {
         native,
         p,
@@ -368,6 +420,7 @@ pub fn emit(
         outputs,
         prims,
         mesh_stride,
+        probe,
     })?;
     Ok(HostShader {
         stage: native.stage,
@@ -388,6 +441,7 @@ pub fn emit(
         samplers: l.samplers,
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
+        probe: l.probe,
     })
 }
 
@@ -688,6 +742,7 @@ mod tests {
             static_samplers: Vec::new(),
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            probe: None,
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -698,6 +753,7 @@ mod tests {
                 static_samplers: Vec::new(),
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                probe: None,
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);

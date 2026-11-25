@@ -513,6 +513,16 @@ impl State {
                 }
             }
         }
+        if let Some(param) = p.probes {
+            // The host heaps' slot counts, view then sampler (0 unbound).
+            let slots = |i: usize| match self.heaps[i] {
+                0 => 0,
+                h => crate::descriptor::heap(h as This)
+                    .host()
+                    .map_or(0, |h| h.slots()),
+            };
+            crate::probes::bind(l, param, compute, [slots(0), slots(1)]);
+        }
         true
     }
 

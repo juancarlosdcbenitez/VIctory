@@ -69,6 +69,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        probe: None,
     })
     .expect("lower");
     // One access with each lane's own heap index, no wave operation.
@@ -82,6 +83,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
+        probe: lowered.probe,
     };
     if let Some(mut v) = validator::Validator::for_tests() {
         v.validate(&mut shader.dxil.clone())

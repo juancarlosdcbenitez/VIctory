@@ -8,7 +8,7 @@
 use std::ffi::{CStr, CString};
 use std::sync::Arc;
 
-use victory_shader::emit::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+use victory_shader::emit::{PROBE_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -275,6 +275,9 @@ pub(crate) struct HostPipeline {
     pub(crate) inputs: Vec<Input>,
     /// Its shaders, for reports of slow submissions.
     pub(crate) name: String,
+    /// With probes (diagnostics): the root parameter of the probe
+    /// constants; the probe buffer's is the next.
+    pub(crate) probes: Option<u32>,
 }
 
 /// Logs a pipeline that gets no host pipeline, once per reason.
@@ -401,6 +404,37 @@ impl HostPipeline {
             }
             bound.push(stage);
         }
+        // Probes (`victory_shader::emit::probes`, diagnostics builds): the
+        // bound heaps' slot counts and the probe buffer, for every stage.
+        let probed = stages
+            .iter()
+            .any(|(s, _)| s.translated().is_some_and(|t| t.host.probe.is_some()));
+        let probes = probed.then(|| {
+            let at = params.len() as u32;
+            params.push(D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                    Constants: D3D12_ROOT_CONSTANTS {
+                        ShaderRegister: 0,
+                        RegisterSpace: PROBE_SPACE,
+                        Num32BitValues: 2,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            });
+            params.push(D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                    Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                        ShaderRegister: 0,
+                        RegisterSpace: PROBE_SPACE,
+                        Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            });
+            at
+        });
         let (root, root_blob) = match root_signature(&host.device, &params, &samplers, compute.is_some()) {
             Ok(root) => root,
             Err(e) => {
@@ -443,6 +477,7 @@ impl HostPipeline {
             tracing::info!(?shaders, "host pipeline");
             crate::host::name(&pso, || format!("{shaders:?}"));
             return Some(HostPipeline {
+                probes,
                 compute: true,
                 mesh: false,
                 pso,
@@ -475,6 +510,7 @@ impl HostPipeline {
             tracing::info!(?shaders, "host mesh pipeline");
             crate::host::name(&pso, || format!("{shaders:?}"));
             return Some(HostPipeline {
+                probes,
                 compute: false,
                 mesh: true,
                 pso,
@@ -545,6 +581,7 @@ impl HostPipeline {
             "host graphics state"
         );
         Some(HostPipeline {
+            probes,
             compute: false,
             mesh: false,
             pso,

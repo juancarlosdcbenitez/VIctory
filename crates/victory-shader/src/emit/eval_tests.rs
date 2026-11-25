@@ -2784,6 +2784,7 @@ fn wide_image_atomics_declare_their_features() {
         static_samplers: Vec::new(),
         root_cbvs: l.root_cbvs.clone(),
         root_srvs: l.root_srvs.clone(),
+        probe: l.probe,
     };
     assert!(shader(&l).needs_typed_atomics_64());
     // A 32-bit atomic needs none of them.
@@ -2799,4 +2800,181 @@ fn wide_image_atomics_declare_their_features() {
     let features = u64::from_le_bytes(sfi0.try_into().expect("8 bytes"));
     assert_eq!(features & 0x1040_8000, 0, "SFI0 {features:#x}");
     assert!(!shader(&l).needs_typed_atomics_64());
+}
+
+// --- Probes (GPU-1, PERF-3) ------------------------------------------------
+
+/// SMEM `s_load_dwordx4 s[dst:dst+3], s[4:5], s<soffset>`: the buffer
+/// descriptor at byte offset `s<soffset>` of the harness's table, so heap
+/// index `s<soffset> >> 5` (32-byte descriptors).
+const fn s_load_dwordx4_at(dst: u8, soffset: u8) -> [u32; 2] {
+    [
+        0x3D << 26 | 0x02 << 18 | (dst as u32) << 6 | (4 >> 1),
+        (soffset as u32) << 25,
+    ]
+}
+
+/// A store of `s2` through the descriptor at heap index `s1 >> 5`. (The
+/// offset is not in `s0`: the resource tracker takes a root parameter's
+/// first dword for a table base.)
+fn store_at_index_from_s1() -> Vec<u32> {
+    let mut body = s_load_dwordx4_at(12, 1).to_vec();
+    body.extend(super::synth::buffer_store_dword(3, 12, 0));
+    body
+}
+
+/// Lowers `body` with probes (and the loop limit at `limit`, if any).
+fn lower_probed(body: &[u32], limit: Option<u32>) -> super::lower::Lowered {
+    super::TEST_PROBES.set(true);
+    super::TEST_LOOP_LIMIT.set(limit);
+    let l = lower_valu(body);
+    super::TEST_PROBES.set(false);
+    super::TEST_LOOP_LIMIT.set(None);
+    l.unwrap_or_else(|e| panic!("{body:08x?} does not lower with probes: {e}"))
+}
+
+/// A probe buffer's records, as written: `(shader id, site word, index,
+/// slots)` each.
+fn probe_records(probe: &[u32]) -> Vec<[u32; 4]> {
+    use super::probe::{RECORDS, RING, RING_START};
+    let n = probe[RECORDS].min(RING) as usize;
+    (0..n)
+        .map(|k| {
+            let at = RING_START + 4 * k;
+            [probe[at], probe[at + 1], probe[at + 2], probe[at + 3]]
+        })
+        .collect()
+}
+
+/// A heap access with its index below the bound heap's slot count leaves
+/// the probe buffer as it was; one at the count, past it, or at an index
+/// the address arithmetic wrapped to, is counted and recorded with the
+/// shader, the index and the count, and goes ahead all the same: the store
+/// lands at that index, as without probes.
+#[test]
+fn heap_accesses_past_the_bound_heap_are_counted_and_recorded() {
+    use super::probe::{LOOP_STOPS, PAST_HEAP, PER_LANE, RECORDS, SAMPLER};
+    let l = lower_probed(&store_at_index_from_s1(), None);
+    assert_eq!(l.probe, Some(super::TEST_PROBE_ID));
+    let buffer = vec![0u8; 16];
+    // (s1: the descriptor's byte offset, heap slots, whether past the heap)
+    let wrapped = 0xFFFF_FFE0u32; // 32 bytes below the table: index 2^27 - 1
+    for (offset, slots, past) in [
+        (64u32, 3u32, false),
+        (32, 2, false),
+        (64, 2, true),
+        (96, 2, true),
+        (wrapped, 2, true),
+        (wrapped, 1 << 27, false),
+    ] {
+        let index = offset >> 5;
+        let (_, probe, heap) = super::synth::eval_probed(
+            &l,
+            [0, offset, 0x5EED, 0],
+            [slots, 16],
+            &[(index, buffer.clone())],
+        )
+        .unwrap_or_else(|e| panic!("offset {offset:#x}, {slots} slots: {e}"));
+        let what = format!("index {index:#x} against {slots} slots");
+        // Not clamped, not sent elsewhere: the store lands at the index.
+        assert_eq!(
+            heap[&index][..4],
+            0x5EEDu32.to_le_bytes(),
+            "{what}: the store"
+        );
+        assert_eq!(probe[LOOP_STOPS], 0, "{what}");
+        if !past {
+            assert!(probe.iter().all(|&w| w == 0), "{what}: {probe:x?}");
+            continue;
+        }
+        assert!(probe[PAST_HEAP] >= 1, "{what}: not counted");
+        assert_eq!(
+            probe[RECORDS], probe[PAST_HEAP],
+            "{what}: one record per count"
+        );
+        for [id, site, at, of] in probe_records(&probe) {
+            assert_eq!(id, super::TEST_PROBE_ID, "{what}");
+            assert_eq!(
+                site & (SAMPLER | PER_LANE),
+                0,
+                "{what}: a uniform view index"
+            );
+            assert_eq!((at, of), (index, slots), "{what}");
+        }
+    }
+}
+
+/// A lane the loop limit stops is counted and recorded (with the loop
+/// site word); a loop that finishes is not.
+#[test]
+fn loop_limit_stops_are_counted_and_recorded() {
+    use super::probe::{LOOP_SITE, LOOP_STOPS, PAST_HEAP};
+    let l = lower_probed(&counted_loop(), Some(8));
+    for (n, stopped) in [(5u32, false), (8, false), (9, true), (0, true)] {
+        let (out, probe, _) = super::synth::eval_probed(&l, [n, 0, 0, 0], [4, 16], &[])
+            .unwrap_or_else(|e| panic!("{n} iterations: {e}"));
+        assert_eq!(probe[PAST_HEAP], 0, "{n}: the result's store is in range");
+        if stopped {
+            assert_eq!(out, [NOT_STORED; 4], "{n}: the lane left the program");
+            assert_eq!(probe[LOOP_STOPS], 1, "{n}");
+            assert_eq!(
+                probe_records(&probe),
+                [[super::TEST_PROBE_ID, LOOP_SITE, 0, 0]],
+                "{n}"
+            );
+        } else {
+            assert_eq!(out[0], n, "{n}");
+            assert!(probe.iter().all(|&w| w == 0), "{n}: {probe:x?}");
+        }
+    }
+}
+
+/// The ring keeps the first records; later ones still count, and their
+/// writes go to the slot past the ring, which is not read.
+#[test]
+fn the_probe_ring_keeps_the_first_records_and_counts_the_rest() {
+    use super::probe::{PAST_HEAP, RECORDS, RING};
+    // s[12:15] = the descriptor at s1 >> 5; then 70 stores of s2 through
+    // it.
+    let mut body = s_load_dwordx4_at(12, 1).to_vec();
+    body.push(sopk(0x00, 20, 70)); // s_movk_i32 s20, 70
+    body.extend(super::synth::buffer_store_dword(3, 12, 0)); // L:
+    body.push(sop2(S_SUB_U32, 20, 20, 129));
+    body.push(sopc(S_CMP_LG_U32, 20, 128));
+    body.push(sopp(S_CBRANCH_SCC1, -5)); // to L (the store is two dwords)
+    let l = lower_probed(&body, None);
+    let (_, probe, _) = super::synth::eval_probed(&l, [0, 64, 7, 0], [2, 16], &[(2, vec![0; 16])])
+        .unwrap_or_else(|e| panic!("{e}"));
+    // 70 stores, and the descriptor load's own size query (every
+    // descriptor load makes one, in its block, for code that reads sizes
+    // from the descriptor's dwords).
+    assert_eq!(probe[PAST_HEAP], 71);
+    assert_eq!(probe[RECORDS], 71);
+    let records = probe_records(&probe);
+    assert_eq!(records.len(), RING as usize);
+    assert!(
+        records.iter().all(|r| r[2] == 2 && r[3] == 2),
+        "{records:x?}"
+    );
+}
+
+/// Without probes nothing is declared or checked.
+#[test]
+fn probes_are_off_by_default() {
+    let l = lower_valu(&store_at_index_from_s1()).expect("lowers");
+    assert_eq!(l.probe, None);
+    let container = crate::dxbc::Container::parse(&l.dxil).expect("a container");
+    let without = container
+        .part(crate::dxbc::FourCC::DXIL)
+        .expect("DXIL")
+        .data
+        .len();
+    let probed = lower_probed(&store_at_index_from_s1(), None);
+    let container = crate::dxbc::Container::parse(&probed.dxil).expect("a container");
+    let with = container
+        .part(crate::dxbc::FourCC::DXIL)
+        .expect("DXIL")
+        .data
+        .len();
+    assert!(with > without, "the probes are in the probed shader only");
 }

@@ -109,6 +109,7 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
         if let Err(e) = unsafe { host.device.GetDeviceRemovedReason() } {
             text.push_str(&format!("; device removed: {e}"));
         }
+        text.push_str(&crate::probes::summary());
         match host.log_messages() {
             Some(first) => text.push_str(&format!("; debug layer: {first}")),
             None if host.messages.is_none() => text.push_str(
@@ -698,6 +699,19 @@ impl Host {
             }
         }
         self.log_messages();
+        // Diagnostics: what shaders with probes recorded (GPU-1, PERF-3).
+        crate::probes::after_submission(|| {
+            let pipelines: std::collections::BTreeSet<String> = runs
+                .iter()
+                .flat_map(|l| {
+                    l.pipelines
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone()
+                })
+                .collect();
+            format!("{pipelines:?}")
+        });
     }
 
     /// With `VICTORY_D3D12_DRED`: the faulting address and the allocations

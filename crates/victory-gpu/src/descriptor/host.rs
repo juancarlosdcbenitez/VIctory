@@ -263,6 +263,12 @@ impl HostHeap {
         self.count
     }
 
+    /// The host heap's slots, the dynamic ones included: a shader index at
+    /// or past this reads outside the heap.
+    pub(crate) fn slots(&self) -> u32 {
+        self.count + self.dynamic
+    }
+
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
     /// returned).
     ///

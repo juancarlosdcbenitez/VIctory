@@ -108,6 +108,16 @@ impl Shader {
         self.translated
             .get_or_init(|| {
                 let done = translate(&self.container);
+                if let Ok(Translated {
+                    host:
+                        victory_shader::emit::HostShader {
+                            probe: Some(id), ..
+                        },
+                    ..
+                }) = &done
+                {
+                    crate::probes::name(*id, || format!("{} shader {}", self.stage, self.hash));
+                }
                 match &done {
                     Ok(t) => tracing::info!(
                         stage = self.stage,

@@ -225,6 +225,7 @@ pub(super) fn lower_valu(body: &[u32]) -> Result<Lowered, crate::ShaderError> {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        probe: super::test_probe(),
     })?;
     #[cfg(windows)]
     validate(&l.dxil, body);
@@ -282,6 +283,46 @@ pub(super) fn eval_valu(l: &Lowered, inputs: [u32; 4]) -> Result<[u32; 4], Strin
     let out = &env.heap[&0];
     let dword = |k: usize| u32::from_le_bytes(out[4 * k..4 * k + 4].try_into().expect("4 bytes"));
     Ok([dword(0), dword(1), dword(2), dword(3)])
+}
+
+/// What a run with probes leaves: the stored `v0, v5, v6, v7`, the probe
+/// buffer's dwords and the heap's buffers.
+pub(super) type Probed = ([u32; 4], Vec<u32>, std::collections::HashMap<u32, Vec<u8>>);
+
+/// Runs a lowered [`valu_program`] (lowered with probes) whose bound heaps
+/// have `slots` (view, sampler) slots, with `extra` buffers in the heap
+/// besides the result's at index 0.
+pub(super) fn eval_probed(
+    l: &Lowered,
+    inputs: [u32; 4],
+    slots: [u32; 2],
+    extra: &[(u32, Vec<u8>)],
+) -> Result<Probed, String> {
+    let mut env = Env {
+        user_data: user_data(l, inputs),
+        probe_slots: slots,
+        probe: vec![0; 4 * super::probe::DWORDS],
+        ..Env::default()
+    };
+    env.heap.insert(
+        0,
+        [0xDEAD_BEEFu32; 4]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect(),
+    );
+    for (index, bytes) in extra {
+        env.heap.insert(*index, bytes.clone());
+    }
+    eval::run(&l.module, &mut env)?;
+    let out = &env.heap[&0];
+    let dword = |k: usize| u32::from_le_bytes(out[4 * k..4 * k + 4].try_into().expect("4 bytes"));
+    let probe = env
+        .probe
+        .chunks(4)
+        .map(|c| u32::from_le_bytes(c.try_into().expect("4 bytes")))
+        .collect();
+    Ok(([dword(0), dword(1), dword(2), dword(3)], probe, env.heap))
 }
 
 /// Lowers `body` and runs it on the evaluator for each input set: the
@@ -420,6 +461,7 @@ pub(super) fn lower_native(native: &NativeProgram) -> Result<Lowered, crate::Sha
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        probe: super::test_probe(),
     })?;
     #[cfg(windows)]
     validate(&l.dxil, &[]);

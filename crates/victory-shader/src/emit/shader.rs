@@ -2,7 +2,7 @@
 //! the `dx.op` declarations it calls, its signatures and bound resources,
 //! and the metadata and container that wrap it up (SM 6.6, validator 1.6).
 
-use super::bitcode::{Attr, Md, Module, Ty, V};
+use super::bitcode::{Attr, Bin, Md, Module, Term, Ty, V, pred};
 use super::container::{self, Binding, Psv, SigElement};
 
 /// Where the shader reads its user data: `b0` in this space.
@@ -12,6 +12,39 @@ pub const SAMPLER_SPACE: u32 = 0;
 /// Where root CBVs and SRVs are bound: `b<root parameter index>` and
 /// `t<root parameter index>` in this space.
 pub const ROOT_CBV_SPACE: u32 = 1;
+/// Where a shader translated with probes ([`super::probes`]) finds them:
+/// the bound heaps' slot counts as root constants `b0` (view heap, then
+/// sampler heap) and the probe buffer as root UAV `u0`, in this space.
+pub const PROBE_SPACE: u32 = 2;
+
+/// The probe buffer: counts, then a ring of records, in dwords. A heap
+/// access whose index is at or past the bound heap's slot count, and a lane
+/// the loop limit stops, each count and leave a record; the access itself
+/// goes ahead unchanged.
+pub mod probe {
+    /// Heap accesses past the bound heap's end, by lane.
+    pub const PAST_HEAP: usize = 0;
+    /// Lanes the loop limit stopped.
+    pub const LOOP_STOPS: usize = 1;
+    /// Records written, kept or not: the next record's slot.
+    pub const RECORDS: usize = 2;
+    /// Where the ring starts. A record is four dwords: the shader's id,
+    /// the site word, the heap index and the heap's slot count.
+    pub const RING_START: usize = 4;
+    /// Records the ring keeps; the one past them takes the writes it does
+    /// not keep.
+    pub const RING: u32 = 64;
+    /// The buffer's size in dwords.
+    pub const DWORDS: usize = RING_START + 4 * (RING as usize + 1);
+    /// The site word of a loop-limit stop.
+    pub const LOOP_SITE: u32 = u32::MAX;
+    /// Site word bit: the index is a sampler heap's.
+    pub const SAMPLER: u32 = 1 << 31;
+    /// Site word bit: the index may differ between lanes.
+    pub const PER_LANE: u32 = 1 << 30;
+    /// Site word: the access's number in the shader, in emission order.
+    pub const SITE: u32 = 0xFF_FFFF;
+}
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
@@ -81,6 +114,13 @@ pub(crate) struct Shader {
     lds: Option<V>,
     main: V,
     pub entry: usize,
+    /// With probes: the shader's id in probe records.
+    pub probe_id: Option<u32>,
+    /// The probe buffer's handle and the view and sampler heaps' slot
+    /// counts, made in the entry block.
+    probe_handles: Option<(V, V, V)>,
+    /// Heap accesses to check: block, index, site word.
+    probed: Vec<(usize, V, u32)>,
 }
 
 impl Shader {
@@ -132,6 +172,9 @@ impl Shader {
             lds: None,
             main,
             entry,
+            probe_id: None,
+            probe_handles: None,
+            probed: Vec::new(),
         }
     }
 
@@ -296,6 +339,12 @@ impl Shader {
             flags::RESOURCE_HEAP
         };
         self.nonuniform_handles += u32::from(nonuniform);
+        if self.probe_id.is_some() {
+            let site = (self.probed.len() as u32 & probe::SITE)
+                | if sampler { probe::SAMPLER } else { 0 }
+                | if nonuniform { probe::PER_LANE } else { 0 };
+            self.probed.push((block, index, site));
+        }
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
         let h = self.op(
             block,
@@ -308,9 +357,163 @@ impl Shader {
         self.annotate(block, h, props.0, props.1)
     }
 
+    /// Whether the finished shader declares the probe bindings: it has
+    /// probes and makes a heap access or can stop a loop.
+    pub fn probes_declared(&self) -> bool {
+        self.probe_id.is_some() && (!self.probed.is_empty() || self.probe_handles.is_some())
+    }
+
+    /// The probe buffer's handle and the view and sampler heaps' slot
+    /// counts (from the probe constants), made in the entry block.
+    fn probe_handles(&mut self) -> (V, V, V) {
+        if let Some(h) = self.probe_handles {
+            return h;
+        }
+        let entry = self.entry;
+        let zero = self.m.i32(0);
+        let f = self.m.bool(false);
+        let make = |s: &mut Self, class: u8| {
+            let bind = [zero, zero, s.m.i32(PROBE_SPACE), s.m.i8(class)];
+            let bind = s.m.aggregate(s.t.bind, &bind);
+            s.op(
+                entry,
+                "createHandleFromBinding",
+                Attr::ReadNone,
+                s.t.handle,
+                217,
+                &[bind, zero, f],
+            )
+        };
+        let constants = make(self, 2);
+        let constants = self.annotate(entry, constants, 13, 16);
+        let row = self.op(
+            entry,
+            "cbufferLoadLegacy.i32",
+            Attr::ReadOnly,
+            self.t.cbuf_ret,
+            59,
+            &[constants, zero],
+        );
+        let views = self.m.extract(entry, row, 0);
+        let samplers = self.m.extract(entry, row, 1);
+        let buffer = make(self, 1);
+        let buffer = self.annotate(entry, buffer, 11 | 0x1000, 0);
+        self.flags |= flags::RAW_BUFFERS;
+        let h = (buffer, views, samplers);
+        self.probe_handles = Some(h);
+        h
+    }
+
+    /// In `block`, adds `amount` to the probe buffer's count at `count`,
+    /// takes a record slot when `keep` (else the slot past the ring), and
+    /// writes `record` there.
+    fn probe_record(&mut self, block: usize, count: usize, keep: V, record: [V; 4]) {
+        let (buffer, _, _) = self.probe_handles();
+        let i32t = self.t.i32;
+        let iu = self.m.undef(i32t);
+        let one = self.m.int_const(i32t, 1);
+        let zero = self.m.int_const(i32t, 0);
+        let amount = self.m.select(block, keep, one, zero);
+        let add = |s: &mut Self, dword: usize| {
+            let at = s.m.i32(4 * dword as u32);
+            let add = s.m.i32(0);
+            s.op(
+                block,
+                "atomicBinOp.i32",
+                Attr::NoUnwind,
+                i32t,
+                78,
+                &[buffer, add, at, iu, iu, amount],
+            )
+        };
+        add(self, count);
+        let slot = add(self, probe::RECORDS);
+        let ring = self.m.i32(probe::RING);
+        let room = self.m.cmp(block, pred::IULT, slot, ring);
+        let kept = self.m.bin(block, Bin::And, keep, room);
+        let slot = self.m.select(block, kept, slot, ring);
+        let sixteen = self.m.i32(16);
+        let at = self.m.bin(block, Bin::Mul, slot, sixteen);
+        let start = self.m.i32(4 * probe::RING_START as u32);
+        let at = self.m.bin(block, Bin::Add, at, start);
+        let mask = self.m.i8(0xF);
+        let align = self.m.i32(4);
+        let void = self.t.void;
+        let mut args = vec![buffer, at, iu];
+        args.extend(record);
+        args.extend([mask, align]);
+        self.op(
+            block,
+            "rawBufferStore.i32",
+            Attr::NoUnwind,
+            void,
+            140,
+            &args,
+        );
+    }
+
+    /// Counts and records a lane the loop limit stopped, in the block it
+    /// leaves the program from (with probes only).
+    pub fn probe_loop_stop(&mut self, block: usize) {
+        let Some(id) = self.probe_id else { return };
+        let keep = self.m.bool(true);
+        let (zero, site) = (self.m.i32(0), self.m.i32(probe::LOOP_SITE));
+        let id = self.m.i32(id);
+        self.probe_record(block, probe::LOOP_STOPS, keep, [id, site, zero, zero]);
+    }
+
+    /// Checks every heap access the shader makes against the bound heap's
+    /// slot count. A block that made some moves its terminator to a new
+    /// block it falls into; where an index is at or past the count, a block
+    /// between the two counts and records each such access. Nothing about
+    /// the access changes: it reads what it would without probes.
+    fn instrument(&mut self) {
+        let Some(id) = self.probe_id else { return };
+        if self.probed.is_empty() {
+            return;
+        }
+        let (_, views, samplers) = self.probe_handles();
+        let mut probed = std::mem::take(&mut self.probed);
+        probed.sort_by_key(|p| p.0);
+        let id = self.m.i32(id);
+        let mut i = 0;
+        while i < probed.len() {
+            let block = probed[i].0;
+            let n = probed[i..].iter().take_while(|p| p.0 == block).count();
+            let accesses = probed[i..i + n].to_vec();
+            i += n;
+            let rest = self.m.new_block();
+            self.m.move_terminator(block, rest);
+            let mut past = Vec::new();
+            let mut any = None;
+            for &(_, index, site) in &accesses {
+                let slots = if site & probe::SAMPLER != 0 {
+                    samplers
+                } else {
+                    views
+                };
+                let p = self.m.cmp(block, pred::IUGE, index, slots);
+                any = Some(match any {
+                    None => p,
+                    Some(a) => self.m.bin(block, Bin::Or, a, p),
+                });
+                past.push((p, index, site, slots));
+            }
+            let record = self.m.new_block();
+            for (p, index, site, slots) in past {
+                let site = self.m.i32(site);
+                self.probe_record(record, probe::PAST_HEAP, p, [id, site, index, slots]);
+            }
+            self.m.terminate(record, Term::Br(rest));
+            let any = any.expect("accesses");
+            self.m.terminate(block, Term::CondBr(any, record, rest));
+        }
+    }
+
     /// The finished container, and the module it holds (which tests run,
     /// [`super::bitcode::eval`]).
     pub fn finish(mut self) -> (Vec<u8>, Module) {
+        self.instrument();
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
         let mut resources = None;
@@ -323,6 +526,7 @@ impl Shader {
             || self.samplers > 0
             || !self.root_cbvs.is_empty()
             || !self.root_srvs.is_empty()
+            || self.probe_handles.is_some()
         {
             let empty = self.m.md_str("");
             let mut cbvs = None;
@@ -371,6 +575,61 @@ impl Shader {
                     space: ROOT_CBV_SPACE,
                     register: u32::from(slot),
                     dxil_kind: 13,
+                });
+            }
+            let mut uavs = None;
+            if self.probe_handles.is_some() {
+                // The probe constants (b0) and buffer (u0), PROBE_SPACE.
+                let arr = self.m.array(4, self.t.i32);
+                let ty = self.m.named_struct("ProbeConstants", vec![arr]);
+                let p = self.m.ptr(ty);
+                let u = self.m.undef(p);
+                let ops = vec![
+                    Some(i32c(&mut self, cbv_list.len() as u32)),
+                    Some(self.m.md_value(u)),
+                    Some(empty),
+                    Some(i32c(&mut self, PROBE_SPACE)),
+                    Some(i32c(&mut self, 0)),
+                    Some(i32c(&mut self, 1)),
+                    Some(i32c(&mut self, 16)),
+                    None,
+                ];
+                cbv_list.push(Some(self.m.md_node(ops)));
+                bindings.push(Binding {
+                    kind: 2,
+                    space: PROBE_SPACE,
+                    register: 0,
+                    dxil_kind: 13,
+                });
+                let ty = self
+                    .m
+                    .named_struct("struct.RWByteAddressBuffer", vec![self.t.i32]);
+                let p = self.m.ptr(ty);
+                let u = self.m.undef(p);
+                let no = self.m.bool(false);
+                let no = self.m.md_value(no);
+                // A UAV: shape, then globally coherent, counter, rasterizer
+                // ordered.
+                let ops = vec![
+                    Some(i32c(&mut self, 0)),
+                    Some(self.m.md_value(u)),
+                    Some(empty),
+                    Some(i32c(&mut self, PROBE_SPACE)),
+                    Some(i32c(&mut self, 0)),
+                    Some(i32c(&mut self, 1)),
+                    Some(i32c(&mut self, 11)),
+                    Some(no),
+                    Some(no),
+                    Some(no),
+                    None,
+                ];
+                let uav = self.m.md_node(ops);
+                uavs = Some(self.m.md_node(vec![Some(uav)]));
+                bindings.push(Binding {
+                    kind: 7,
+                    space: PROBE_SPACE,
+                    register: 0,
+                    dxil_kind: 11,
                 });
             }
             if !cbv_list.is_empty() {
@@ -435,11 +694,13 @@ impl Shader {
                 }
                 samplers = Some(self.m.md_node(list));
             }
-            resources = Some(self.m.md_node(vec![srvs, None, cbvs, samplers]));
-            // PSV0 lists them as the module does: CBVs, samplers, SRVs.
+            resources = Some(self.m.md_node(vec![srvs, uavs, cbvs, samplers]));
+            // PSV0 lists them as the module does: CBVs, samplers, SRVs,
+            // UAVs.
             bindings.sort_by_key(|b| match b.kind {
                 2 => 0,
                 1 => 1,
+                6..=9 => 3,
                 _ => 2,
             });
         }

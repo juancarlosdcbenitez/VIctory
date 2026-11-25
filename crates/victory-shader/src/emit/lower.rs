@@ -46,6 +46,8 @@ pub(crate) struct Lowered {
     /// The module the container holds, for [`super::bitcode::eval`].
     #[cfg(test)]
     pub module: super::bitcode::Module,
+    /// The shader's probe id, if it declares the probe bindings.
+    pub probe: Option<u32>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -59,6 +61,8 @@ pub(crate) struct Parts<'a> {
     pub prims: Vec<SigElement>,
     /// Mesh: what the group id arrives multiplied by.
     pub mesh_stride: u32,
+    /// With probes ([`super::probes`]): the shader's id in probe records.
+    pub probe: Option<u32>,
 }
 
 enum Stop {
@@ -359,6 +363,7 @@ impl<'a> Lower<'a> {
             }
         }
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
+        s.probe_id = x.probe;
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
@@ -920,8 +925,10 @@ impl<'a> Lower<'a> {
             self.s.nonuniform_handles,
             self.s.flags & flags::WAVE_OPS != 0,
         );
+        let probe = self.s.probe_id.filter(|_| self.s.probes_declared());
         let (dxil, _module) = self.s.finish();
         Ok(Lowered {
+            probe,
             cmp_samplers,
             root_cbvs,
             root_srvs,
@@ -7884,6 +7891,8 @@ impl<'a> Lower<'a> {
             return a;
         }
         let a = self.s.m.new_block();
+        // With probes, a stopped lane is counted and recorded.
+        self.s.probe_loop_stop(a);
         if self.s.pixel {
             let t = self.s.m.bool(true);
             self.s
@@ -8016,6 +8025,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            probe: None,
         })
         .map(|_| ())
     }
@@ -8066,6 +8076,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            probe: None,
         })
     }
 
@@ -8169,6 +8180,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            probe: None,
         }).unwrap();
 
         let container =

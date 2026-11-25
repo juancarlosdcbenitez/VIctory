@@ -51,6 +51,7 @@ fn build() -> &'static [u8; 32] {
             );
         }
         let atomics_64 = victory_shader::emit::image_atomics_64();
+        let probes = victory_shader::emit::probes();
         if atomics_64 {
             tracing::warn!(
                 "VICTORY_SHADER_IMAGE_ATOMICS_64: 64-bit image atomics are translated \
@@ -61,6 +62,7 @@ fn build() -> &'static [u8; 32] {
             Ok(mut bytes) => {
                 bytes.extend_from_slice(&limit.to_le_bytes());
                 bytes.push(u8::from(atomics_64));
+                bytes.push(u8::from(probes));
                 *blake3::hash(&bytes).as_bytes()
             }
             Err(e) => {
@@ -218,6 +220,9 @@ fn encode(s: &HostShader) -> Vec<u8> {
         word(&mut out, slots.len() as u32);
         out.extend(slots);
     }
+    // The probe id, after a word saying whether there is one.
+    word(&mut out, u32::from(s.probe.is_some()));
+    word(&mut out, s.probe.unwrap_or(0));
     out
 }
 
@@ -274,6 +279,13 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     }
     let root_cbvs = r.list()?;
     let root_srvs = r.list()?;
+    let probed = r.word()?;
+    let id = r.word()?;
+    let probe = match probed {
+        0 => None,
+        1 => Some(id),
+        _ => return None,
+    };
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -282,6 +294,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         static_samplers,
         root_cbvs,
         root_srvs,
+        probe,
     })
 }
 
@@ -308,6 +321,7 @@ mod tests {
             ])],
             root_cbvs: vec![2],
             root_srvs: vec![0, 3],
+            probe: Some(0x7E57_1D00),
         }
     }
 

@@ -311,6 +311,32 @@ impl Host {
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
             });
         }
+        // Probes last ([`Host::probe_param`]): the heaps' slot counts, then
+        // the probe buffer.
+        if stages.iter().any(|(s, _)| s.probe.is_some()) {
+            params.push(D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                    Constants: D3D12_ROOT_CONSTANTS {
+                        ShaderRegister: 0,
+                        RegisterSpace: super::PROBE_SPACE,
+                        Num32BitValues: 2,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            });
+            params.push(D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                    Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                        ShaderRegister: 0,
+                        RegisterSpace: super::PROBE_SPACE,
+                        Flags: D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            });
+        }
         let mut samplers = Vec::new();
         for &(s, vis) in stages {
             for (n, d) in s.static_samplers.iter().enumerate() {
@@ -359,6 +385,22 @@ impl Host {
             );
             self.device.CreateRootSignature(0, bytes).map_err(err)
         }
+    }
+
+    /// The root parameter of the probe constants in the root signature of
+    /// `stages` ([`Host::root_signature_for`]); the probe buffer's is the
+    /// next.
+    pub fn probe_param(stages: &[&HostShader]) -> u32 {
+        let mut views: Vec<(u8, bool)> = stages
+            .iter()
+            .flat_map(|s| {
+                let cbvs = s.root_cbvs.iter().map(|&r| (r, false));
+                cbvs.chain(s.root_srvs.iter().map(|&r| (r, true)))
+            })
+            .collect();
+        views.sort_unstable();
+        views.dedup();
+        (stages.len() + views.len()) as u32
     }
 
     /// A compute pipeline; user data is root parameter 0.
@@ -676,6 +718,7 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
             crate::native::HwStage::Vs
         },
         dxil: s.finish().0,
+        probe: None,
         user_data: Vec::new(),
         samplers: Vec::new(),
         static_samplers: Vec::new(),
@@ -699,6 +742,9 @@ pub enum Root {
         srv: bool,
         data: Vec<u32>,
     },
+    /// A root UAV over a zeroed buffer of this many dwords, read back after
+    /// the views' UAVs ([`Host::dispatch`] only).
+    Uav(u32),
 }
 
 /// Bindings for [`Host::draw`]: root arguments and the heap contents.
@@ -936,7 +982,9 @@ impl Host {
                         at.ptr += (index * size) as u64;
                         list.SetGraphicsRootDescriptorTable(*param, at);
                     }
-                    Root::View { .. } => return Err("root views in a draw".into()),
+                    Root::View { .. } | Root::Uav(_) => {
+                        return Err("root views in a draw".into());
+                    }
                 }
             }
             list.OMSetRenderTargets(1, Some(&rtv), false, None);
@@ -1495,6 +1543,21 @@ impl Host {
                             list.SetComputeRootConstantBufferView(*param, va);
                         }
                         keep.push(b);
+                    }
+                    Root::Uav(n) => {
+                        let bytes = u64::from(*n) * 4;
+                        let b = make(
+                            D3D12_HEAP_TYPE_DEFAULT,
+                            &buffer(bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+                            D3D12_RESOURCE_STATE_COMMON,
+                        )?;
+                        list.SetComputeRootUnorderedAccessView(*param, b.GetGPUVirtualAddress());
+                        let rb = make(
+                            D3D12_HEAP_TYPE_READBACK,
+                            &buffer(bytes, D3D12_RESOURCE_FLAG_NONE),
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                        )?;
+                        uavs.push((b, None, *n, rb));
                     }
                 }
             }
