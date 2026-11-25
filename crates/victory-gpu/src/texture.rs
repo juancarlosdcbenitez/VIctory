@@ -10,6 +10,12 @@
 //! which cannot be watched, a content hash of the whole memory at every
 //! submission that samples it.
 //!
+//! The textures a submission checks between two steps that write title
+//! memory are independent (each reads title memory and writes only its own
+//! staging buffer), so [`refresh`] checks them side by side on a few
+//! threads, and a big hash is split along BLAKE3's tree: the outcome is the
+//! one checking them one by one gives (PERF-5).
+//!
 //! shortcut: a change detiles the whole texture, not the pages written.
 //! Only textures read through descriptor tables are brought up to date
 //! (directly indexed views are not known per draw); plane 0 is uploaded
@@ -169,20 +175,43 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     list.defer_texture(staging);
 }
 
+/// Below this many bytes of texture memory in all, a group of textures is
+/// checked on the submitting thread: starting threads would cost more.
+const PARALLEL_MIN: u64 = 2 << 20;
+
+/// Brings `due` up to date: textures a submission samples, checked one after
+/// another with no title memory written in between, each detiled into its
+/// staging buffer if its memory changed (and is mapped at all). They are
+/// checked side by side when there is enough memory to read, each hash on
+/// the threads left over; the outcome does not depend on how.
+pub(crate) fn refresh(due: &[Arc<Staging>]) {
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    if due.is_empty() {
+        return;
+    }
+    let started = std::time::Instant::now();
+    let read = AtomicUsize::new(0);
+    let bytes: u64 = due.iter().map(|s| s.layout.size).sum();
+    let threads = if bytes < PARALLEL_MIN {
+        1
+    } else {
+        victory_core::parallel::threads()
+    };
+    let workers = threads.min(due.len());
+    let per_hash = (threads / workers.max(1)).max(1);
+    victory_core::parallel::for_each(due, workers, |staging| {
+        read.fetch_add(staging.refresh_now(per_hash), Relaxed);
+    });
+    let preparing = &crate::host::PREPARING;
+    preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+    preparing[3].fetch_add(read.into_inner() as u64, Relaxed);
+}
+
 impl Staging {
     /// Detiles the texture memory into the staging buffer if it changed
-    /// since the last time (and is mapped at all).
-    pub(crate) fn refresh(&self) {
-        use std::sync::atomic::Ordering::Relaxed;
-        let started = std::time::Instant::now();
-        let read = self.refresh_now();
-        let preparing = &crate::host::PREPARING;
-        preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
-        preparing[3].fetch_add(read as u64, Relaxed);
-    }
-
-    /// Returns the bytes of title memory read.
-    fn refresh_now(&self) -> usize {
+    /// since the last time (and is mapped at all), hashing on up to
+    /// `threads` threads; returns the bytes of title memory read.
+    fn refresh_now(&self, threads: usize) -> usize {
         let size = self.layout.size as usize;
         let start = self.memory as usize;
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
@@ -213,7 +242,7 @@ impl Staging {
         }
         // SAFETY: committed memory of the texture's layout size.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
-        let hash = blake3::hash(tiled);
+        let hash = victory_core::parallel::blake3(tiled, threads);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {

@@ -124,6 +124,15 @@ jobs:
           cargo test --locked -p victory-gpu the_host_device_names_its_adapter -- --nocapture 2>&1 | tee logs/tests-gpu-adapter.txt
           cargo test --locked -p victory-gpu -p victory-hle -p victory 2>&1 | tee logs/tests-gpu-hle-app.txt
 
+      # CPU throughput of the hashing texture checks use (PERF-5), one
+      # thread against split and side by side: a CPU measurement of this
+      # runner, not a frame rate.
+      - name: Hashing throughput (CPU)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        shell: bash
+        run: cargo test --release --locked -p victory-core -- --ignored --nocapture hashing_throughput 2>&1 | tee logs/bench-hashing.txt
+
       - name: D3D12 capability report
         if: ${{ !cancelled() }}
         timeout-minutes: 10
@@ -150,6 +159,12 @@ jobs:
               ignored=$(grep -oE "[0-9]+ ignored" "$f" | awk '{s+=$1} END {print s+0}')
               echo "- \`$(basename "$f")\`: $passed passed, $failed failed, $ignored ignored"
             done
+            echo
+            echo "### Hashing throughput (CPU of this runner, not a frame rate)"
+            echo
+            echo '```'
+            grep -E "^hashing_throughput|MiB" logs/bench-hashing.txt 2>/dev/null || echo "no benchmark output"
+            echo '```'
             echo
             echo "### D3D12 adapters"
             echo

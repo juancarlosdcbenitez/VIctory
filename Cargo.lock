@@ -665,6 +665,7 @@ name = "victory-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "serde",
  "tempfile",
  "thiserror",
@@ -693,6 +694,7 @@ dependencies = [
  "miniz_oxide",
  "tempfile",
  "tracing",
+ "victory-core",
  "victory-formats",
  "victory-pipeline",
  "victory-shader",

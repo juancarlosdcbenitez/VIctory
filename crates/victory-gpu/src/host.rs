@@ -613,6 +613,7 @@ impl Host {
             }
             lists.push(list.list.cast().ok());
         }
+        batch.refresh_textures();
         batch.flush();
         let prepared = std::time::Instant::now();
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
@@ -1285,6 +1286,11 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         for step in &self.deferred().copies {
+            // Textures checked so far go before anything but more textures
+            // and buffer refreshes (which only gather ranges until flushed).
+            if !matches!(step, Step::Texture(_) | Step::Refresh(..)) {
+                batch.refresh_textures();
+            }
             let started = std::time::Instant::now();
             let copied = match step {
                 &Step::Copy(dst, src, len) => {
@@ -1334,9 +1340,7 @@ impl HostList {
                     continue;
                 }
                 Step::Texture(staging) => {
-                    if batch.texture_due(staging) {
-                        staging.refresh();
-                    }
+                    batch.texture(staging);
                     continue;
                 }
             };
@@ -1354,11 +1358,15 @@ impl HostList {
 /// lists of a world submission sample the same textures, and a texture in
 /// physical-page memory is hashed whole each time it is checked. Checked
 /// once, it is checked again only after a step that writes title memory.
+/// Textures due are gathered until another kind of step comes, then
+/// checked together ([`crate::texture::refresh`]).
 #[derive(Default)]
 struct Batch {
     refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
+    /// Textures due and not checked yet.
+    due: Vec<std::sync::Arc<crate::texture::Staging>>,
 }
 
 impl Batch {
@@ -1377,12 +1385,28 @@ impl Batch {
     /// Whether `staging` is still to be refreshed in this submission (and
     /// notes it refreshed).
     fn texture_due<T>(&mut self, staging: &std::sync::Arc<T>) -> bool {
-        self.textures.insert(std::sync::Arc::as_ptr(staging) as *const () as usize)
+        self.textures
+            .insert(std::sync::Arc::as_ptr(staging) as *const () as usize)
     }
 
-    /// Before a step that writes title memory: pending refreshes are done
-    /// first, and textures are checked again after it.
+    /// A texture a list samples: due if not checked yet in this submission
+    /// (since the last title write).
+    fn texture(&mut self, staging: &std::sync::Arc<crate::texture::Staging>) {
+        if self.texture_due(staging) {
+            self.due.push(staging.clone());
+        }
+    }
+
+    /// Checks the textures due.
+    fn refresh_textures(&mut self) {
+        crate::texture::refresh(&self.due);
+        self.due.clear();
+    }
+
+    /// Before a step that writes title memory: pending refreshes and
+    /// textures due are done first, and textures are checked again after it.
     fn title_written(&mut self) {
+        self.refresh_textures();
         self.flush();
         self.textures.clear();
     }
