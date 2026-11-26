@@ -1528,10 +1528,14 @@ mod tests {
         let mut list = null;
         let hr = create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list);
         assert_eq!(hr, S_OK);
+        // Lists are closed before they are reset (the host allocator cannot
+        // be reset under a list still recording).
+        let close = |l: This| slot::<extern "system" fn(This) -> HRESULT>(l, 0x48)(l);
         let p = allocate_upload(list, 64, 0x100);
         assert!(!p.is_null());
         // SAFETY: 64 bytes were handed out.
         unsafe { p.write_bytes(0xcd, 64) };
+        assert_eq!(close(list), S_OK);
         // A queue holds the list's submission back.
         let held = host_list_shared(list).expect("a host list");
         assert_eq!(reset(list, allocator, null), S_OK);
@@ -1547,6 +1551,7 @@ mod tests {
         // Without a held submission the next reset frees what the list has.
         drop(fresh);
         assert!(!allocate_upload(list, 8, 0x10).is_null());
+        assert_eq!(close(list), S_OK);
         assert_eq!(reset(list, allocator, null), S_OK);
         let own = host_list_shared(list).expect("a host list");
         assert_eq!(own.kept_memory(), 0);
