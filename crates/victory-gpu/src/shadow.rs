@@ -136,6 +136,12 @@ impl Shadow {
         self.gpu
     }
 
+    /// The title memory it holds, `[start, end)`.
+    pub(crate) fn span(&self) -> crate::order::Range {
+        let start = self.start as usize;
+        (start, start + self.len as usize)
+    }
+
     /// Bytes from a title address to the buffer's end.
     pub(crate) fn left(&self, address: u64) -> u64 {
         (self.start + self.len).saturating_sub(address)

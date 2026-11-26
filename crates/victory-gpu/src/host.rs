@@ -1477,6 +1477,14 @@ impl HostList {
         let deferred = self.deferred();
         let mut a = crate::order::Access::default();
         let range = |at: usize, len: usize| (at, at.saturating_add(len));
+        // Each copy's memory once (a list names few copies, many times, in
+        // runs): runs folded here, the rest after.
+        let mut copies: Vec<(usize, crate::order::Range)> = Vec::new();
+        let mut held = |copy: usize, span: crate::order::Range| {
+            if copies.last().is_none_or(|&(c, _)| c != copy) {
+                copies.push((copy, span));
+            }
+        };
         for step in &deferred.copies {
             match step {
                 &Step::Copy(dst, src, len) | &Step::Move(dst, src, len) => {
@@ -1488,17 +1496,23 @@ impl HostList {
                 Step::Refresh(shadow, at, len) => {
                     let copy = Arc::as_ptr(shadow) as usize;
                     a.gpu_reads.push((copy, range(*at, *len)));
+                    held(copy, shadow.span());
                 }
                 Step::GpuWrite(shadow, at, len) => {
                     let copy = Arc::as_ptr(shadow) as usize;
                     a.gpu_writes.push((copy, range(*at, *len)));
+                    held(copy, shadow.span());
                 }
                 Step::Texture(staging) => {
                     let copy = Arc::as_ptr(staging) as usize;
                     a.gpu_reads.push((copy, staging.span()));
+                    held(copy, staging.span());
                 }
             }
         }
+        copies.sort_unstable_by_key(|&(c, _)| c);
+        copies.dedup_by_key(|&mut (c, _)| c);
+        a.copies = copies;
         for &(at, _, bytes) in &deferred.writes {
             a.gpu_writes.push((crate::order::TITLE, range(at, bytes)));
         }
