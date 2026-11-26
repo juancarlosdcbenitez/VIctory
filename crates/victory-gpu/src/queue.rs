@@ -156,6 +156,19 @@ thread_local! {
     static ASYNC_FOR_TESTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Asynchronous queues for the calling test's thread (tests of other
+/// modules).
+#[cfg(test)]
+pub(crate) fn asynchronous_for_tests(on: bool) {
+    ASYNC_FOR_TESTS.set(on);
+}
+
+/// A queue's signal (tests of other modules).
+#[cfg(test)]
+pub(crate) fn signal_for_tests(queue: This, fence: This, value: u64) -> HRESULT {
+    signal(queue, fence, value)
+}
+
 /// Whether queue waits hold work back (the default). With the
 /// `diagnostics` feature, `VICTORY_QUEUE_WAITS=0` makes queues run what is
 /// submitted at once, reached or not, as before, to compare.

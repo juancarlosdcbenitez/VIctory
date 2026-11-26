@@ -1579,7 +1579,23 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn buffer_data_reaches_the_host_texture() {
+        buffer_data_reaches_the_host_texture_with(false);
+    }
+
+    /// The same on asynchronous queues (experimental): the submission runs
+    /// on the queue worker, and the title's way to know it ran, a signal
+    /// after it and a fence wait, is what the test waits on before reading
+    /// the texture back.
+    #[cfg(windows)]
+    #[test]
+    fn buffer_data_reaches_the_host_texture_on_asynchronous_queues() {
+        buffer_data_reaches_the_host_texture_with(true);
+    }
+
+    #[cfg(windows)]
+    fn buffer_data_reaches_the_host_texture_with(asynchronous: bool) {
         use windows::Win32::Graphics::Direct3D12::*;
+        crate::queue::asynchronous_for_tests(asynchronous);
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
         };
@@ -1708,6 +1724,22 @@ mod tests {
         slot::<Copy>(list, 0x80)(list, &to, 0, 0, 0, &from, null.cast());
         slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list);
         slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
+        if asynchronous {
+            let mut fence = null;
+            let fence_iid = &crate::fence::FENCE_IIDS[0];
+            assert_eq!(crate::fence::create(null, 0, 0, fence_iid, &mut fence), S_OK);
+            assert_eq!(crate::queue::signal_for_tests(queue, fence, 1), S_OK);
+            let value = slot::<extern "system" fn(This) -> u64>(fence, 0x40);
+            let started = std::time::Instant::now();
+            while value(fence) < 1 {
+                assert!(
+                    started.elapsed() < std::time::Duration::from_secs(10),
+                    "the queue worker never signalled after the submission"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            crate::queue::asynchronous_for_tests(false);
+        }
 
         // Read the host texture back into a readback buffer.
         let readback_heap = D3D12_HEAP_PROPERTIES {
