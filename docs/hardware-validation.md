@@ -230,7 +230,9 @@ submission and their work overlaps the GPU's. Compare fps, ms per frame and
 the presented-frame intervals with the run without it, and note any hang,
 device removal, flicker or wrong image (those settle whether it is safe,
 whatever the frame rate says). The `held back` counts after the frame lines
-count everything in this mode.
+count everything in this mode. Our window and swap chain are then made
+and pumped by the queue worker, which runs every present: a window that
+stops responding or drawing only in this mode points there.
 
 The 5 s lines are averages. Presented-frame intervals one by one, which
 show stutter the averages hide: `VICTORY_LOG=victory_gpu::frame=debug,info`
