@@ -732,13 +732,16 @@ passed both jobs; runs 34 and 35 failed (the test defect above); runs 36,
 38 and 41 passed their checks; run 43 (`a54583d`) passed both jobs.
 Seventh session: runs 44 (`ea34abb`) and 45 (`cbd8ae7`) passed; 46-48
 were replaced by newer pushes; 49 (`8c67206`) failed (the test defect
-above); 50 (`b8debcb`) passed both jobs. The latest verified diagnostic
-package is run 50's `victory-diag-0.1.0-b8debcb0d3ce-windows-x64` (build
-`0.1.0+diag.b8debcb0d3ce`, 10,741,144 bytes, zip SHA-256
-`2f958bcb7f1e7afdc63504ab675f83260c5a476d3a04648d92a08bc3113ba79c`;
+above); 50 (`b8debcb`) and 51 (`47f4631`) passed; 52 (`430660d`) failed
+on one test expectation of mine (the one-part mix, above); 53
+(`b44b0da`), 54 (`28684cb`) and 55 (`56c5050`, the last code commit)
+passed both jobs. The latest verified diagnostic package is run 55's
+`victory-diag-0.1.0-56c5050527a2-windows-x64` (build
+`0.1.0+diag.56c5050527a2`, 10,823,376 bytes, zip SHA-256
+`bddfd40d6eb9a96c50b3bce8420ddad524fbf145e7892a271e946d3af2834941`;
 `victory.exe`
-`98d60399b2e81b1960f693ca3c777f87a8eb7b21ed71b02efe675ae6b2f4e75e`,
+`00972eb0e866e692a03643514b15e58afef831535a01482d4b27a531d599b61d`,
 `victory.pdb`
-`0bdeef2d26f19b343df774e7e6b6f86c8f545469b39c19ab535e228540e0f2e4`; the
-job checked the nine files and `--version`). Run 43's package
-(`a54583d`) is the one before it.
+`f7608e0e6de635e41c7e07668dbd3bc5a0fb544f6b598a507d47607966e54b5d`; the
+job checked the nine files and `--version`). Run 50's package
+(`b8debcb`) is the one before it in this record.
