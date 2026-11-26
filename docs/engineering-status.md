@@ -508,9 +508,44 @@ test, the new differential and a scratch test, which was removed).
   what they read at the call. The worker's `execute` is unchanged, one
   submission at a time and waiting, so the copy invariants hold as today
   (architecture.md). Tested on the schedule model and the queues
-  (signals and presents in order behind a wait); not run on a GPU or with
-  the game. Smallest step toward overlap that keeps every invariant:
-  title CPU work overlaps the GPU; the worker's own preparation does not.
+  (signals and presents in order behind a wait), and end to end on the
+  GPU layer's host device (`8efa1e6`: a title buffer copied into a
+  texture through a title queue whose submission the worker runs, the
+  test waiting on a fence signalled after it, as a title would; its CI
+  run is recorded under "Next session"); not run on a GPU or with the
+  game. Smallest step toward overlap that keeps every
+  invariant: title CPU work overlaps the GPU; the worker's own preparation
+  does not.
+* **CI broke and was restored.** Runs 34 and 35 aborted the GPU layer's
+  test binary (`0xc0000409`): the new upload-memory test reset a title
+  list that was still open, the host allocator refused, and the failure
+  panicked inside an `extern "system"` method. A test defect, not a code
+  one: titles close lists before resetting them. Fixed in `dbce613`; run
+  36's checks passed.
+* **Buffer-to-texture copies take upload memory from the list's chunks**
+  (`ebc664b`): each such copy made and mapped a committed upload buffer of
+  its own; the list's 4 MiB upload chunks (reused after its reset) hold
+  them now, at the 512-byte placement alignment. The existing end-to-end
+  copy test now copies two buffers so the second lands past the first.
+  Allocation cost only; no frame-rate claim.
+* **Copies at submission that read what earlier shaders write** (reported,
+  not fixed; `e6d16c6`). Buffer copies and fills of upload memory run on
+  the CPU when a submission starts, before its GPU work, where D3D12
+  orders them after the work recorded before them. A copy whose source
+  shaders earlier in the same submission write takes the bytes from before
+  they ran (counts copied into indirect arguments, constants a compute
+  pass makes). Such copies are now counted (the frame report) and the
+  first eight logged; stage 3 of the hardware procedure counts them. A fix
+  would record them as GPU copies between host copies, which needs the
+  host copies' resource states tracked (they live in COMMON and rely on
+  implicit promotion today): worth it only if a run shows them.
+* **Shader census evidence without the game files**: the README's census
+  (world: mesh 8,191 of 8,506, vertex/pixel 10,617 of 12,346, compute
+  1,643 of 2,539 translated) names the causes (64-bit image atomics,
+  merged geometry stages, the ray-tracing builder, 64-lane waves) but not
+  their counts or the instructions behind the rest; ranking instructions
+  needs the census on the game files (hardware-validation.md, "Translation
+  census"). No lowering was added on speculation.
 
 ## Backlog
 
@@ -540,34 +575,46 @@ P3 runtime compatibility, P4 usability.
 
 ## Next session
 
-Remote branch head at the end of the fifth session: the last commit of
+Remote branch head at the end of the sixth session: the last commit of
 `claude/sharp-thompson-o8cl4c` (the docs commit that adds this
-paragraph). Windows validation runs 18-20, 22, 25 and 27 passed, each with
-its diagnostic package; the latest verified one is run 27's
-(`victory-diag-0.1.0-de302ed0a8c7-windows-x64`, checksums in the
-fifth-session entry). Runs for `4bc6e42` and `3d3bd7d` had not finished
-when this was written.
+paragraph). CI and the latest verified diagnostic package: see the end of
+this section.
 
-1. Check the latest Windows validation run: both jobs green, the summary
-   saying no hardware GPU was present, the float, f16 and packed f16
-   device tests run on WARP (not skipped), and a `victory-diag-...`
-   artifact for the head commit.
+1. Check the latest Windows validation run: both jobs green; the shader
+   step's WARP runs (f16 and mixed differential included); the GPU layer's
+   tests, which since the sixth session include the held-submission
+   ownership tests and the asynchronous end-to-end copy; a
+   `victory-diag-...` artifact for the head commit.
 2. Whoever has a Windows machine with a hardware D3D12 GPU and game files
    they may use: [hardware-validation.md](hardware-validation.md) with
    that artifact: the baseline against `ffe310e` and the translation
    census first, then the stages one variable at a time. They settle the
    open P0 items: the world hang (3, 4), GPU-1 (5), SYNC-1 (6), PERF-3 (7),
-   SH-1 (8), the frame and memory baselines (9, 10), playability (12).
-   Nothing in this repository's CI can stand in for it (HW-1).
+   SH-1 (8), the frame and memory baselines (9, 10), playability (12);
+   new in the sixth session: the stale-copy count (3) and one run with
+   `VICTORY_QUEUE_ASYNC=1` (9). Nothing in this repository's CI can stand
+   in for it (HW-1).
 3. Without such a machine, the next implementation tasks, in order:
-   * PERF-2: check C3 in diagnostics builds with `inflight::InFlight`
-     (every GPU-written range recorded per submission, every range
-     preparation reads checked against it), so the bookkeeping is proven
-     on real workloads before anything relies on it; then per-submission
-     versions of host copies (C1). No step that lets submissions overlap
-     before a world run measures the CPU and GPU split.
+   * If a run reports stale copies: record buffer copies whose source
+     earlier work writes as GPU copies between host copies, with the host
+     copies' resource states tracked per list (today they live in COMMON
+     and rely on implicit promotion); a WARP test of dispatch-then-copy in
+     one list.
+   * If `VICTORY_QUEUE_ASYNC=1` runs clean and faster: batch consecutive
+     ready submissions on the worker into one host submission (only where
+     no later list's copies read what an earlier one's shaders write), then
+     overlap the worker's own preparation with the GPU (C1, C3 with
+     `inflight`).
    * With the game's shaders at hand (the census), the most frequent
      refusal reasons decide the next lowering; those needing AMD's ISA
      guide (SH-2's converting formats, SH-4, SH-5) wait for it.
    * The d16 texture returns' rounding (D3D's toward zero today), once a
      hardware run can compare them with nearest-even.
+
+CI at the time of writing: run 31 (`89ed258`, the f16 fix and
+differential) passed both jobs; runs 34 and 35 failed (the test defect
+above); run 36 (`dbce613`) passed its checks; the runs for `e6d16c6` and
+`8efa1e6` had not finished. The latest diagnostic package whose run passed
+both jobs: run 31's `victory-diag-0.1.0-89ed25834c46-windows-x64`
+(10,683,891 bytes, zip SHA-256
+`d7cec95773969cd7514734bca907a6be3f4de85dec3ede203201a5d0a776d40d`).
