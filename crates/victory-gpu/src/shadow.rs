@@ -45,6 +45,24 @@ pub(crate) struct Shadow {
     before: Mutex<Option<(usize, Vec<u8>)>>,
 }
 
+/// Title ranges `[start, end)` shaders of the submission being run write,
+/// not yet copied back (submissions run one at a time): what
+/// [`written_by_gpu`] answers from.
+static GPU_WRITTEN: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+/// Whether shaders of the submission being run write any byte of `[at, at +
+/// len)` of title memory. A copy that reads such a range at submission (a
+/// title buffer copy, a fill of upload memory) reads what was there before
+/// those shaders ran, where D3D12 orders it after them.
+pub(crate) fn written_by_gpu(at: usize, len: usize) -> bool {
+    let end = at.saturating_add(len);
+    GPU_WRITTEN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|&(a, e)| a < end && at < e)
+}
+
 /// Snapshot memory kept for reuse (already touched, so no page faults).
 static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 
@@ -153,6 +171,10 @@ impl Shadow {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push((address, address + len));
+        GPU_WRITTEN
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((address, address + len));
         let (from, to) = self.inside(address, len);
         // SAFETY: inside the mapping.
         let host = |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
@@ -243,6 +265,10 @@ impl Shadow {
         // submission runs at a time), and the snapshot with the last range.
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         pending.retain(|&r| r != (address, address + len));
+        GPU_WRITTEN
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|&r| r != (address, address + len));
         if pending.is_empty()
             && let Some((_, bytes)) = snapshot.take()
         {
@@ -488,4 +514,41 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    /// The title ranges shaders of the running submission write are known
+    /// from `writing` until `copy_back`, byte for byte at their edges: a copy
+    /// at submission that reads any of them is reported, since it reads the
+    /// bytes from before those shaders ran.
+    #[test]
+    fn ranges_shaders_write_are_known_until_copied_back() {
+        if host().is_none() {
+            assert!(
+                !crate::warp::required(),
+                "VICTORY_WARP_REQUIRED=1, but the GPU layer has no host device"
+            );
+            return;
+        }
+        // Title memory of the test's own, registered as a buffer.
+        let mut memory = vec![0u8; 1 << 16];
+        let start = memory.as_mut_ptr() as u64;
+        let resource = memory.as_ptr() as usize;
+        register(resource, start, 1 << 16);
+        let shadow = find(start, 1 << 16).expect("a host copy");
+        let (at, len) = (start as usize + 0x1000, 0x100);
+        assert!(!written_by_gpu(at, len));
+        shadow.writing(at, len);
+        assert!(written_by_gpu(at + len - 1, 1), "its last byte");
+        assert!(written_by_gpu(at - 0x10, 0x11), "a range reaching into it");
+        assert!(!written_by_gpu(at + len, 0x10), "just past it");
+        assert!(!written_by_gpu(at - 0x10, 0x10), "just before it");
+        shadow.copy_back(at, len);
+        assert!(!written_by_gpu(at, len), "copied back");
+        unregister(resource, start);
+        drop(memory);
+    }
 }

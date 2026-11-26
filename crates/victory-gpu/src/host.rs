@@ -71,6 +71,28 @@ unsafe impl Sync for Host {}
 /// them one at a time, for the frame line.
 static LOCK_WAIT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Copies done at submission (title buffer copies, fills of upload memory)
+/// whose source shaders earlier in the same submission write: they read
+/// the bytes from before those shaders ran, where D3D12 orders the copy
+/// after them. Counted for the frame report; the first few are logged.
+static STALE_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A copy at submission reads `[src, src + len)`, which shaders earlier in
+/// the submission write (see [`STALE_COPIES`]).
+fn stale_copy(what: &str, dst: usize, src: usize, len: usize) {
+    static LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    STALE_COPIES.fetch_add(1, Ordering::Relaxed);
+    if LOGGED.fetch_add(1, Ordering::Relaxed) < 8 {
+        tracing::warn!(
+            dst = format_args!("{dst:#x}"),
+            src = format_args!("{src:#x}"),
+            len,
+            "a {what} at submission reads memory shaders earlier in the submission write: it \
+             copies the bytes from before they ran (the GPU orders it after them)"
+        );
+    }
+}
+
 static SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 
@@ -1371,6 +1393,9 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
+                    if crate::shadow::written_by_gpu(src, len) {
+                        stale_copy("buffer copy", dst, src, len);
+                    }
                     batch.title_written();
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     len
@@ -1380,6 +1405,9 @@ impl HostList {
                     {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
+                    }
+                    if crate::shadow::written_by_gpu(src, len) {
+                        stale_copy("fill of upload memory", dst, src, len);
                     }
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
                     len
@@ -1756,6 +1784,14 @@ impl Meter {
                     ahead,
                     "since the last report: submissions and signals held back by queue waits \
                      not reached, and presents or page mappings that ran ahead of held work"
+                );
+            }
+            let stale = STALE_COPIES.swap(0, Ordering::Relaxed);
+            if stale > 0 {
+                tracing::warn!(
+                    stale,
+                    "since the last report: copies at submission that read what shaders earlier \
+                     in their submission write (copied from before those shaders ran)"
                 );
             }
             #[cfg(feature = "diagnostics")]
