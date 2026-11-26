@@ -244,6 +244,24 @@ call such methods directly, not by slot
 checks the slots). `queue::tests::asynchronous_backlogs_are_bounded_
 without_waiting_on_held_work` checks the asynchronous queues' backlog.
 
+Submission order across lists: `order::tests` (any host) are the model of
+where a submission is cut. On Windows, on the GPU layer's host device,
+`resource::tests` submit lists together through a title queue (`Lists`;
+`host::UNCUT_FOR_TESTS` runs them as one part, the old behaviour, and
+`host::PARTS_FOR_TESTS` is the parts this thread's last submission ran
+in): `copies_in_later_lists_read_what_earlier_lists_shaders_wrote`,
+`dependent_lists_run_in_as_many_parts_as_they_need`,
+`only_lists_sharing_bytes_are_cut_apart`,
+`aliased_buffers_see_earlier_lists_shader_writes`,
+`copies_over_memory_earlier_lists_use_wait_for_them` and
+`asynchronous_queues_cut_submissions_too`, each checking every byte of the
+memory involved. `overlapping_copies_on_the_gpu_move_memory` checks the GPU
+copy's memory-move semantics; `copy::tests` its dispatch plans and their
+refusals. Texture to buffer from other subresources:
+`texture_regions_of_other_mips_and_slices_reach_title_buffers` and
+`depth_slices_of_volume_textures_reach_title_buffers` (`texture_reads`
+fills a texture's subresources through title buffers and reads them back).
+
 Benchmarks (ignored tests, release builds): `merge_speed` (victory-gpu,
 the copy-back merge), `detile_speed` (victory-formats), `bcpack_throughput`
 (victory-formats), `bench_write` (victory-shader, the bitcode writer),

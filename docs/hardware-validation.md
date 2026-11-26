@@ -144,10 +144,22 @@ much slower, one more load with `VICTORY_PIPELINE_SYNCS=0` (the old
 behaviour) says whether the barriers are the cause.
 
 In stage 3's log, also count `copies at submission that read what shaders
-earlier in their submission write`: each is a copy that took stale bytes
-(the GPU orders it after those shaders; we copy before the submission
-runs). Report the count and the first logged lines; none means the title
-does not depend on that order.
+earlier in their list write`: each is work at submission (a fill of upload
+memory, a rectangle expansion, a copy the GPU could not take) that read
+stale bytes (the GPU orders it after those shaders; it runs before the
+submission does). Report the count and the first logged lines; none means
+the title does not depend on that order inside a list. Across lists the
+submission is cut instead (seventh session): `submissions cut before lists
+that depend on an earlier list's GPU work` counts the cuts, and the first
+eight are logged with their reason (`a submission is cut before a list:
+...`). Each cut waits for the GPU in the middle of a submission: report
+the count next to the frame times.
+
+Also collect every `method not implemented` line (an object, a slot and the
+title's caller: a call that does nothing here) and every `a copy not made`
+line (a copy the host cannot make, and why). Together they say which
+unimplemented paths the world reaches, which decides what to implement
+next.
 
 ### 4. Device removal (DRED)
 

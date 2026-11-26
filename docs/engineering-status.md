@@ -592,10 +592,49 @@ green.
   `list::tests::newer_lists_have_their_console_methods_two_slots_later`
   checks every method's slot in both layouts, which the copy-order test no
   longer goes through. Run 50 passed both jobs.
-* **Copies across lists of one submission** (in progress): a list's work at
-  submission (copies, fills of upload memory, quad expansion, all on the
-  CPU before any GPU work) still reads what an earlier list of the same
-  submission writes on the GPU before it ran (counted, `STALE_COPIES`).
+* **Copies across lists of one submission** (C5, `430660d`, `b44b0da`;
+  run 53). A submission's work at submission (copies, fills of upload
+  memory, rectangle expansion) runs on the CPU before any of its GPU work,
+  and every host copy is brought up to date then too, so where the lists
+  of one ExecuteCommandLists depended on each other through title memory a
+  later list saw it as before an earlier list's GPU work. Now (`order`)
+  each list's accesses, read from its steps, decide where the submission
+  is cut: before a list whose CPU work reads or writes what GPU work of an
+  earlier list in its part writes, or writes what such work reads, or
+  whose GPU work reads or writes, through another copy of the same memory
+  (nested or aliased buffers, a texture over a buffer's memory), what
+  earlier GPU work writes. Each part runs and is copied back before the
+  next part's work at submission, under the same lock; lists that share
+  nothing stay one submission. Cuts are counted in the frame report. The
+  Windows tests run each case as one part too, to show the old result: a
+  copy in the next list of what shaders wrote (old: the bytes from before);
+  a four-list chain (three parts); copies sharing no byte (one part) and
+  one dword (cut); a buffer nested in another, written through the outer
+  host copy and read through the inner (old: the heap's zeros); a copy over
+  what shaders wrote (old: a byte-wise mix, since the copy-back writes only
+  bytes the GPU changed) and over what GPU work read (old: the earlier
+  reader saw the copy); the first case on asynchronous queues. Run 52
+  failed on my expectation for that mix; run 53 passed all of them.
+  Inside one list nothing can be cut and nothing changed: fills and
+  expansions reading what earlier shaders of the list write are counted
+  (`STALE_COPIES`); copies over memory earlier GPU work in the list reads
+  or writes stay on the CPU (moving them to the GPU would make a fill after
+  them read title memory from before them); aliasing barriers between
+  buffers are dropped (each buffer has its own host copy); buffers read
+  through directly indexed heaps are not brought up to date per use, so
+  the cuts do not see those reads (architecture.md, C5).
+* **The GPU copy pass, audited** (`b44b0da`; run 53). Fixed: region ends
+  were computed in unchecked arithmetic of the title's pitches before the
+  row and slice limits were checked (an overflow, a panic in debug builds
+  inside an exported method); the last offset now leaves the 3 bytes the
+  pass's dword accesses reach past a copy; texture-to-buffer staging
+  buffers are whole dwords (the pass read up to 3 bytes past one-byte
+  formats' footprints); overlapping ranges of one host copy go through a
+  buffer of ours, a memory move as on the CPU (one pass read what its own
+  threads wrote). Checked and unchanged: offsets, byte merges at the ends,
+  long rows, dispatch limits, barriers, and that the pass leaves no state
+  behind (every title draw and dispatch sets its pipeline, root signature
+  and arguments again; graphics bindings, heaps and targets untouched).
 
 ## Backlog
 
@@ -606,6 +645,7 @@ P3 runtime compatibility, P4 usability.
 |----|---|-------|------|
 | GPU-1 | P0 | hypothesis, instrumented | **Out-of-range heap indices as a hang cause.** Audited (second session): table bases cannot leave the heaps (`draw::State::user_value` gives 0 for a table outside the bound heaps), and tables reaching past a smaller host heap get fresh slots (`draw::State::tables`). What remains unbounded is an index the shader computes per lane (bindless indexing, waterfall loops: `emit::lower::lane_heap_index`, `fetched_index`), read through `ResourceDescriptorHeap[]` with no clamp. Since the fourth session, probes (`VICTORY_SHADER_PROBES=1`, diagnostics) record every such index at or past the bound heap's slots, with the shader, without clamping. Check: hardware-validation.md stages 4 and 5. Records name the shaders whose index computation to fix; none, with DRED placing a fault past a heap, would mean an index inside the slots naming the wrong descriptor, which probes do not see. Clamping stays out: it would hide the defect. |
 | GPU-2 | P0 | verified off-GPU | Fence waits follow D3D12's rules (third session): no timeout, rewinds, bottom-of-pipe writes wake waiters. Next: a world run; a "blocking fence wait has not been reached" warning names a fence nothing signals, or a title deadlock. |
+| COPY-1 | P0 | fixed across lists (run 53); inside a list in part | **Work at submission against the GPU order (C5).** Copies, fills and expansions run on the CPU before a submission's GPU work. Seventh session: a copy whose source earlier shaders of its list write runs on the GPU (`copy`); a submission is cut where a list depends on an earlier one's GPU work (`order`); texture-to-buffer copies are made (they were dropped). Left, inside a list: fills and expansions reading what its earlier shaders write (counted), copies over memory its earlier GPU work reads or writes, aliasing barriers between buffers, reads through directly indexed heaps (architecture.md). Check: hardware-validation.md stage 3 (the stale and cut counts). |
 | SYNC-1 | P0 | implemented, not run in the world | Queue waits were not carried out (work behind a wait not reached ran ahead of it). Since the fourth session the work is held and a queue worker runs it once the fence gets there (`schedule`, `queue`; the rules checked on WARP). Sixth session: held work keeps the descriptor slots and list-owned upload memory it reads past the title list's reset or release (two defects fixed). Left running ahead, and counted: presents and page mappings on a held queue. Check: hardware-validation.md stage 6 (held counts after the frame lines; waits held 5 s or more; `VICTORY_QUEUE_WAITS=0` to compare). A wait that only held work could satisfy would hang: the log names it. |
 | PERF-2 | P2 | open; invariants written, two components built | Every submission runs synchronously: `host::Host::execute` holds a lock, executes, signals and waits `INFINITE` before returning (decision 0007). This makes lifetimes safe by construction, but CPU and GPU never overlap, and one submission past about 2 s is a TDR. The fourth session listed what depends on it (session log): single-buffered host copies, dirty-page copies over GPU-written ranges not yet copied back, completion writes, releases right after a submission, the probe buffer. Order: (1) a registry of in-flight GPU-written ranges that preparation consults (wait for that submission only, or skip the range); (2) host copies versioned per submission, or copied on write while in flight; (3) host resources and descriptor slots retired by host fence value; (4) completion (copy-back, bottom-of-pipe writes, probe reads) moved to the queue worker; (5) only then `execute` returning before the GPU finishes. Each step needs a world run on a GPU to show it changes nothing but timing; measure first (`VICTORY_GPU_TIMING`, the frame line's CPU and GPU times). Fifth session: the invariants are in architecture.md (C1-C4, O1-O3, what keeps each today and with overlap); `inflight::Retire` (O2) and `inflight::InFlight` (C3) exist, tested on their own and on WARP (eight submissions in flight with allocators reused; a read waiting for exactly the newest writer of its range); not used yet. The frame line now reports the time title threads wait for each other's submissions. Sixth session: asynchronous queues (`VICTORY_QUEUE_ASYNC=1`, experimental, off): everything runs on the queue worker in queue order, so title CPU work overlaps the GPU; next, a GPU run (hardware-validation.md stage 9) before anything overlaps the worker's own preparation. |
 | PERF-3 | P2 | hypothesis, instrumented | Loops stopped only at `LOOP_LIMIT` (2^20 per lane) can cost about a second in a full-screen pass, the order of the world's frame times. Since the third session a lane the limit stops leaves the program at every back edge; since the fourth, probes count and record such lanes with their shader. Check: hardware-validation.md stages 5 and 7 (`VICTORY_SHADER_LOOP_LIMIT=4096`); if frames get much faster, `VICTORY_GPU_TIMING=1` names the slow lists. Recorded stops in shaders whose loops should end tell whether the limit hides translation bugs. |
@@ -631,9 +671,9 @@ paragraph). CI and the latest verified diagnostic package: see the end of
 this section.
 
 1. Check the latest Windows validation run: both jobs green; the shader
-   step's WARP runs (f16 and mixed differential included); the GPU layer's
-   tests, which since the sixth session include the held-submission
-   ownership tests and the asynchronous end-to-end copy; a
+   step's WARP runs; the GPU layer's tests, which since the seventh
+   session include the copy-order tests inside and across lists (each
+   also run the old way, as one part) and the texture-to-buffer tests; a
    `victory-diag-...` artifact for the head commit.
 2. Whoever has a Windows machine with a hardware D3D12 GPU and game files
    they may use: [hardware-validation.md](hardware-validation.md) with
@@ -641,15 +681,23 @@ this section.
    census first, then the stages one variable at a time. They settle the
    open P0 items: the world hang (3, 4), GPU-1 (5), SYNC-1 (6), PERF-3 (7),
    SH-1 (8), the frame and memory baselines (9, 10), playability (12);
-   new in the sixth session: the stale-copy count (3) and one run with
+   from the sixth and seventh sessions: the stale-copy and cut counts, the
+   `method not implemented` and `a copy not made` lines (3), one run with
+   `VICTORY_PIPELINE_SYNCS=0` if the world flickers (3) and one with
    `VICTORY_QUEUE_ASYNC=1` (9). Nothing in this repository's CI can stand
    in for it (HW-1).
 3. Without such a machine, the next implementation tasks, in order:
-   * If a run reports stale copies: record buffer copies whose source
-     earlier work writes as GPU copies between host copies, with the host
-     copies' resource states tracked per list (today they live in COMMON
-     and rely on implicit promotion); a WARP test of dispatch-then-copy in
-     one list.
+   * If a run reports stale reads inside lists (COPY-1): fills of upload
+     memory and rectangle expansions whose source earlier shaders of the
+     list write become GPU copies into scratch memory of ours that shaders
+     can write (constant buffers then name the scratch; buffer-to-texture
+     copies read the source's host copy); then copies over memory earlier
+     GPU work in the list reads or writes can move to the GPU as well.
+     Each costs a compute pass, so only once a run shows them.
+   * If a run shows many cuts costing frame time: order the dependent copy
+     on the GPU in a list of ours between the parts instead of waiting, or
+     hold back only the lists that depend.
+   * The methods `method not implemented` names in a world run, by count.
    * If `VICTORY_QUEUE_ASYNC=1` runs clean and faster: batch consecutive
      ready submissions on the worker into one host submission (only where
      no later list's copies read what an earlier one's shaders write), then

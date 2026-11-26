@@ -99,10 +99,13 @@ without a host pipeline ...`. The figures are milliseconds per frame,
 averaged over the 5 s; the last one is how long title threads waited for
 each other because submissions run one at a time. After it, when there
 were any: `since the last report: copies at submission that read what
-shaders earlier in their submission write` (such a copy takes the bytes
-from before those shaders ran; the first eight are logged with their
-addresses as `a buffer copy at submission reads memory shaders earlier in
-the submission write`).
+shaders earlier in their list write` (such work takes the bytes from
+before those shaders ran; the first eight are logged with their addresses
+as `a <kind> at submission reads memory shaders earlier in its list
+write`), and `since the last report: submissions cut before lists that
+depend on an earlier list's GPU work through title memory` (each part run
+and copied back before the next; the first eight cuts are logged as `a
+submission is cut before a list: <reason>`).
 
 Before sharing a log, read it: logs hold paths of your machine (and your
 user name in them). Frame captures and saves hold the game's content;
