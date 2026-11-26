@@ -5551,6 +5551,11 @@ impl<'a> Lower<'a> {
         let s_norm = self.s.m.bin(c, Bin::Sub, k25, exp);
         let k24 = k(self, 24);
         let sh = self.s.m.select(c, sub, k24, s_norm);
+        // Exponents of 1 and above saturate below; keep their shift valid
+        // (25 - exp is negative from 2048 up, a shift LLVM leaves undefined).
+        let k14 = k(self, 14);
+        let ge_one = self.s.m.cmp(c, pred::IUGT, exp, k14);
+        let sh = self.s.m.select(c, ge_one, k24, sh);
         let ks = k(self, scale);
         let p = self.s.m.bin(c, Bin::Mul, m, ks);
         let q = self.s.m.bin(c, Bin::LShr, p, sh);

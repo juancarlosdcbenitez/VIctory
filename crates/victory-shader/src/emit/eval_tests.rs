@@ -219,6 +219,39 @@ fn hardware_cases_v_cvt_u16_and_i16_f16_saturate() {
     }
 }
 
+/// `v_cvt_norm_i16_f16` and `v_cvt_norm_u16_f16` of halves of 1 and more
+/// saturate, and the lowering computes them with defined operations only:
+/// it shifted the scaled mantissa by 25 minus the exponent, negative from
+/// 2048 up, a shift LLVM leaves undefined (the saturating select then
+/// discarded the value, so devices gave the right result, but the IR
+/// leaned on an undefined one, which the evaluator refuses).
+#[test]
+fn normalised_conversions_of_large_halves_saturate_with_defined_shifts() {
+    // (half, signed result, unsigned result)
+    let cases: &[(u16, u16, u16)] = &[
+        (0x3C00, 0x7FFF, 0xFFFF), // 1
+        (0x6400, 0x7FFF, 0xFFFF), // 1024: a shift by 0
+        (0x67FF, 0x7FFF, 0xFFFF), // 2047
+        (0x6800, 0x7FFF, 0xFFFF), // 2048: 25 - 26 = -1
+        (0x7800, 0x7FFF, 0xFFFF), // 32768
+        (0x7BFF, 0x7FFF, 0xFFFF), // 65504
+        (0xFBFF, 0x8001, 0x0000), // -65504: -1 times 32767
+        (0x7C00, 0x7FFF, 0xFFFF), // infinity
+        (0xFC00, 0x8001, 0x0000),
+        (0x7E00, 0x0000, 0x0000), // NaN
+        (0x3BFF, 0x7FEF, 0xFFDF), // just below 1: 32751.0 and 65503.0
+    ];
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|c| [u32::from(c.0), 0, 0, 0]).collect();
+    for (op, signed) in [(0x063u16, true), (0x064, false)] {
+        // v_mov_b32 v0, 0; v_cvt_norm_*16_f16 v0, v1 (VOP1).
+        let body = [vop1(0x001, 0, 128), vop1(op, 0, vgpr(1))];
+        for (c, got) in cases.iter().zip(eval_cases(&body, &inputs)) {
+            let want = if signed { c.1 } else { c.2 };
+            assert_eq!(got[0], u32::from(want), "op {op:#x}({:#06x})", c.0);
+        }
+    }
+}
+
 #[test]
 fn hardware_cases_v_sin_and_v_cos_f32_reduce_large_turns() {
     let f = f32::to_bits;
