@@ -10,7 +10,7 @@ use windows::Win32::Graphics::Dxgi::{
 };
 
 /// Whether a test that cannot get its WARP device fails instead of skipping.
-fn required() -> bool {
+pub(crate) fn required() -> bool {
     std::env::var("VICTORY_WARP_REQUIRED").is_ok_and(|v| v == "1")
 }
 

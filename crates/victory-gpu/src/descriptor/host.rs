@@ -257,6 +257,16 @@ impl HostHeap {
         Some(self.count + first as u32)
     }
 
+    /// Whether dynamic slot `index` is taken.
+    #[cfg(test)]
+    pub(crate) fn taken(&self, index: u32) -> bool {
+        let guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
+        index
+            .checked_sub(self.count)
+            .and_then(|at| guard.1.get(at as usize).copied())
+            .unwrap_or(false)
+    }
+
     /// The title slots this heap has host slots for; fewer than the title's
     /// when the host caps its size.
     pub(crate) fn count(&self) -> u32 {

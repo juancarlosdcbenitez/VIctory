@@ -72,21 +72,10 @@ pub(crate) struct State {
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
     /// Tables made afresh in this list: (table, what it holds) → first
-    /// dynamic slot.
+    /// dynamic slot. The host list holds the slots ([`HostList::hold_slots`]).
     fresh_tables: std::collections::HashMap<(u64, u64), u32>,
-    /// The dynamic slots the list holds: title heap, first, count; given
-    /// back when the list is reset or released.
-    dynamic: Vec<(usize, u32, u32)>,
     /// A fresh table of the stage being bound could not be made.
     table_failed: bool,
-}
-
-impl Drop for State {
-    fn drop(&mut self) {
-        for &(heap, first, n) in &self.dynamic {
-            crate::descriptor::release_dynamic(heap, first, n);
-        }
-    }
 }
 
 /// Draws recorded on the host GPU since the last frame line.
@@ -743,8 +732,9 @@ impl State {
                 continue;
             };
             self.fresh_tables.insert(key, first);
-            self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n));
+            // The host list that reads the slots holds them: a submission a
+            // queue holds back keeps it past the title list's reset.
+            list.hold_slots(std::ptr::from_ref(heap) as usize, first, n);
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
@@ -1224,4 +1214,64 @@ pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
 pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    /// The dynamic slots a list's fresh tables are made in stay taken as long
+    /// as the host list reading them can still run. A title list reset while
+    /// a queue holds its submission back (behind a wait) records into a
+    /// fresh host list and resets its draw state; the held submission keeps
+    /// the old host list, whose tables name those slots, so they must not be
+    /// given back to be made into other lists' tables first. They go back
+    /// once the held submission has run and let the host list go.
+    #[test]
+    fn fresh_table_slots_stay_taken_while_a_held_submission_keeps_the_list() {
+        let Some(host) = crate::host::host() else {
+            assert!(
+                !crate::warp::required(),
+                "VICTORY_WARP_REQUIRED=1, but the GPU layer has no host device"
+            );
+            return;
+        };
+        let heap = crate::descriptor::view_heap_for_tests(16);
+        let title = crate::descriptor::heap(heap);
+        // A constant buffer view in the table's first slot: such tables are
+        // made afresh in dynamic slots.
+        crate::descriptor::create_cbv(std::ptr::null(), &[0x1000, 1, 256, 0], title.start);
+        let list = std::sync::Arc::new(host.new_list().expect("a host list"));
+        let mut state = State::default();
+        state.set_heaps(&[heap]);
+        state.set_table(false, 0, title.start);
+        let used = [UsedResource {
+            kind: ResourceType::Cbv,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }];
+        let made = state.tables(&list, &used, false);
+        let &[(0, offset)] = &made[..] else {
+            panic!("one fresh table, made {made:?}");
+        };
+        let first = offset / 32;
+        let slots = title.host().expect("the host heap");
+        assert!(slots.taken(first), "the fresh table's slot is taken");
+        // A queue holds the submission back; the title resets its list.
+        let held = list.clone();
+        state.reset(std::ptr::null());
+        drop(list);
+        assert!(
+            slots.taken(first),
+            "the slot a held submission's table reads was given back"
+        );
+        // The held submission has run.
+        drop(held);
+        assert!(!slots.taken(first), "given back with the host list");
+    }
 }

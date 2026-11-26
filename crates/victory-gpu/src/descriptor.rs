@@ -583,6 +583,30 @@ fn tagged_record(handle: u64, tag: u32) -> Option<RtvRecord> {
 }
 
 /// Device method.
+/// A shader-visible view heap of `count` descriptors in memory of its own,
+/// as a title makes one: for tests of other modules.
+#[cfg(test)]
+pub(crate) fn view_heap_for_tests(count: u32) -> This {
+    #[repr(C)]
+    struct Plain(HeapDesc, Placement);
+    let desc = Plain(
+        HeapDesc {
+            kind: VIEWS_KIND,
+            count,
+            flags: SHADER_VISIBLE,
+            nodes: 0,
+        },
+        Placement {
+            address: 0,
+            size: 0,
+        },
+    );
+    let mut out = std::ptr::null();
+    let made = create_heap(std::ptr::null(), &desc.0, &HEAP_IIDS[0], &mut out);
+    assert_eq!(made, crate::object::S_OK);
+    out
+}
+
 pub(crate) extern "system" fn create_heap(
     _: This,
     desc_ptr: *const HeapDesc,

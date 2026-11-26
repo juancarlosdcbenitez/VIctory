@@ -410,6 +410,13 @@ pub(crate) struct HostList {
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
+    /// Dynamic descriptor slots its fresh tables were made in (title heap,
+    /// first, count): its commands read them, so they are given back only
+    /// once it can no longer run, when it is reset or dropped. A title list
+    /// reset while a queue holds its submission back records into a fresh
+    /// host list (`list::reset`); this one keeps its slots until the held
+    /// submission has run and let it go.
+    slots: Mutex<Vec<(usize, u32, u32)>>,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -418,6 +425,14 @@ pub(crate) struct HostList {
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+}
+
+impl Drop for HostList {
+    /// The last owner has let go: the list's submissions have run (a held
+    /// one owned it until then), so nothing reads its slots any more.
+    fn drop(&mut self) {
+        self.give_back_slots();
+    }
 }
 
 /// Timestamps per list (diagnostics); commands past them are not timed.
@@ -590,6 +605,7 @@ impl Host {
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
+                slots: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -1005,6 +1021,7 @@ impl HostList {
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
+        self.give_back_slots();
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -1122,6 +1139,22 @@ impl HostList {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .push((what, range));
+        }
+    }
+
+    /// Holds `n` dynamic slots from `first` of the host heap behind the
+    /// title heap at `heap` until the list is reset or dropped.
+    pub(crate) fn hold_slots(&self, heap: usize, first: u32, n: u32) {
+        self.slots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((heap, first, n));
+    }
+
+    fn give_back_slots(&self) {
+        let slots = std::mem::take(&mut *self.slots.lock().unwrap_or_else(|e| e.into_inner()));
+        for (heap, first, n) in slots {
+            crate::descriptor::release_dynamic(heap, first, n);
         }
     }
 
