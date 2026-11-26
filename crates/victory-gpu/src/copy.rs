@@ -180,27 +180,33 @@ impl Region {
 /// threads of one dword each.
 const ROW_MAX: u64 = 65_535 * 64 * 4;
 
+/// The furthest offset the pass may reach: its dword reads and writes go
+/// up to 3 bytes past a copy's last byte, in 32-bit arithmetic.
+const OFFSET_MAX: u64 = u32::MAX as u64 - 3;
+
 /// The dispatches (as their root constants and group counts) that copy
 /// `r`, or `None` if the pass cannot: offsets past 32 bits, more than
 /// 65,535 rows or slices, or rows of a multi-row copy that do not start on
 /// dwords (two rows could share one). Single rows longer than a dispatch
 /// covers are cut at dwords of the destination.
 pub(crate) fn dispatches(r: &Region) -> Option<Vec<([u32; 8], [u32; 3])>> {
-    let last_from = r.from
-        + r.from_pitch * u64::from(r.rows.max(1) - 1)
-        + r.from_slice * u64::from(r.slices.max(1) - 1)
-        + r.bytes;
-    let last_to = r.to
-        + r.to_pitch * u64::from(r.rows.max(1) - 1)
-        + r.to_slice * u64::from(r.slices.max(1) - 1)
-        + r.bytes;
     if r.bytes == 0 || r.rows == 0 || r.slices == 0 {
         return Some(Vec::new());
     }
-    if last_from > u64::from(u32::MAX) || last_to > u64::from(u32::MAX) {
+    if r.rows > 65_535 || r.slices > 65_535 {
         return None;
     }
-    if r.rows > 65_535 || r.slices > 65_535 {
+    // Past the last byte copied, each side (pitches are the title's).
+    let end = |at: u64, pitch: u64, slice: u64| {
+        let rows = pitch.checked_mul(u64::from(r.rows - 1))?;
+        let slices = slice.checked_mul(u64::from(r.slices - 1))?;
+        at.checked_add(rows)?
+            .checked_add(slices)?
+            .checked_add(r.bytes)
+    };
+    let last_from = end(r.from, r.from_pitch, r.from_slice)?;
+    let last_to = end(r.to, r.to_pitch, r.to_slice)?;
+    if last_from > OFFSET_MAX || last_to > OFFSET_MAX {
         return None;
     }
     let several = r.rows > 1 || r.slices > 1;
@@ -282,7 +288,10 @@ pub(crate) fn record(list: &HostList, src: u64, dst: u64, r: &Region) -> bool {
 /// Records the copy of `len` bytes of title memory from `from` to `to` as
 /// a GPU copy between their host copies: both brought up to date when the
 /// list is submitted, the destination declared written by the GPU (copied
-/// back into title memory once the submission has run). False, with
+/// back into title memory once the submission has run). Overlapping ranges
+/// of one host copy go through a buffer of ours, so that the copy reads
+/// what was there before it, a memory move as the copy on the CPU makes
+/// it, not what other threads of the pass already wrote. False, with
 /// nothing recorded, if either range has no host copy or the pass cannot
 /// copy it; the caller copies on the CPU then.
 pub(crate) fn buffers(list: &HostList, to: u64, from: u64, len: u64) -> bool {
@@ -294,10 +303,29 @@ pub(crate) fn buffers(list: &HostList, to: u64, from: u64, len: u64) -> bool {
     if copier().is_none() || dispatches(&r).is_none() {
         return false;
     }
+    // Both ranges lie in their buffers (found), so neither end overflows.
+    let overlap = std::sync::Arc::ptr_eq(&src, &dst) && from < to + len && to < from + len;
+    let staged = if overlap {
+        let Some(staging) = staging(len) else {
+            return false;
+        };
+        Some(staging)
+    } else {
+        None
+    };
     src.refresh(list, from, len);
     dst.refresh(list, to, len);
     dst.gpu_writes(list, to, len);
-    record(list, src.base(), dst.base(), &r)
+    let Some(staging) = staged else {
+        return record(list, src.base(), dst.base(), &r);
+    };
+    crate::host::name(&staging, || format!("overlapping copy {len:#x}"));
+    list.keep(&staging);
+    // SAFETY: a live buffer; written as unordered access from the common
+    // state (a buffer's promotion), then read so.
+    let between = unsafe { staging.GetGPUVirtualAddress() };
+    record(list, src.base(), between, &Region::bytes(r.from, 0, len))
+        && record(list, between, dst.base(), &Region::bytes(0, r.to, len))
 }
 
 /// Where a texture-to-buffer copy writes in title memory: the first byte,
@@ -396,13 +424,19 @@ pub(crate) fn texture_to_buffer(
     }
     let slices = footprint.Footprint.Depth.max(1);
     let pitch = u64::from(footprint.Footprint.RowPitch);
-    let last = dst.at
-        + u64::from(slices - 1) * dst.slice_pitch
-        + u64::from(rows - 1) * dst.row_pitch
-        + row_bytes;
-    if last > dst.end {
+    // The title's pitches: checked, as everything it passes.
+    let last = u64::from(slices - 1)
+        .checked_mul(dst.slice_pitch)
+        .zip(u64::from(rows - 1).checked_mul(dst.row_pitch))
+        .and_then(|(s, r)| {
+            dst.at
+                .checked_add(s)?
+                .checked_add(r)?
+                .checked_add(row_bytes)
+        });
+    let Some(last) = last.filter(|&last| last <= dst.end) else {
         return Err("the copied box runs past the destination buffer");
-    }
+    };
     let len = last - dst.at;
     let shadow = crate::shadow::find(dst.at, len).ok_or("the destination has no host copy")?;
     let r = Region {
@@ -472,12 +506,13 @@ pub(crate) fn texture_to_buffer(
 }
 
 /// A buffer of `bytes` in GPU memory our passes can write, in the common
-/// state (as every buffer is created).
+/// state (as every buffer is created), rounded up to whole dwords: the
+/// pass reads the dword holding a copy's last byte.
 fn staging(bytes: u64) -> Option<ID3D12Resource> {
     let host = host()?;
     let desc = D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-        Width: bytes.max(4),
+        Width: bytes.max(4).next_multiple_of(4),
         Height: 1,
         DepthOrArraySize: 1,
         MipLevels: 1,
@@ -588,5 +623,35 @@ mod tests {
         );
         assert!(dispatches(&Region { rows: 70_000, ..r }).is_none());
         assert!(dispatches(&Region::bytes(0, 1 << 32, 4)).is_none());
+    }
+
+    /// What titles pass is checked before any arithmetic on it: pitches
+    /// whose products overflow and counts past a dispatch are refused, not
+    /// wrapped (or a panic in an exported method); the pass's dword reads
+    /// and writes past a copy's last byte stay within 32-bit offsets.
+    #[test]
+    fn title_sized_regions_are_refused_before_they_overflow() {
+        let r = Region {
+            rows: 65_535,
+            from_pitch: u64::MAX / 2,
+            ..Region::bytes(0, 0, 4)
+        };
+        assert!(dispatches(&r).is_none(), "the rows' span overflows");
+        let r = Region {
+            slices: 3,
+            to_slice: u64::MAX,
+            ..Region::bytes(0, 0, 4)
+        };
+        assert!(dispatches(&r).is_none(), "the slices' span overflows");
+        let r = Region {
+            rows: u32::MAX,
+            ..Region::bytes(0, 0, 4)
+        };
+        assert!(dispatches(&r).is_none(), "more rows than a dispatch has");
+        assert!(dispatches(&Region::bytes(u64::MAX - 1, 0, 4)).is_none());
+        let last = u64::from(u32::MAX) - 3;
+        assert!(dispatches(&Region::bytes(0, last - 4, 4)).is_some());
+        assert!(dispatches(&Region::bytes(0, last - 3, 4)).is_none());
+        assert!(dispatches(&Region::bytes(last - 3, 0, 4)).is_none());
     }
 }

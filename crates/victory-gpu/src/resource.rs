@@ -2615,7 +2615,8 @@ void main(uint3 id : SV_DispatchThreadID) { o.Store(id.x * 4, 0xC0DE0000u | id.x
 
     /// Copies over memory earlier lists' GPU work uses. Shaders write A, a
     /// later list copies W over A: as one part the copy runs first and the
-    /// shaders' bytes, copied back after, win; cut, the copy's. GPU work
+    /// shaders' bytes, copied back after, win where they differ from A's
+    /// old ones; cut, the copy's everywhere. GPU work
     /// reads Y into Z1, a later list copies X over Y, GPU work reads Y into
     /// Z2: as one part Y's host copy is brought up to date for the last
     /// reader before the first one runs, so both get X; cut, Z1 gets Y as
@@ -2645,7 +2646,14 @@ void main(uint3 id : SV_DispatchThreadID) { o.Store(id.x * 4, 0xC0DE0000u | id.x
                     &got[..8]
                 );
             } else {
-                assert_eq!(got, dwords(0..256), "one part: the shaders' bytes last");
+                // A mix: what is copied back is what the GPU changed from A's
+                // old bytes, over the copy's (0x11, dword 17's first byte, is
+                // the copy's 0x44 there).
+                let mixed: Vec<u8> = dwords(0..256)
+                    .into_iter()
+                    .map(|b| if b == 0x11 { 0x44 } else { b })
+                    .collect();
+                assert_eq!(got, mixed, "one part: the shaders' changes over the copy");
             }
 
             let (y, at_y) = filled(1024, 0x33);
@@ -2670,6 +2678,30 @@ void main(uint3 id : SV_DispatchThreadID) { o.Store(id.x * 4, 0xC0DE0000u | id.x
             let want = if cut { 0x33 } else { 0x44 };
             assert!(z1.iter().all(|&v| v == want), "Z1: {:02x?}", &z1[..8]);
         }
+    }
+
+    /// A copy inside one buffer whose ranges overlap, after shaders of its
+    /// list write the buffer (so on the GPU): a memory move, as on the CPU,
+    /// through a buffer of ours (one pass would read what its other threads
+    /// already wrote). Shaders write A's 256 dwords; the list copies A's
+    /// first 512 bytes 256 bytes on.
+    #[cfg(windows)]
+    #[test]
+    fn overlapping_copies_on_the_gpu_move_memory() {
+        if no_host_device() {
+            return;
+        }
+        let (a, at_a) = filled(1024, 0x11);
+        let mut lists = Lists::new();
+        let (list, host_list) = lists.list();
+        let copy = crate::shadow::find(at_a as u64, 1024).expect("A's host copy");
+        shaders_write(host_list, &copy, at_a, 1024);
+        title_copies(list, (a, 256), (a, 0), 512);
+        assert_eq!(lists.run_cut(true), 1);
+        let mut want = dwords(0..64);
+        want.extend(dwords(0..128));
+        want.extend(dwords(192..256));
+        assert_eq!(title_bytes(at_a, 1024), want);
     }
 
     /// With asynchronous queues the queue worker runs the submission, cut
