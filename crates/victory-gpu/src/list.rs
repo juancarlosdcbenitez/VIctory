@@ -254,6 +254,23 @@ extern "system" fn allocator_reset(_: This) -> HRESULT {
 extern "system" fn list_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
     object::answer(LIST, iid, object::is(iid, &LIST_IIDS).then_some(this), out)
 }
+/// A list the title releases while a queue still holds its submission back
+/// hands its upload memory to the held host list, as a reset does.
+#[cfg(windows)]
+impl Drop for List {
+    fn drop(&mut self) {
+        let blocks = std::mem::take(self.uploads.get_mut().unwrap_or_else(|e| e.into_inner()));
+        if let Some(held) = self
+            .host
+            .get_mut()
+            .as_ref()
+            .filter(|h| std::sync::Arc::strong_count(h) > 1)
+        {
+            held.keep_memory(blocks);
+        }
+    }
+}
+
 extern "system" fn list_release(this: This) -> u32 {
     object::release_boxed::<List>(this)
 }
@@ -1534,8 +1551,17 @@ mod tests {
         let own = host_list_shared(list).expect("a host list");
         assert_eq!(own.kept_memory(), 0);
         drop((own, held));
+        // Released while held: the held host list takes the memory too.
+        let p = allocate_upload(list, 16, 0x10);
+        // SAFETY: 16 bytes were handed out.
+        unsafe { p.write_bytes(0x5a, 16) };
+        let held = host_list_shared(list).expect("a host list");
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
+        assert_eq!(held.kept_memory(), 1);
+        // SAFETY: the held host list keeps the block alive.
+        let bytes = unsafe { std::slice::from_raw_parts(p, 16) };
+        assert!(bytes.iter().all(|&b| b == 0x5a));
         assert_eq!(release(allocator), 0);
     }
 }
