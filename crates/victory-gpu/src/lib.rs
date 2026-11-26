@@ -33,6 +33,8 @@ mod host;
 mod indirect;
 mod inflight;
 pub mod list;
+#[cfg(windows)]
+mod copy;
 #[cfg(any(windows, test))]
 mod merge;
 pub mod object;

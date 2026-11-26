@@ -1836,6 +1836,142 @@ mod tests {
         }
     }
 
+    /// Writes 256 dwords, `0xc0de0000 | index`, through the root UAV.
+    #[cfg(windows)]
+    const WRITER: &str = r#"
+#define RS "UAV(u0)"
+RWByteAddressBuffer o : register(u0);
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) { o.Store(id.x * 4, 0xC0DE0000u | id.x); }
+"#;
+
+    /// A buffer copy whose source shaders earlier in the same list write
+    /// (invariant C5): a compute pass writes buffer A, the title copies A to
+    /// B in the same list, and B must hold what the pass wrote. Copied on
+    /// the CPU at submission, as every copy was before, B gets A's bytes from
+    /// before the pass ran; the GPU copy gets the pass's. A's own title
+    /// memory gets the pass's bytes either way (copied back).
+    #[cfg(windows)]
+    #[test]
+    fn a_copy_reads_what_earlier_shaders_in_its_list_wrote() {
+        if crate::host::host().is_none() {
+            assert!(
+                !crate::warp::required(),
+                "VICTORY_WARP_REQUIRED=1, but the GPU layer has no host device"
+            );
+            return;
+        }
+        let written = |bytes: &[u8]| {
+            let (words, _) = bytes.as_chunks::<4>();
+            words
+                .iter()
+                .enumerate()
+                .all(|(i, w)| u32::from_le_bytes(*w) == 0xC0DE_0000 | i as u32)
+        };
+        let (a, b) = copy_after_a_shader_write(true);
+        assert!(written(&a), "the pass wrote A: {:02x?}", &a[..8]);
+        assert!(
+            b.iter().all(|&x| x == 0x11),
+            "on the CPU the copy took A's bytes from before the pass: {:02x?}",
+            &b[..8]
+        );
+        let (a, b) = copy_after_a_shader_write(false);
+        assert!(written(&a), "the pass wrote A: {:02x?}", &a[..8]);
+        assert!(
+            written(&b),
+            "the GPU copy took what the pass wrote: {:02x?}",
+            &b[..8]
+        );
+    }
+
+    /// Title buffers A (bytes 0x11) and B (0x22); a list in which our own
+    /// compute pass writes 1 KiB into A's host copy, declared written as a
+    /// title dispatch's writes are, then the title's CopyBufferRegion of A
+    /// to B (`cpu_copies`: on the CPU at submission, as before GPU copies);
+    /// submitted through a title queue and waited for. A's and B's title
+    /// memory afterwards.
+    #[cfg(windows)]
+    fn copy_after_a_shader_write(cpu_copies: bool) -> (Vec<u8>, Vec<u8>) {
+        let null = std::ptr::null();
+        let iid = &RESOURCE_IIDS[0];
+        let (mut a, mut b) = (null, null);
+        for (out, fill) in [(&mut a, 0x11u8), (&mut b, 0x22)] {
+            let desc = buffer(1024);
+            assert_eq!(
+                create_committed(null, &PROPERTIES, 0, &desc, 0, null.cast(), iid, out),
+                S_OK
+            );
+            let (data, _) = buffer_bytes(*out).unwrap();
+            // SAFETY: the buffer holds 1024 bytes.
+            unsafe { data.write_bytes(fill, 1024) };
+        }
+        let at = |r: This| buffer_bytes(r).unwrap().0 as u64;
+        let queue_iid = guid(
+            0x0ec870a6,
+            0x5d7e,
+            0x4c22,
+            [0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed],
+        );
+        let allocator_iid = guid(
+            0x6102dee4,
+            0xaf59,
+            0x4b09,
+            [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24],
+        );
+        let list_iid = guid(
+            0x5b160d0f,
+            0xac1b,
+            0x4185,
+            [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55],
+        );
+        let (mut queue, mut allocator, mut list) = (null, null, null);
+        let queue_desc = [0u32; 4];
+        assert_eq!(
+            crate::queue::create(null, queue_desc.as_ptr().cast(), &queue_iid, &mut queue),
+            S_OK
+        );
+        assert_eq!(
+            crate::list::create_allocator(null, 0, &allocator_iid, &mut allocator),
+            S_OK
+        );
+        assert_eq!(
+            crate::list::create_list(null, 0, 0, allocator, null, &list_iid, &mut list),
+            S_OK
+        );
+        let host_list = crate::list::host_list(list).expect("a host list");
+        let writer = crate::copy::compute(WRITER, windows::core::s!("writer")).expect("a writer");
+        let shadow = crate::shadow::find(at(a), 1024).expect("A's host copy");
+        // As a title dispatch writing A: A's data first, its writes declared.
+        shadow.refresh(host_list, at(a), 1024);
+        shadow.gpu_writes(host_list, at(a), 1024);
+        // SAFETY: an open list, our pipeline, a live host copy.
+        unsafe {
+            let l = &host_list.list;
+            l.SetComputeRootSignature(&writer.root);
+            l.SetPipelineState(&writer.pso);
+            l.SetComputeRootUnorderedAccessView(0, shadow.gpu(at(a)));
+            l.Dispatch(4, 1, 1);
+        }
+        host_list.keep(&writer.pso);
+        host_list.keep(&writer.root);
+        crate::list::CPU_COPIES_FOR_TESTS.set(cpu_copies);
+        type CopyBuffer = extern "system" fn(This, This, u64, This, u64, u64);
+        slot::<CopyBuffer>(list, 0x78)(list, b, 0, a, 0, 1024);
+        crate::list::CPU_COPIES_FOR_TESTS.set(false);
+        assert_eq!(
+            slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list),
+            S_OK
+        );
+        slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
+        let read = |r: This| {
+            let (data, _) = buffer_bytes(r).unwrap();
+            // SAFETY: the buffer holds 1024 bytes; its submission has run.
+            unsafe { std::slice::from_raw_parts(data, 1024) }.to_vec()
+        };
+        (read(a), read(b))
+    }
+
     #[test]
     fn committed_and_placed_resources_map_at_their_gpu_address() {
         let null = std::ptr::null();

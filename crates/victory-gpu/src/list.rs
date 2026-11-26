@@ -474,7 +474,11 @@ fn buffer_range(buffer: This, offset: u64, len: u64) -> Option<*mut u8> {
     Some(unsafe { data.add(offset as usize) })
 }
 
-/// Buffer to buffer: both are host memory, copied at submission.
+/// Buffer to buffer: both are title memory, copied on the CPU when the list
+/// is submitted, in order with the list's other CPU work (fills of upload
+/// memory read what it copied), unless shaders recorded earlier in the list
+/// write the source: then the GPU copies it between the host copies, after
+/// them (`copy`, invariant C5).
 extern "system" fn copy_buffer_region(
     this: This,
     dst: This,
@@ -484,14 +488,52 @@ extern "system" fn copy_buffer_region(
     len: u64,
 ) {
     #[cfg(windows)]
-    if let Some(list) = host_list(this)
-        && let Some(to) = buffer_range(dst, dst_offset, len)
-        && let Some(from) = buffer_range(src, src_offset, len)
-    {
-        list.defer_copy(to, from, len as usize);
-    }
+    with_state(this, |list, state| {
+        if let (Some(to), Some(from)) = (
+            buffer_range(dst, dst_offset, len),
+            buffer_range(src, src_offset, len),
+        ) {
+            copy_buffer(list, state, to, from, len);
+        }
+    });
     #[cfg(not(windows))]
     let _ = (this, dst, dst_offset, src, src_offset, len);
+}
+
+/// Copies `len` bytes of title memory from `from` to `to` (see
+/// [`copy_buffer_region`]).
+#[cfg(windows)]
+fn copy_buffer(
+    list: &crate::host::HostList,
+    state: &mut crate::draw::State,
+    to: *mut u8,
+    from: *mut u8,
+    len: u64,
+) {
+    let gpu = !cpu_copies_only()
+        && list.shaders_write(from as usize, len as usize)
+        && crate::copy::buffers(list, to as u64, from as u64, len);
+    if gpu {
+        state.forget_compute_binding();
+    } else {
+        list.defer_copy(to, from, len as usize);
+    }
+}
+
+#[cfg(all(test, windows))]
+thread_local! {
+    /// Copies always on the CPU (the behaviour before GPU copies), for the
+    /// calls of one test's thread: to show what it gets wrong.
+    pub(crate) static CPU_COPIES_FOR_TESTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(windows)]
+fn cpu_copies_only() -> bool {
+    #[cfg(test)]
+    if CPU_COPIES_FOR_TESTS.get() {
+        return true;
+    }
+    false
 }
 
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
@@ -518,7 +560,9 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
         ) {
-            list.defer_copy(to, from, a.min(b) as usize);
+            with_state(this, |list, state| {
+                copy_buffer(list, state, to, from, a.min(b))
+            });
         }
     }
     #[cfg(not(windows))]

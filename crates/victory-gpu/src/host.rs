@@ -443,6 +443,10 @@ pub(crate) struct HostList {
     /// upload blocks of a title list reset while a queue held this host
     /// list's submission back (`list::reset`), kept until it is dropped.
     memory: Mutex<Vec<Vec<u8>>>,
+    /// Title ranges `[start, end)` its shaders write, as recorded so far: a
+    /// copy recorded after them that reads one runs on the GPU, in order
+    /// (`copy`).
+    gpu_written: Mutex<Vec<(usize, usize)>>,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -633,6 +637,7 @@ impl Host {
                 budget: OnceLock::new(),
                 slots: Mutex::default(),
                 memory: Mutex::default(),
+                gpu_written: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -1049,6 +1054,10 @@ impl HostList {
     /// for).
     pub(crate) fn reset(&self) {
         self.give_back_slots();
+        self.gpu_written
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         self.memory
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1262,6 +1271,22 @@ impl HostList {
         self.deferred()
             .copies
             .push(Step::GpuWrite(shadow.clone(), address, len));
+        let range = (address, address + len);
+        let mut written = self.gpu_written.lock().unwrap_or_else(|e| e.into_inner());
+        if !written.contains(&range) {
+            written.push(range);
+        }
+    }
+
+    /// Whether shaders recorded in the list so far write any byte of
+    /// `[address, address + len)` of title memory.
+    pub(crate) fn shaders_write(&self, address: usize, len: usize) -> bool {
+        let end = address.saturating_add(len);
+        self.gpu_written
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|&(a, e)| a < end && address < e)
     }
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.

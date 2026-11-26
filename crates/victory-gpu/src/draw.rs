@@ -156,6 +156,13 @@ fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
 }
 
 impl State {
+    /// A pass of ours (a GPU copy) set the list's compute root signature
+    /// and pipeline: the next draw or dispatch binds the title's again.
+    pub(crate) fn forget_compute_binding(&mut self) {
+        self.host_pipeline = 0;
+        self.host_roots[1] = 0;
+    }
+
     pub(crate) fn reset(&mut self, pipeline: This) {
         *self = State::default();
         self.pipeline = pipeline as usize;
