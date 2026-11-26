@@ -2680,6 +2680,167 @@ void main(uint3 id : SV_DispatchThreadID) { o.Store(id.x * 4, 0xC0DE0000u | id.x
         }
     }
 
+    /// A title RGBA8 texture made from `desc`, its subresources filled
+    /// through a title buffer (each `(subresource, footprint)` of `fills`
+    /// from texels `texel(subresource, x, y, z)`), then the copies `reads`
+    /// (subresource, box or none, destination footprint) made into a title
+    /// buffer of `len` bytes of 0x33, all in one list: that buffer after.
+    #[cfg(windows)]
+    fn texture_reads(
+        desc: &ResourceDesc,
+        fills: &[(u32, PlacedFootprint)],
+        texel: impl Fn(u32, u32, u32, u32) -> [u8; 4],
+        reads: &[(u32, Option<[u32; 6]>, PlacedFootprint)],
+        len: u64,
+    ) -> Vec<u8> {
+        let null = std::ptr::null();
+        const COPY_DEST: u32 = 0x400;
+        let iid = &RESOURCE_IIDS[0];
+        let mut image = null;
+        assert_eq!(
+            create_committed(
+                null,
+                &PROPERTIES,
+                0,
+                desc,
+                COPY_DEST,
+                null.cast(),
+                iid,
+                &mut image
+            ),
+            S_OK
+        );
+        let bytes: u64 = fills
+            .iter()
+            .map(|(_, f)| f.offset + f.bytes().unwrap())
+            .max()
+            .unwrap();
+        let (source, at_source) = filled(bytes, 0);
+        for &(s, f) in fills {
+            for z in 0..f.depth {
+                for y in 0..f.height {
+                    for x in 0..f.width {
+                        let (at, _, _) = f.texel(x, y, z).unwrap();
+                        let to = (at_source + at as usize) as *mut [u8; 4];
+                        // SAFETY: inside the source buffer (its footprints' bytes).
+                        unsafe { to.write(texel(s, x, y, z)) };
+                    }
+                }
+            }
+        }
+        let (down, at_down) = filled(len, 0x33);
+        let mut lists = Lists::new();
+        let (list, _) = lists.list();
+        type Copy = extern "system" fn(This, *const At, u32, u32, u32, *const At, *const u32);
+        let copy = slot::<Copy>(list, 0x80);
+        let index = |s: u32| At {
+            resource: image,
+            kind: 0,
+            footprint: PlacedFootprint {
+                offset: u64::from(s),
+                ..NO_FOOTPRINT
+            },
+        };
+        let rows = |resource: This, footprint: PlacedFootprint| At {
+            resource,
+            kind: 1,
+            footprint,
+        };
+        for &(s, f) in fills {
+            copy(list, &index(s), 0, 0, 0, &rows(source, f), null.cast());
+        }
+        for (s, area, f) in reads {
+            let area = area.as_ref().map_or(null.cast(), |a| a.as_ptr());
+            copy(list, &rows(down, *f), 0, 0, 0, &index(*s), area);
+        }
+        assert_eq!(lists.run_cut(true), 1);
+        title_bytes(at_down, len as usize)
+    }
+
+    /// RGBA8 rows of `width` x `height` (x `depth`) at `offset`, pitched 256.
+    #[cfg(windows)]
+    fn rgba_rows(offset: u64, (width, height, depth): (u32, u32, u32)) -> PlacedFootprint {
+        PlacedFootprint {
+            offset,
+            format: 28,
+            width,
+            height,
+            depth,
+            row_pitch: 256,
+        }
+    }
+
+    /// Texture to buffer from other mips and array slices: an 8x8 RGBA8
+    /// texture of two slices and two mips whose subresource s (mip s % 2 of
+    /// slice s / 2) holds texel (x, y) as `[s, x, y, 0xee]`. Texels 1..3 x
+    /// 1..4 of subresource 3 (mip 1 of slice 1) and all of subresource 1
+    /// (mip 1 of slice 0) are copied into a buffer of 0x33: exactly those
+    /// texels at their places.
+    #[cfg(windows)]
+    #[test]
+    fn texture_regions_of_other_mips_and_slices_reach_title_buffers() {
+        if no_host_device() {
+            return;
+        }
+        let desc = ResourceDesc {
+            depth_or_array_size: 2,
+            ..texture(8, 8, 28, 2)
+        };
+        let fills: Vec<(u32, PlacedFootprint)> = (0..4u32)
+            .map(|s| {
+                let side = if s % 2 == 0 { 8 } else { 4 };
+                (s, rgba_rows(u64::from(s) * 2048, (side, side, 1)))
+            })
+            .collect();
+        let texel = |s: u32, x: u32, y: u32, _: u32| [s as u8, x as u8, y as u8, 0xEE];
+        let reads = [
+            (3, Some([1, 1, 0, 3, 4, 1]), rgba_rows(256, (2, 3, 1))),
+            (1, None, rgba_rows(2048, (4, 4, 1))),
+        ];
+        let got = texture_reads(&desc, &fills, texel, &reads, 4096);
+        let mut want = vec![0x33u8; 4096];
+        for (y, x) in (1..4u8).flat_map(|y| (1..3u8).map(move |x| (y, x))) {
+            let at = 256 + usize::from(y - 1) * 256 + usize::from(x - 1) * 4;
+            want[at..at + 4].copy_from_slice(&[3, x, y, 0xEE]);
+        }
+        for (y, x) in (0..4u8).flat_map(|y| (0..4u8).map(move |x| (y, x))) {
+            let at = 2048 + usize::from(y) * 256 + usize::from(x) * 4;
+            want[at..at + 4].copy_from_slice(&[1, x, y, 0xEE]);
+        }
+        assert_eq!(got, want);
+    }
+
+    /// Texture to buffer from a box of depth slices: a 4x4x4 RGBA8 3D
+    /// texture whose texel (x, y, z) holds `[x, y, z, 0xd3]`; slices 1..3
+    /// are copied to a footprint of two 4x4 slices (slice pitch 1024): each
+    /// slice at its place, every other byte kept.
+    #[cfg(windows)]
+    #[test]
+    fn depth_slices_of_volume_textures_reach_title_buffers() {
+        if no_host_device() {
+            return;
+        }
+        let desc = ResourceDesc {
+            dimension: 4,
+            depth_or_array_size: 4,
+            ..texture(4, 4, 28, 1)
+        };
+        let texel = |_: u32, x: u32, y: u32, z: u32| [x as u8, y as u8, z as u8, 0xD3];
+        let fills = [(0, rgba_rows(0, (4, 4, 4)))];
+        let reads = [(0, Some([0, 0, 1, 4, 4, 3]), rgba_rows(0, (4, 4, 2)))];
+        let got = texture_reads(&desc, &fills, texel, &reads, 4096);
+        let mut want = vec![0x33u8; 4096];
+        for z in 0..2u8 {
+            for y in 0..4u8 {
+                for x in 0..4u8 {
+                    let at = usize::from(z) * 1024 + usize::from(y) * 256 + usize::from(x) * 4;
+                    want[at..at + 4].copy_from_slice(&[x, y, z + 1, 0xD3]);
+                }
+            }
+        }
+        assert_eq!(got, want);
+    }
+
     /// A copy inside one buffer whose ranges overlap, after shaders of its
     /// list write the buffer (so on the GPU): a memory move, as on the CPU,
     /// through a buffer of ours (one pass would read what its other threads
