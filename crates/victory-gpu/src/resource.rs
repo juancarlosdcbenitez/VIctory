@@ -332,6 +332,21 @@ impl PlacedFootprint {
         let last = u64::from(self.width).div_ceil(block) * element;
         Some(u64::from(self.row_pitch) * lines.saturating_sub(1) + last)
     }
+
+    /// Where the element holding texel `(x, y, z)` starts in the buffer, and
+    /// the footprint's row and slice pitches (a slice is the footprint's
+    /// rows of elements, blocks for block-compressed formats). `None` for a
+    /// format whose element size is not known.
+    pub(crate) fn texel(&self, x: u32, y: u32, z: u32) -> Option<(u64, u64, u64)> {
+        let (element, block) = element(self.format)?;
+        let row_pitch = u64::from(self.row_pitch);
+        let slice_pitch = row_pitch * u64::from(self.height).div_ceil(block);
+        let at = self.offset
+            + u64::from(z) * slice_pitch
+            + u64::from(y) / block * row_pitch
+            + u64::from(x) / block * element;
+        Some((at, row_pitch, slice_pitch))
+    }
 }
 const _: () = assert!(size_of::<PlacedFootprint>() == 32);
 
@@ -1970,6 +1985,225 @@ void main(uint3 id : SV_DispatchThreadID) { o.Store(id.x * 4, 0xC0DE0000u | id.x
             unsafe { std::slice::from_raw_parts(data, 1024) }.to_vec()
         };
         (read(a), read(b))
+    }
+
+    /// A copy location as titles pass it (the host's layout).
+    #[cfg(windows)]
+    #[repr(C)]
+    struct At {
+        resource: This,
+        kind: u32,
+        footprint: PlacedFootprint,
+    }
+
+    /// A title texture made from `desc`, filled from `source` (a title
+    /// buffer laid out as `up`) and copied back, the `area` box of it, into
+    /// a title buffer of `len` bytes of 0x33 at texel `xyz` of footprint
+    /// `down`, in one list submitted through a title queue: that buffer's
+    /// title memory afterwards.
+    #[cfg(windows)]
+    fn texture_round_trip(
+        desc: &ResourceDesc,
+        (up, source): (PlacedFootprint, &[u8]),
+        (down, xyz, area): (PlacedFootprint, (u32, u32, u32), [u32; 6]),
+        len: u64,
+    ) -> Vec<u8> {
+        let null = std::ptr::null();
+        let iid = &RESOURCE_IIDS[0];
+        const COPY_DEST: u32 = 0x400;
+        let (mut image, mut from, mut to) = (null, null, null);
+        assert_eq!(
+            create_committed(
+                null,
+                &PROPERTIES,
+                0,
+                desc,
+                COPY_DEST,
+                null.cast(),
+                iid,
+                &mut image
+            ),
+            S_OK
+        );
+        for (out, bytes) in [(&mut from, source.len() as u64), (&mut to, len)] {
+            let d = buffer(bytes);
+            assert_eq!(
+                create_committed(null, &PROPERTIES, 0, &d, 0, null.cast(), iid, out),
+                S_OK
+            );
+        }
+        let (data, _) = buffer_bytes(from).unwrap();
+        // SAFETY: the buffer holds the source's bytes.
+        unsafe { std::ptr::copy_nonoverlapping(source.as_ptr(), data, source.len()) };
+        let (data, _) = buffer_bytes(to).unwrap();
+        // SAFETY: the buffer holds `len` bytes.
+        unsafe { data.write_bytes(0x33, len as usize) };
+        let queue_iid = guid(
+            0x0ec870a6,
+            0x5d7e,
+            0x4c22,
+            [0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed],
+        );
+        let allocator_iid = guid(
+            0x6102dee4,
+            0xaf59,
+            0x4b09,
+            [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24],
+        );
+        let list_iid = guid(
+            0x5b160d0f,
+            0xac1b,
+            0x4185,
+            [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55],
+        );
+        let (mut queue, mut allocator, mut list) = (null, null, null);
+        let queue_desc = [0u32; 4];
+        assert_eq!(
+            crate::queue::create(null, queue_desc.as_ptr().cast(), &queue_iid, &mut queue),
+            S_OK
+        );
+        assert_eq!(
+            crate::list::create_allocator(null, 0, &allocator_iid, &mut allocator),
+            S_OK
+        );
+        assert_eq!(
+            crate::list::create_list(null, 0, 0, allocator, null, &list_iid, &mut list),
+            S_OK
+        );
+        let subresource = PlacedFootprint {
+            offset: 0,
+            ..NO_FOOTPRINT
+        };
+        type Copy = extern "system" fn(This, *const At, u32, u32, u32, *const At, *const u32);
+        let copy = slot::<Copy>(list, 0x80);
+        let upload = (
+            At {
+                resource: image,
+                kind: 0,
+                footprint: subresource,
+            },
+            At {
+                resource: from,
+                kind: 1,
+                footprint: up,
+            },
+        );
+        copy(list, &upload.0, 0, 0, 0, &upload.1, null.cast());
+        let back = (
+            At {
+                resource: to,
+                kind: 1,
+                footprint: down,
+            },
+            At {
+                resource: image,
+                kind: 0,
+                footprint: subresource,
+            },
+        );
+        let (x, y, z) = xyz;
+        copy(list, &back.0, x, y, z, &back.1, area.as_ptr());
+        assert_eq!(
+            slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list),
+            S_OK
+        );
+        slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
+        let (data, _) = buffer_bytes(to).unwrap();
+        // SAFETY: the buffer holds `len` bytes; its submission has run.
+        unsafe { std::slice::from_raw_parts(data, len as usize) }.to_vec()
+    }
+
+    /// Texture to buffer: an 8x4 RGBA8 texture whose texel (x, y) holds
+    /// `[x, y, 0xa0 + x, 0xb0 + y]`; texels 2..6 x 1..3 of it are copied to
+    /// texel (1, 1) of a footprint at offset 512 (row pitch 256) in a buffer
+    /// of 0x33: exactly those rows, at those places, are written; every
+    /// other byte keeps 0x33.
+    #[cfg(windows)]
+    #[test]
+    fn texture_regions_reach_title_buffers() {
+        if crate::host::host().is_none() {
+            assert!(
+                !crate::warp::required(),
+                "VICTORY_WARP_REQUIRED=1, but the GPU layer has no host device"
+            );
+            return;
+        }
+        let texel = |x: usize, y: usize| [x as u8, y as u8, 0xA0 + x as u8, 0xB0 + y as u8];
+        let up = PlacedFootprint {
+            offset: 0,
+            format: 28,
+            width: 8,
+            height: 4,
+            depth: 1,
+            row_pitch: 256,
+        };
+        let mut source = vec![0u8; 1024];
+        for y in 0..4 {
+            for x in 0..8 {
+                source[y * 256 + x * 4..][..4].copy_from_slice(&texel(x, y));
+            }
+        }
+        let down = PlacedFootprint { offset: 512, ..up };
+        let out = texture_round_trip(
+            &texture(8, 4, 28, 1),
+            (up, &source),
+            (down, (1, 1, 0), [2, 1, 0, 6, 3, 1]),
+            2048,
+        );
+        let mut want = vec![0x33u8; 2048];
+        for y in 1..3 {
+            for x in 1..5 {
+                want[512 + y * 256 + x * 4..][..4].copy_from_slice(&texel(x + 1, y));
+            }
+        }
+        for (i, (&got, &w)) in out.iter().zip(&want).enumerate() {
+            assert_eq!(got, w, "byte {i:#x}");
+        }
+    }
+
+    /// Texture to buffer in a block-compressed format: an 8x8 BC1 texture
+    /// whose block (bx, by) holds `[bx, by, 0xc0, ..., 0xc5]`; the box of
+    /// texels 4..8 x 0..8 (block column 1, both block rows) goes to a
+    /// footprint at offset 1024: two 8-byte blocks, a row pitch apart.
+    #[cfg(windows)]
+    #[test]
+    fn compressed_texture_regions_reach_title_buffers() {
+        if crate::host::host().is_none() {
+            assert!(
+                !crate::warp::required(),
+                "VICTORY_WARP_REQUIRED=1, but the GPU layer has no host device"
+            );
+            return;
+        }
+        let block = |bx: usize, by: usize| [bx as u8, by as u8, 0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5];
+        let up = PlacedFootprint {
+            offset: 0,
+            format: 71,
+            width: 8,
+            height: 8,
+            depth: 1,
+            row_pitch: 256,
+        };
+        let mut source = vec![0u8; 1024];
+        for by in 0..2 {
+            for bx in 0..2 {
+                source[by * 256 + bx * 8..][..8].copy_from_slice(&block(bx, by));
+            }
+        }
+        let down = PlacedFootprint { offset: 1024, ..up };
+        let out = texture_round_trip(
+            &texture(8, 8, 71, 1),
+            (up, &source),
+            (down, (0, 0, 0), [4, 0, 0, 8, 8, 1]),
+            2048,
+        );
+        let mut want = vec![0x33u8; 2048];
+        for by in 0..2 {
+            want[1024 + by * 256..][..8].copy_from_slice(&block(1, by));
+        }
+        for (i, (&got, &w)) in out.iter().zip(&want).enumerate() {
+            assert_eq!(got, w, "byte {i:#x}");
+        }
     }
 
     #[test]

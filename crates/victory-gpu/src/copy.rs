@@ -300,6 +300,219 @@ pub(crate) fn buffers(list: &HostList, to: u64, from: u64, len: u64) -> bool {
     record(list, src.base(), dst.base(), &r)
 }
 
+/// Where a texture-to-buffer copy writes in title memory: the first byte,
+/// the destination footprint's row and slice pitches, and the end of the
+/// title buffer (nothing is written past it).
+pub(crate) struct Destination {
+    pub(crate) at: u64,
+    pub(crate) row_pitch: u64,
+    pub(crate) slice_pitch: u64,
+    pub(crate) end: u64,
+}
+
+/// Records the copy of `subresource` of the host `texture` (within `area`,
+/// a box as left, top, front, right, bottom, back; all of it if `None`) into
+/// title memory laid out as `dst` says. The GPU copies the texture into a
+/// staging buffer of ours at a host footprint (pitches the host accepts,
+/// block rows for block-compressed formats), then our pass moves its rows
+/// to the title buffer's host copy at the title's pitches; that range is
+/// brought up to date first and declared GPU-written, so the copied bytes
+/// reach title memory after the submission. The texture must already be in
+/// the copy source state. Err, with nothing recorded, says what it cannot
+/// copy.
+pub(crate) fn texture_to_buffer(
+    list: &HostList,
+    texture: &ID3D12Resource,
+    subresource: u32,
+    area: Option<[u32; 6]>,
+    dst: &Destination,
+) -> Result<(), &'static str> {
+    let device = &host().ok_or("no host device")?.device;
+    // SAFETY: a live texture.
+    let desc = unsafe { texture.GetDesc() };
+    let three_d = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    let mips = u32::from(desc.MipLevels.max(1));
+    let layers = if three_d {
+        1
+    } else {
+        u32::from(desc.DepthOrArraySize.max(1))
+    };
+    let mip = subresource % mips;
+    let plane = subresource / (mips * layers);
+    let size = |n: u64| u32::try_from((n >> mip).max(1)).unwrap_or(u32::MAX);
+    let whole = [
+        0,
+        0,
+        0,
+        size(desc.Width),
+        size(u64::from(desc.Height)),
+        if three_d {
+            size(u64::from(desc.DepthOrArraySize))
+        } else {
+            1
+        },
+    ];
+    let [left, top, front, right, bottom, back] = area.unwrap_or(whole);
+    if right <= left || bottom <= top || back <= front {
+        return Ok(());
+    }
+    // The box as a texture of its own: its footprint is the staging layout.
+    let part = D3D12_RESOURCE_DESC {
+        Dimension: desc.Dimension,
+        Alignment: 0,
+        Width: u64::from(right - left),
+        Height: bottom - top,
+        DepthOrArraySize: if three_d {
+            u16::try_from(back - front).map_err(|_| "a box too deep")?
+        } else {
+            1
+        },
+        MipLevels: 1,
+        Format: desc.Format,
+        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+        Flags: D3D12_RESOURCE_FLAG_NONE,
+    };
+    let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+    let (mut rows, mut row_bytes, mut total) = (0u32, 0u64, 0u64);
+    // SAFETY: outputs for one subresource.
+    unsafe {
+        device.GetCopyableFootprints(
+            &part,
+            plane,
+            1,
+            0,
+            Some(&mut footprint),
+            Some(&mut rows),
+            Some(&mut row_bytes),
+            Some(&mut total),
+        );
+    }
+    if rows == 0 || row_bytes == 0 || total == 0 || total == u64::MAX {
+        return Err("the host has no footprint for the copied box");
+    }
+    let slices = footprint.Footprint.Depth.max(1);
+    let pitch = u64::from(footprint.Footprint.RowPitch);
+    let last = dst.at
+        + u64::from(slices - 1) * dst.slice_pitch
+        + u64::from(rows - 1) * dst.row_pitch
+        + row_bytes;
+    if last > dst.end {
+        return Err("the copied box runs past the destination buffer");
+    }
+    let len = last - dst.at;
+    let shadow = crate::shadow::find(dst.at, len).ok_or("the destination has no host copy")?;
+    let r = Region {
+        from: 0,
+        to: shadow.offset(dst.at),
+        bytes: row_bytes,
+        rows,
+        slices,
+        from_pitch: pitch,
+        to_pitch: dst.row_pitch,
+        from_slice: pitch * u64::from(rows),
+        to_slice: dst.slice_pitch,
+    };
+    if copier().is_none() {
+        return Err("no GPU copy pass");
+    }
+    if dispatches(&r).is_none() {
+        return Err("destination rows that do not start on dwords, or too many of them");
+    }
+    let staging = staging(total).ok_or("no staging buffer")?;
+    crate::host::name(&staging, || format!("texture readback {total:#x}"));
+    list.keep(&staging);
+    shadow.refresh(list, dst.at, len);
+    shadow.gpu_writes(list, dst.at, len);
+    let from = D3D12_TEXTURE_COPY_LOCATION {
+        // SAFETY: borrowed for the call; the caller's list keeps the texture.
+        pResource: unsafe { std::mem::transmute_copy(texture) },
+        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+            SubresourceIndex: subresource,
+        },
+    };
+    let to = D3D12_TEXTURE_COPY_LOCATION {
+        // SAFETY: borrowed for the call; the list keeps the buffer.
+        pResource: unsafe { std::mem::transmute_copy(&staging) },
+        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+            PlacedFootprint: footprint,
+        },
+    };
+    let area = D3D12_BOX {
+        left,
+        top,
+        front,
+        right,
+        bottom,
+        back,
+    };
+    // SAFETY: an open list; a live texture in the copy source state and our
+    // buffer, promoted from the common state by the copy, then moved on.
+    unsafe {
+        list.list
+            .CopyTextureRegion(&to, 0, 0, 0, &from, Some(&area));
+        list.list.ResourceBarrier(&[crate::host::transition(
+            &staging,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        )]);
+    }
+    // SAFETY: a live buffer.
+    let from = unsafe { staging.GetGPUVirtualAddress() };
+    if record(list, from, shadow.base(), &r) {
+        Ok(())
+    } else {
+        Err("no GPU copy pass")
+    }
+}
+
+/// A buffer of `bytes` in GPU memory our passes can write, in the common
+/// state (as every buffer is created).
+fn staging(bytes: u64) -> Option<ID3D12Resource> {
+    let host = host()?;
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: bytes.max(4),
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        ..Default::default()
+    };
+    let mut buffer: Option<ID3D12Resource> = None;
+    // SAFETY: plain creation.
+    let made = unsafe {
+        host.device.CreateCommittedResource(
+            &D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_DEFAULT,
+                ..Default::default()
+            },
+            D3D12_HEAP_FLAG_NONE,
+            &desc,
+            D3D12_RESOURCE_STATE_COMMON,
+            None,
+            &mut buffer,
+        )
+    };
+    match made {
+        Ok(()) => buffer,
+        Err(e) => {
+            tracing::warn!(error = %e, bytes, "no staging buffer");
+            None
+        }
+    }
+}
+
 fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
     D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,

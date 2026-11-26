@@ -584,8 +584,9 @@ pub(crate) struct CopyLocation {
 }
 
 /// Texture to texture on the GPU; buffer to texture through an upload
-/// buffer filled at submission. Texture to buffer (read back) is not done
-/// yet.
+/// buffer filled at submission; texture to buffer on the GPU into the
+/// buffer's host copy, back in title memory after the submission
+/// ([`texture_to_buffer`]).
 extern "system" fn copy_texture_region(
     this: This,
     dst: *const CopyLocation,
@@ -609,8 +610,11 @@ extern "system" fn copy_texture_region(
             return;
         };
         let Some(to) = crate::resource::host_resource(dst.resource) else {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!("texture to buffer copies not implemented"));
+            if dst.kind == FOOTPRINT && src.kind != FOOTPRINT {
+                texture_to_buffer(this, list, &dst, (x, y, z), &src, source_box);
+            } else {
+                copy_refused("a texture region copy into a resource with no host texture");
+            }
             return;
         };
         let mut from = src;
@@ -696,6 +700,66 @@ extern "system" fn copy_texture_region(
 }
 
 #[allow(clippy::too_many_arguments)] // the method's own arguments
+/// A texture subresource (in `source_box`, or all of it) into a title buffer
+/// laid out as `dst`'s footprint says, from texel `(x, y, z)` of it: the
+/// host texture is brought up to date and copied on the GPU, in order with
+/// the list's work (`copy::texture_to_buffer`). What cannot be copied is
+/// logged, never dropped unseen.
+#[cfg(windows)]
+fn texture_to_buffer(
+    this: This,
+    list: &crate::host::HostList,
+    dst: &CopyLocation,
+    (x, y, z): (u32, u32, u32),
+    src: &CopyLocation,
+    source_box: *const [u32; 6],
+) {
+    let Some(texture) = crate::resource::host_resource(src.resource) else {
+        copy_refused("a texture-to-buffer copy from a texture with no host copy");
+        return;
+    };
+    let Some((buffer, size)) = crate::resource::buffer_bytes(dst.resource) else {
+        copy_refused("a texture-to-buffer copy into no buffer");
+        return;
+    };
+    let Some((at, row_pitch, slice_pitch)) = dst.footprint.texel(x, y, z) else {
+        copy_refused("a texture-to-buffer copy in a format of unknown size");
+        return;
+    };
+    if crate::texture::title_written(texture) {
+        crate::texture::upload(list, src.resource, texture);
+    }
+    ensure_state(list, src.resource, COPY_SOURCE);
+    // SAFETY: the title passes a box or null.
+    let area = (!source_box.is_null()).then(|| unsafe { source_box.read_unaligned() });
+    let to = crate::copy::Destination {
+        at: buffer as u64 + at,
+        row_pitch,
+        slice_pitch,
+        end: buffer as u64 + size,
+    };
+    // The subresource index sits where a footprint's offset would.
+    let subresource = src.footprint.offset as u32;
+    match crate::copy::texture_to_buffer(list, texture, subresource, area, &to) {
+        Ok(()) => with_state(this, |_, state| state.forget_compute_binding()),
+        Err(why) => copy_refused(why),
+    }
+}
+
+/// A copy the host cannot make: counted, and logged the first time for each
+/// reason.
+#[cfg(windows)]
+fn copy_refused(why: &'static str) {
+    static SEEN: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+    static REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !seen.contains(&why) {
+        seen.push(why);
+        tracing::warn!(refused_so_far = n, "a copy not made: {why}");
+    }
+}
+
 extern "system" fn copy_texture_region_x(
     this: This,
     dst: *const CopyLocation,
