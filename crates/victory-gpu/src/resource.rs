@@ -1884,30 +1884,34 @@ void main(uint3 id : SV_DispatchThreadID) { o.Store(id.x * 4, 0xC0DE0000u | id.x
                 .enumerate()
                 .all(|(i, w)| u32::from_le_bytes(*w) == 0xC0DE_0000 | i as u32)
         };
-        let (a, b) = copy_after_a_shader_write(true);
-        assert!(written(&a), "the pass wrote A: {:02x?}", &a[..8]);
-        assert!(
-            b.iter().all(|&x| x == 0x11),
-            "on the CPU the copy took A's bytes from before the pass: {:02x?}",
-            &b[..8]
-        );
-        let (a, b) = copy_after_a_shader_write(false);
-        assert!(written(&a), "the pass wrote A: {:02x?}", &a[..8]);
-        assert!(
-            written(&b),
-            "the GPU copy took what the pass wrote: {:02x?}",
-            &b[..8]
-        );
+        // CopyBufferRegion, then CopyMemoryToMemoryX (title addresses).
+        for memory in [false, true] {
+            let (a, b) = copy_after_a_shader_write(true, memory);
+            assert!(written(&a), "the pass wrote A: {:02x?}", &a[..8]);
+            assert!(
+                b.iter().all(|&x| x == 0x11),
+                "on the CPU the copy took A's bytes from before the pass: {:02x?}",
+                &b[..8]
+            );
+            let (a, b) = copy_after_a_shader_write(false, memory);
+            assert!(written(&a), "the pass wrote A: {:02x?}", &a[..8]);
+            assert!(
+                written(&b),
+                "the GPU copy took what the pass wrote: {:02x?}",
+                &b[..8]
+            );
+        }
     }
 
     /// Title buffers A (bytes 0x11) and B (0x22); a list in which our own
     /// compute pass writes 1 KiB into A's host copy, declared written as a
-    /// title dispatch's writes are, then the title's CopyBufferRegion of A
-    /// to B (`cpu_copies`: on the CPU at submission, as before GPU copies);
-    /// submitted through a title queue and waited for. A's and B's title
-    /// memory afterwards.
+    /// title dispatch's writes are, then the title's copy of A to B,
+    /// CopyBufferRegion or (`memory`) CopyMemoryToMemoryX of their
+    /// addresses (`cpu_copies`: on the CPU at submission, as before GPU
+    /// copies); submitted through a title queue and waited for. A's and B's
+    /// title memory afterwards.
     #[cfg(windows)]
-    fn copy_after_a_shader_write(cpu_copies: bool) -> (Vec<u8>, Vec<u8>) {
+    fn copy_after_a_shader_write(cpu_copies: bool, memory: bool) -> (Vec<u8>, Vec<u8>) {
         let null = std::ptr::null();
         let iid = &RESOURCE_IIDS[0];
         let (mut a, mut b) = (null, null);
@@ -1971,8 +1975,13 @@ void main(uint3 id : SV_DispatchThreadID) { o.Store(id.x * 4, 0xC0DE0000u | id.x
         host_list.keep(&writer.pso);
         host_list.keep(&writer.root);
         crate::list::CPU_COPIES_FOR_TESTS.set(cpu_copies);
-        type CopyBuffer = extern "system" fn(This, This, u64, This, u64, u64);
-        slot::<CopyBuffer>(list, 0x78)(list, b, 0, a, 0, 1024);
+        if memory {
+            type CopyMemory = extern "system" fn(This, u64, u64, u64, u32);
+            slot::<CopyMemory>(list, 0x1e0)(list, at(b), at(a), 1024, 0);
+        } else {
+            type CopyBuffer = extern "system" fn(This, This, u64, This, u64, u64);
+            slot::<CopyBuffer>(list, 0x78)(list, b, 0, a, 0, 1024);
+        }
         crate::list::CPU_COPIES_FOR_TESTS.set(false);
         assert_eq!(
             slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list),

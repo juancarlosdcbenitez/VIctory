@@ -930,13 +930,22 @@ extern "system" fn clear_dsv(
 }
 
 /// `CopyMemoryToMemoryX(destination, source, size, flags)`: GPU addresses
-/// are title memory, copied at submission like buffer copies (if mapped).
+/// are title memory, copied at submission like buffer copies (if mapped),
+/// or, like them, on the GPU in order where shaders recorded earlier in the
+/// list write the source (invariant C5).
 extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && dst != 0
         && src != 0
     {
+        if !cpu_copies_only()
+            && list.shaders_write(src as usize, len as usize)
+            && crate::copy::buffers(list, dst, src, len)
+        {
+            with_state(this, |_, state| state.forget_compute_binding());
+            return;
+        }
         let len = len as usize;
         list.defer(move || {
             if crate::texture::committed(src as *const u8, len)
@@ -1036,10 +1045,46 @@ extern "system" fn set_pipeline(this: This, pipeline: This) {
 }
 
 /// Pipeline syncs: waits for earlier work and cache flushes, at the top or
-/// bottom of the pipe `(flags, control, address, size)`. Host lists order
-/// their own work and every submission is waited for, so there is nothing
-/// to do.
-extern "system" fn sync(_: This, _flags: u32, _control: u32, _address: u64, _size: u64) {}
+/// bottom of the pipe `(flags, control, address, size)`. D3D12 does not
+/// order a shader's writes before later work in the same list without a
+/// barrier (dispatches may overlap; WARP happens to run them one after
+/// another), so a sync becomes a barrier on every shader write, as the
+/// title's barriers on buffers do. Diagnostics builds can drop them again
+/// (`VICTORY_PIPELINE_SYNCS=0`) to compare.
+extern "system" fn sync(this: This, _flags: u32, _control: u32, _address: u64, _size: u64) {
+    #[cfg(windows)]
+    if syncing()
+        && let Some(list) = host_list(this)
+    {
+        use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
+        // SAFETY: the same layout (checked where barriers are translated).
+        let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
+        // SAFETY: an open list; a global barrier names no resource.
+        unsafe { list.list.ResourceBarrier(&[barrier]) };
+        SYNCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    #[cfg(not(windows))]
+    let _ = this;
+}
+
+/// Pipeline syncs recorded as barriers so far (tests).
+#[cfg(windows)]
+static SYNCS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether pipeline syncs become barriers (the default); diagnostics builds
+/// drop them with `VICTORY_PIPELINE_SYNCS=0`, as before, to compare.
+#[cfg(windows)]
+fn syncing() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let off = cfg!(feature = "diagnostics")
+            && std::env::var("VICTORY_PIPELINE_SYNCS").is_ok_and(|v| v.trim() == "0");
+        if off {
+            tracing::warn!("VICTORY_PIPELINE_SYNCS=0: pipeline syncs are dropped");
+        }
+        !off
+    })
+}
 
 /// Reset with console flags `(allocator, pipeline, flags)`; the flags only
 /// tune the console's command memory.
@@ -1609,6 +1654,41 @@ mod tests {
         assert_eq!(reset(list, allocator, null), S_OK);
         // SAFETY: the list is ours.
         assert!(unsafe { &(*list.cast::<List>()).uploads }.lock().unwrap().is_empty());
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+    }
+
+    /// A pipeline sync records a barrier on every shader write, which the
+    /// host list takes (it closes and runs). Whether it stops two
+    /// dispatches overlapping cannot be seen on WARP, which runs them one
+    /// after another anyway.
+    #[test]
+    #[cfg(windows)]
+    fn pipeline_syncs_become_barriers() {
+        let Some(host) = crate::host::host() else {
+            assert!(
+                !crate::warp::required(),
+                "VICTORY_WARP_REQUIRED=1, but the GPU layer has no host device"
+            );
+            return;
+        };
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let mut list = null;
+        let hr = create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list);
+        assert_eq!(hr, S_OK);
+        let before = SYNCS.load(std::sync::atomic::Ordering::Relaxed);
+        sync(list, 0, 0, 0, 0);
+        sync(list, 1, 2, 0, 0);
+        assert!(SYNCS.load(std::sync::atomic::Ordering::Relaxed) >= before + 2);
+        assert_eq!(close(list), S_OK);
+        let host_list = host_list(list).expect("a host list");
+        host.execute(&[host_list]);
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
