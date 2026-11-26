@@ -97,7 +97,12 @@ copies ..., textures ...; <n> on the GPU; <n> copying back ...; <n>
 waiting for another thread's submission), <n> draws/frame, dropped <n>
 without a host pipeline ...`. The figures are milliseconds per frame,
 averaged over the 5 s; the last one is how long title threads waited for
-each other because submissions run one at a time.
+each other because submissions run one at a time. After it, when there
+were any: `since the last report: copies at submission that read what
+shaders earlier in their submission write` (such a copy takes the bytes
+from before those shaders ran; the first eight are logged with their
+addresses as `a buffer copy at submission reads memory shaders earlier in
+the submission write`).
 
 Before sharing a log, read it: logs hold paths of your machine (and your
 user name in them). Frame captures and saves hold the game's content;

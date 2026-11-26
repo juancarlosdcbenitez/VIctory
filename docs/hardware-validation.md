@@ -130,6 +130,12 @@ the last lines of `stderr.txt` if the screen hangs. This is the run where
 the README's machine hung the GPU. A device removal here sends you to stage
 4; a hang without one, to stage 7 and then 6.
 
+In stage 3's log, also count `copies at submission that read what shaders
+earlier in their submission write`: each is a copy that took stale bytes
+(the GPU orders it after those shaders; we copy before the submission
+runs). Report the count and the first logged lines; none means the title
+does not depend on that order.
+
 ### 4. Device removal (DRED)
 
 Variable: `VICTORY_D3D12_DRED=1`. Repeat stage 3. The failure line then

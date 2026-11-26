@@ -179,9 +179,14 @@ specifications leave to the device (`Leeway`, each with its citation: NaN
 bits; denormals flushed on input or output, never for halves; zero signs
 from min/max; FMad fused or not; approximate operations within the
 D3D11.3 chapter 22 bounds); any other difference fails, and every one is
-printed. Users: `float_lowerings_agree_with_the_evaluator_on_the_host`
-(43 f32 and conversion lowerings), `f16_lowerings_...` and
-`packed_f16_lowerings_...`. Conversions the ISA defines exactly are held
+printed. For halves the leeways are NaN bits, zero signs of min/max, and
+for approximate operations (computed in f32) the f32 bound plus one step
+of halves (`approximate_f16`). Users:
+`float_lowerings_agree_with_the_evaluator_on_the_host` (45 f32 and
+conversion lowerings), `f16_lowerings_...`, `packed_f16_lowerings_...` and
+`more_f16_and_mixed_lowerings_...` (f16 min/max/med3, the approximate f16
+operations, f16 roundings, half and 16-bit integer conversions,
+`v_fma_mix*`, `v_dot2_f32_f16`). Conversions the ISA defines exactly are held
 to it on the evaluator by dense sweeps
 (`f16_conversion_rounds_to_nearest_even_on_any_device`,
 `integer_to_float_conversions_round_to_nearest_even_on_any_device`).
@@ -205,9 +210,24 @@ of its range while later work is held. The parallel pool
 and panics.
 
 Queues (victory-gpu, any host): `schedule::Schedule` is the model of
-queue waits, tested on its own; `queue::tests` run queues end to end on
-the worker thread; on Windows, `schedule::d3d12` checks the model's rules
-against a real D3D12 queue on WARP.
+queue waits, tested on its own (`Schedule::defer` too: work kept for the
+worker on a free queue); `queue::tests` run queues end to end on the
+worker thread, asynchronous queues included (`ASYNC_FOR_TESTS` turns them
+on for the test's own thread: a present and a signal held in order behind
+a wait); on Windows, `schedule::d3d12` checks the model's rules against a
+real D3D12 queue on WARP.
+
+Held submissions (victory-gpu, Windows, the GPU layer's host device):
+what a held submission reads stays its host list's past the title list's
+reset or release: `draw::tests::fresh_table_slots_stay_taken_while_a_held_
+submission_keeps_the_list` (dynamic descriptor slots of a constant-buffer
+table made through `State::tables`) and `list::tests::upload_memory_
+outlives_a_reset_while_the_submission_is_held` (list-owned upload memory;
+the list is closed before each reset, as titles do: the host allocator
+cannot be reset under a list still recording).
+`descriptor::view_heap_for_tests` makes a shader-visible title heap.
+`shadow::tests::ranges_shaders_write_are_known_until_copied_back` checks
+the registry behind the stale-copy report.
 
 Benchmarks (ignored tests, release builds): `merge_speed` (victory-gpu,
 the copy-back merge), `detile_speed` (victory-formats), `bcpack_throughput`
