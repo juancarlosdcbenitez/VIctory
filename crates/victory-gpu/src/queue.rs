@@ -1112,7 +1112,11 @@ mod tests {
         for v in n + 1..=2 * n {
             assert_eq!(signal(q, g, v), S_OK);
         }
-        assert_eq!(value(g), n, "held behind the wait, the thread never stopped");
+        assert_eq!(
+            value(g),
+            n,
+            "held behind the wait, the thread never stopped"
+        );
         assert_eq!(crate::fence::signal(f, 1), S_OK);
         assert!(reaches(g, 2 * n), "released in order");
         ASYNC_FOR_TESTS.set(false);
