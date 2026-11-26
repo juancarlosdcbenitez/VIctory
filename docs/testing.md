@@ -229,6 +229,21 @@ cannot be reset under a list still recording).
 `shadow::tests::ranges_shaders_write_are_known_until_copied_back` checks
 the registry behind the stale-copy report.
 
+Copy order and texture copies (victory-gpu, Windows, the GPU layer's host
+device): `resource::tests::a_copy_reads_what_earlier_shaders_in_its_list_
+wrote` (the test's own compute pass writes A, the list copies A to B by
+CopyBufferRegion and by CopyMemoryToMemoryX; `list::CPU_COPIES_FOR_TESTS`
+forces the old CPU copy, which must leave A's old bytes in B);
+`texture_regions_reach_title_buffers` and `compressed_texture_regions_
+reach_title_buffers` (RGBA8 and BC1 fixtures written here, every byte of
+the destination checked); `list::tests::pipeline_syncs_become_barriers`.
+List methods from slot 0x1d8 on move with the list layout, which a device
+asked for at the newest level switches for the whole test process: tests
+call such methods directly, not by slot
+(`list::tests::newer_lists_have_their_console_methods_two_slots_later`
+checks the slots). `queue::tests::asynchronous_backlogs_are_bounded_
+without_waiting_on_held_work` checks the asynchronous queues' backlog.
+
 Benchmarks (ignored tests, release builds): `merge_speed` (victory-gpu,
 the copy-back merge), `detile_speed` (victory-formats), `bcpack_throughput`
 (victory-formats), `bench_write` (victory-shader, the bitcode writer),

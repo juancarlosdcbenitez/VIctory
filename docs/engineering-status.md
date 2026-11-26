@@ -547,6 +547,56 @@ test, the new differential and a scratch test, which was removed).
   needs the census on the game files (hardware-validation.md, "Translation
   census"). No lowering was added on speculation.
 
+### 2026-11-26, seventh session (same container; Windows CI)
+
+Baseline: `96ca73e` (docs; code `a54583d`), local and remote equal; run 43
+green.
+
+* **Copy order inside a list** (C5, `ea34abb`; run 44). A title buffer
+  copy whose source shaders recorded earlier in the same list write runs
+  on the GPU at its place in the list (`copy`: a compute pass between the
+  host copies, the destination declared GPU-written and copied back after
+  the submission) instead of on the CPU when the submission starts, where
+  it took the bytes from before those shaders ran. Other copies stay on
+  the CPU (fills of upload memory after them read what they wrote). Since
+  `efc8bbb` CopyMemoryToMemoryX takes the same path. The regression test
+  (`resource::tests::a_copy_reads_what_earlier_shaders_in_its_list_wrote`,
+  both methods): a compute pass writes A, the list copies A to B; the old
+  CPU path (forced) leaves A's old bytes in B, the GPU path the pass's.
+* **Texture-to-buffer copies** (`cbd8ae7`; run 45). CopyTextureRegion into
+  a placed footprint was dropped with a warning. Now the host texture is
+  brought up to date and copied on the GPU into a staging buffer at the
+  host's footprint, and a compute pass moves the rows to the title
+  footprint's place and pitches (block rows for BC formats); the range is
+  copied back after the submission. What cannot be copied is counted and
+  logged per reason. Tests with fixtures written here: an RGBA8 8x4 box to
+  texel (1, 1) of a footprint at offset 512, a BC1 8x8 block column at
+  offset 1024, every byte of the buffers checked.
+* **Asynchronous queues keep a bounded backlog** (`212ab32`, `d9bdd09`;
+  tests green from run 49 on). With `VICTORY_QUEUE_ASYNC=1` a submitting
+  thread waits while the worker holds more than 512 operations it can run
+  on its own (those before the first wait not reached in each queue);
+  work behind such a wait never counts, so a submitter that is itself
+  the one to signal cannot deadlock.
+* **Pipeline syncs become barriers** (`efc8bbb`). They recorded nothing;
+  D3D12 does not order a dispatch's writes before later work in a list
+  without a barrier, so each is a global UAV barrier now.
+  `VICTORY_PIPELINE_SYNCS=0` (diagnostics) drops them to compare; WARP
+  runs dispatches one after another, so only a GPU run shows the effect.
+* **CI broke and was restored.** Run 49 (`8c67206`) failed the copy-order
+  test's CopyMemoryToMemoryX half: the test called the method by its
+  2020-era slot, 0x1e0; a device test that asks for the newest device
+  level switches every list made after it to newer titles' layout (slots
+  from 0x1d8 on two later), so in some test orders the call hit an empty
+  slot. A test defect: `b8debcb` calls the method itself, and
+  `list::tests::newer_lists_have_their_console_methods_two_slots_later`
+  checks every method's slot in both layouts, which the copy-order test no
+  longer goes through. Run 50 passed both jobs.
+* **Copies across lists of one submission** (in progress): a list's work at
+  submission (copies, fills of upload memory, quad expansion, all on the
+  CPU before any GPU work) still reads what an earlier list of the same
+  submission writes on the GPU before it ran (counted, `STALE_COPIES`).
+
 ## Backlog
 
 Priority order: P0 GPU stability, P1 shader correctness, P2 performance,
@@ -611,16 +661,18 @@ this section.
    * The d16 texture returns' rounding (D3D's toward zero today), once a
      hardware run can compare them with nearest-even.
 
-CI at the end of the sixth session's first part: run 31 (`89ed258`, the
-f16 fix and differential) passed both jobs; runs 34 and 35 failed (the
-test defect above); runs 36, 38 and 41 passed their checks; run 43
-(`a54583d`, the last code commit then) passed both jobs. The latest
-verified diagnostic package is run 43's
-`victory-diag-0.1.0-a54583d51539-windows-x64` (build
-`0.1.0+diag.a54583d51539`, 10,700,375 bytes, zip SHA-256
-`c088edc0955052c76934925c423c8edd8bb82dc8205c04467ac2ed72d4901cac`;
+CI in the sixth session: run 31 (`89ed258`, the f16 fix and differential)
+passed both jobs; runs 34 and 35 failed (the test defect above); runs 36,
+38 and 41 passed their checks; run 43 (`a54583d`) passed both jobs.
+Seventh session: runs 44 (`ea34abb`) and 45 (`cbd8ae7`) passed; 46-48
+were replaced by newer pushes; 49 (`8c67206`) failed (the test defect
+above); 50 (`b8debcb`) passed both jobs. The latest verified diagnostic
+package is run 50's `victory-diag-0.1.0-b8debcb0d3ce-windows-x64` (build
+`0.1.0+diag.b8debcb0d3ce`, 10,741,144 bytes, zip SHA-256
+`2f958bcb7f1e7afdc63504ab675f83260c5a476d3a04648d92a08bc3113ba79c`;
 `victory.exe`
-`02192b7bdeb59c16daf0c59d6a3d626daabd738ded80ea9fab1ef8263376536b`,
+`98d60399b2e81b1960f693ca3c777f87a8eb7b21ed71b02efe675ae6b2f4e75e`,
 `victory.pdb`
-`82d3576aef2df2d5eeeefc3edcf9c52fa0b352d03438f9d5a275009f197d3a4c`; the
-job checked the nine files and `--version`).
+`0bdeef2d26f19b343df774e7e6b6f86c8f545469b39c19ab535e228540e0f2e4`; the
+job checked the nine files and `--version`). Run 43's package
+(`a54583d`) is the one before it.

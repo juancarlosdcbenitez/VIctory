@@ -1660,6 +1660,23 @@ mod tests {
         assert_eq!(release(allocator), 0);
     }
 
+    /// Newer titles' lists keep the PC part of the base list and have every
+    /// console method from 0x1d8 on two slots later: the memory copy among
+    /// them, 0x1e0 in older titles' lists and 0x1f0 in newer ones. Which
+    /// layout a list gets depends on the device level asked for first in
+    /// the process, so tests that run lists call such methods themselves.
+    #[test]
+    fn newer_lists_have_their_console_methods_two_slots_later() {
+        let (old, new) = (list_table(false), list_table(true));
+        for &(slot, method) in METHODS.iter().chain(&MORE_METHODS) {
+            assert_eq!(old[slot], method, "slot {slot}");
+            assert_eq!(new[newer_slot(slot)], method, "slot {slot}");
+        }
+        assert_eq!(old[15], new[15]); // CopyBufferRegion stays at 0x78
+        assert_eq!(old[60], copy_memory as *const ()); // 0x1e0
+        assert_eq!(new[62], copy_memory as *const ()); // 0x1f0
+    }
+
     /// A pipeline sync records a barrier on every shader write, which the
     /// host list takes (it closes and runs). Whether it stops two
     /// dispatches overlapping cannot be seen on WARP, which runs them one
