@@ -1727,7 +1727,10 @@ mod tests {
         if asynchronous {
             let mut fence = null;
             let fence_iid = &crate::fence::FENCE_IIDS[0];
-            assert_eq!(crate::fence::create(null, 0, 0, fence_iid, &mut fence), S_OK);
+            assert_eq!(
+                crate::fence::create(null, 0, 0, fence_iid, &mut fence),
+                S_OK
+            );
             assert_eq!(crate::queue::signal_for_tests(queue, fence, 1), S_OK);
             let value = slot::<extern "system" fn(This) -> u64>(fence, 0x40);
             let started = std::time::Instant::now();
