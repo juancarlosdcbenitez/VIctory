@@ -933,7 +933,7 @@ extern "system" fn clear_dsv(
 /// are title memory, copied at submission like buffer copies (if mapped),
 /// or, like them, on the GPU in order where shaders recorded earlier in the
 /// list write the source (invariant C5).
-extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
+pub(crate) extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && dst != 0

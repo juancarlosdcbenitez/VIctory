@@ -1976,8 +1976,10 @@ void main(uint3 id : SV_DispatchThreadID) { o.Store(id.x * 4, 0xC0DE0000u | id.x
         host_list.keep(&writer.root);
         crate::list::CPU_COPIES_FOR_TESTS.set(cpu_copies);
         if memory {
-            type CopyMemory = extern "system" fn(This, u64, u64, u64, u32);
-            slot::<CopyMemory>(list, 0x1e0)(list, at(b), at(a), 1024, 0);
+            // Called directly: its slot depends on the title's list layout,
+            // which a device asked for at the newest level (another test)
+            // switches for every list made after it.
+            crate::list::copy_memory(list, at(b), at(a), 1024, 0);
         } else {
             type CopyBuffer = extern "system" fn(This, This, u64, This, u64, u64);
             slot::<CopyBuffer>(list, 0x78)(list, b, 0, a, 0, 1024);
