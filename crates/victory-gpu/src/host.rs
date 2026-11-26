@@ -417,6 +417,10 @@ pub(crate) struct HostList {
     /// host list (`list::reset`); this one keeps its slots until the held
     /// submission has run and let it go.
     slots: Mutex<Vec<(usize, u32, u32)>>,
+    /// Title memory its submission reads when it runs: the list-owned
+    /// upload blocks of a title list reset while a queue held this host
+    /// list's submission back (`list::reset`), kept until it is dropped.
+    memory: Mutex<Vec<Vec<u8>>>,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -606,6 +610,7 @@ impl Host {
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
                 slots: Mutex::default(),
+                memory: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -1022,6 +1027,10 @@ impl HostList {
     /// for).
     pub(crate) fn reset(&self) {
         self.give_back_slots();
+        self.memory
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -1149,6 +1158,21 @@ impl HostList {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push((heap, first, n));
+    }
+
+    /// Keeps title memory blocks the list's submission reads alive until
+    /// the list is reset or dropped.
+    pub(crate) fn keep_memory(&self, blocks: Vec<Vec<u8>>) {
+        self.memory
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend(blocks);
+    }
+
+    /// How many title memory blocks the list keeps.
+    #[cfg(test)]
+    pub(crate) fn kept_memory(&self) -> usize {
+        self.memory.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     fn give_back_slots(&self) {

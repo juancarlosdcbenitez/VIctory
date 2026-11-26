@@ -286,20 +286,23 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     }
     // SAFETY: the title passes one of our lists.
     let uploads = unsafe { &(*this.cast::<List>()).uploads };
-    uploads.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    let blocks = std::mem::take(&mut *uploads.lock().unwrap_or_else(|e| e.into_inner()));
     // A submission a queue still holds back keeps the host list it was
     // recorded into, as D3D12 lets a list be reset once submitted: the title
-    // list records into a fresh one. Other submissions have run (they are
-    // waited for), so the list's own is reset for reuse.
+    // list records into a fresh one. The held submission copies the list's
+    // upload memory when it runs, so that host list takes the memory too.
+    // Other submissions have run (they are waited for), so the list's own
+    // is reset for reuse and the memory freed.
     #[cfg(windows)]
     {
         // SAFETY: the title resets a list on the thread that records it;
         // nothing reads it through the title list meanwhile.
         let host = unsafe { &mut *(*this.cast::<List>()).host.get() };
-        if host
+        if let Some(held) = host
             .as_ref()
-            .is_some_and(|h| std::sync::Arc::strong_count(h) > 1)
+            .filter(|h| std::sync::Arc::strong_count(h) > 1)
         {
+            held.keep_memory(blocks);
             *host = new_host_list();
         } else if let Some(h) = host.as_ref() {
             h.reset();
@@ -310,7 +313,7 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         state.reset(pipeline);
     }
     #[cfg(not(windows))]
-    let _ = (this, pipeline);
+    let _ = (this, pipeline, blocks);
     S_OK
 }
 
@@ -1480,6 +1483,57 @@ mod tests {
         assert_eq!(reset(list, allocator, null), S_OK);
         // SAFETY: the list is ours.
         assert!(unsafe { &(*list.cast::<List>()).uploads }.lock().unwrap().is_empty());
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+    }
+
+    /// List-owned upload memory is read when the list's submission runs
+    /// (copied at submission, `HostList::defer_fill`), so a title list reset
+    /// while a queue holds that submission back hands the memory to the
+    /// held host list instead of freeing it under the held work.
+    #[test]
+    #[cfg(windows)]
+    fn upload_memory_outlives_a_reset_while_the_submission_is_held() {
+        if crate::host::host().is_none() {
+            assert!(
+                !crate::warp::required(),
+                "VICTORY_WARP_REQUIRED=1, but the GPU layer has no host device"
+            );
+            return;
+        }
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let mut list = null;
+        let hr = create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list);
+        assert_eq!(hr, S_OK);
+        let p = allocate_upload(list, 64, 0x100);
+        assert!(!p.is_null());
+        // SAFETY: 64 bytes were handed out.
+        unsafe { p.write_bytes(0xcd, 64) };
+        // A queue holds the list's submission back.
+        let held = host_list_shared(list).expect("a host list");
+        assert_eq!(reset(list, allocator, null), S_OK);
+        let fresh = host_list_shared(list).expect("a host list");
+        assert!(
+            !std::sync::Arc::ptr_eq(&held, &fresh),
+            "records into a fresh one"
+        );
+        assert_eq!(held.kept_memory(), 1, "the held host list keeps the block");
+        // SAFETY: the held host list keeps the block alive.
+        let bytes = unsafe { std::slice::from_raw_parts(p, 64) };
+        assert!(bytes.iter().all(|&b| b == 0xcd));
+        // Without a held submission the next reset frees what the list has.
+        drop(fresh);
+        assert!(!allocate_upload(list, 8, 0x10).is_null());
+        assert_eq!(reset(list, allocator, null), S_OK);
+        let own = host_list_shared(list).expect("a host list");
+        assert_eq!(own.kept_memory(), 0);
+        drop((own, held));
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
