@@ -110,6 +110,23 @@ impl<T> Schedule<T> {
         None
     }
 
+    /// How many held operations would run without any fence moving: those
+    /// before the first wait not reached in each queue (a queue busy with
+    /// released work included: that work finishes on its own). Operations
+    /// behind a wait not reached are not counted: what releases them may be
+    /// the very thread that asks.
+    pub(crate) fn ready_len(&self) -> usize {
+        self.queues
+            .values()
+            .map(|q| {
+                q.iter()
+                    .take_while(|i| !matches!(i, Item::Wait { reached: false, .. }))
+                    .filter(|i| matches!(i, Item::Op(_)))
+                    .count()
+            })
+            .sum()
+    }
+
     /// An operation kept for [`Schedule::runnable`] even if nothing holds
     /// `queue` back: for queues whose work all runs on the worker.
     pub(crate) fn defer(&mut self, queue: usize, op: T) {
@@ -263,6 +280,24 @@ mod tests {
         assert!(s.direct(A));
         s.finished(A);
         assert!(!s.holds(A));
+    }
+
+    /// Only operations that can run without a fence moving are ready: those
+    /// behind a wait not reached are not, until it is reached.
+    #[test]
+    fn ready_operations_stop_at_waits_not_reached() {
+        let mut s: Schedule<u32> = Schedule::new();
+        assert_eq!(s.ready_len(), 0);
+        s.defer(A, 1);
+        s.defer(A, 2);
+        s.wait(A, F, 4, 0);
+        s.defer(A, 3);
+        s.defer(B, 9);
+        assert_eq!(s.ready_len(), 3, "1 and 2 on A, 9 on B; 3 waits");
+        s.fence_moved(F, 4);
+        assert_eq!(s.ready_len(), 4, "the wait reached");
+        let _ = s.runnable();
+        assert_eq!(s.ready_len(), 0, "given out to run");
     }
 
     /// Deferred work (queues whose work all runs on the worker) is kept

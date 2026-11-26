@@ -237,7 +237,9 @@ submission and their work overlaps the GPU's. Compare fps, ms per frame and
 the presented-frame intervals with the run without it, and note any hang,
 device removal, flicker or wrong image (those settle whether it is safe,
 whatever the frame rate says). The `held back` counts after the frame lines
-count everything in this mode. Our window and swap chain are then made
+count everything in this mode; `backlog` counts submissions that waited
+because the worker already had 512 operations it could run (the title ran
+that far ahead of the GPU). Our window and swap chain are then made
 and pumped by the queue worker, which runs every present: a window that
 stops responding or drawing only in this mode points there.
 

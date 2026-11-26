@@ -1802,13 +1802,16 @@ impl Meter {
                  pipeline ({making} being made) and {indirect:.0} indirect",
                 making = crate::pipeline::making()
             );
-            let [held, ahead] = crate::queue::take_held();
-            if held + ahead > 0 {
+            let [held, ahead, backlog] = crate::queue::take_held();
+            if held + ahead + backlog > 0 {
                 tracing::warn!(
                     held,
                     ahead,
+                    backlog,
                     "since the last report: submissions and signals held back by queue waits \
-                     not reached, and presents or page mappings that ran ahead of held work"
+                     not reached (every one, with asynchronous queues), presents or page \
+                     mappings that ran ahead of held work, and submissions that waited for the \
+                     asynchronous worker's backlog"
                 );
             }
             let stale = STALE_COPIES.swap(0, Ordering::Relaxed);

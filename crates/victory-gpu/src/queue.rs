@@ -113,15 +113,17 @@ fn queues() -> MutexGuard<'static, Schedule<Held>> {
 }
 
 /// Submissions and signals held back since the frame-rate line last
-/// reported them, and presents or page mappings that ran ahead of held
-/// work (the shortcut above).
-static HELD: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+/// reported them, presents or page mappings that ran ahead of held work
+/// (the shortcut above), and submissions that waited for the asynchronous
+/// worker's backlog.
+static HELD: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 
 /// Since the last call (the frame-rate line): submissions and signals
-/// held back by waits, and presents and page mappings that ran ahead.
+/// held back by waits, presents and page mappings that ran ahead, and
+/// waits for the asynchronous worker's backlog.
 #[cfg(windows)]
-pub(crate) fn take_held() -> [u64; 2] {
-    [0, 1].map(|i| HELD[i].swap(0, Ordering::Relaxed))
+pub(crate) fn take_held() -> [u64; 3] {
+    [0, 1, 2].map(|i| HELD[i].swap(0, Ordering::Relaxed))
 }
 
 /// Whether every queue holds what is submitted to it for the worker
@@ -242,12 +244,30 @@ fn hold(queue: usize, held: impl FnOnce() -> Held) -> Submit {
     Submit::Held
 }
 
-/// Asynchronous queues: keeps `item` for the worker, in the queue's order.
+/// The most operations the worker may hold that it can run on its own (not
+/// behind a wait not reached) before a submitting thread waits for it:
+/// several frames' submissions and signals, so that a title running ahead
+/// of the GPU cannot grow the backlog, and the memory its host lists hold,
+/// without bound.
+const BACKLOG: usize = 512;
+
+/// Asynchronous queues: keeps `item` for the worker, in the queue's order;
+/// then waits while the worker has more than [`BACKLOG`] operations it can
+/// run without any fence moving. Held work behind a wait not reached never
+/// makes a thread wait (the thread may be what releases it), and the
+/// worker runs the rest on its own, so the wait ends.
 fn to_worker(queue: usize, item: Held) {
-    queues().defer(queue, item);
+    let mut q = queues();
+    q.defer(queue, item);
     HELD[0].fetch_add(1, Ordering::Relaxed);
     start_worker();
     MOVED.notify_all();
+    if q.ready_len() > BACKLOG {
+        HELD[2].fetch_add(1, Ordering::Relaxed);
+        while q.ready_len() > BACKLOG {
+            q = MOVED.wait(q).unwrap_or_else(|e| e.into_inner());
+        }
+    }
 }
 
 fn start_worker() {
@@ -1071,6 +1091,31 @@ mod tests {
         // SAFETY: the fence's value, as titles store it.
         unsafe { at.write_volatile(2) };
         assert!(reaches(g, 1));
+    }
+
+    /// Asynchronous queues, the backlog bound: thousands of signals on a
+    /// queue nothing holds all run, in order, whether or not a submitting
+    /// thread had to wait for the worker; behind a wait not reached they
+    /// are held without the submitting thread ever waiting (it is what
+    /// signals the fence the wait needs), then run once it does.
+    #[test]
+    fn asynchronous_backlogs_are_bounded_without_waiting_on_held_work() {
+        ASYNC_FOR_TESTS.set(true);
+        let q = new_queue();
+        let (f, g) = (new_fence(0), new_fence(0));
+        let n = 3 * BACKLOG as u64;
+        for v in 1..=n {
+            assert_eq!(signal(q, g, v), S_OK);
+        }
+        assert!(reaches(g, n), "all ran");
+        assert_eq!(wait(q, f, 1), S_OK);
+        for v in n + 1..=2 * n {
+            assert_eq!(signal(q, g, v), S_OK);
+        }
+        assert_eq!(value(g), n, "held behind the wait, the thread never stopped");
+        assert_eq!(crate::fence::signal(f, 1), S_OK);
+        assert!(reaches(g, 2 * n), "released in order");
+        ASYNC_FOR_TESTS.set(false);
     }
 
     /// Asynchronous queues (experimental): the worker runs every signal,
