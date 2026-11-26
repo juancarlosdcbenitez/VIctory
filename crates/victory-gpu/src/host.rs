@@ -71,14 +71,17 @@ unsafe impl Sync for Host {}
 /// them one at a time, for the frame line.
 static LOCK_WAIT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Copies done at submission (title buffer copies, fills of upload memory)
-/// whose source shaders earlier in the same submission write: they read
-/// the bytes from before those shaders ran, where D3D12 orders the copy
-/// after them. Counted for the frame report; the first few are logged.
+/// Work done at submission (title buffer and memory copies, fills of upload
+/// memory, rectangle expansion) whose source shaders recorded earlier in
+/// the same list write: it reads the bytes from before those shaders ran,
+/// where D3D12 orders it after them. Counted for the frame report; the
+/// first few are logged. (A copy recorded after them runs on the GPU
+/// instead where it can, `copy`; across lists the submission is cut,
+/// `order`.)
 static STALE_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// A copy at submission reads `[src, src + len)`, which shaders earlier in
-/// the submission write (see [`STALE_COPIES`]).
+/// Work at submission reads `[src, src + len)`, which shaders earlier in
+/// its list write (see [`STALE_COPIES`]).
 fn stale_copy(what: &str, dst: usize, src: usize, len: usize) {
     static LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     STALE_COPIES.fetch_add(1, Ordering::Relaxed);
@@ -87,10 +90,53 @@ fn stale_copy(what: &str, dst: usize, src: usize, len: usize) {
             dst = format_args!("{dst:#x}"),
             src = format_args!("{src:#x}"),
             len,
-            "a {what} at submission reads memory shaders earlier in the submission write: it \
+            "a {what} at submission reads memory shaders earlier in its list write: it \
              copies the bytes from before they ran (the GPU orders it after them)"
         );
     }
+}
+
+/// Parts submissions were cut into past their first (`order`) since the
+/// last frame report.
+static CUTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Where a submission of `runs` is cut (`order::cuts`): nowhere for one
+/// list, which has nothing earlier to depend on.
+fn cuts(runs: &[&HostList]) -> Vec<(usize, crate::order::Hazard)> {
+    #[cfg(test)]
+    if UNCUT_FOR_TESTS.get() {
+        return Vec::new();
+    }
+    if runs.len() < 2 {
+        return Vec::new();
+    }
+    let access: Vec<crate::order::Access> = runs.iter().map(|l| l.access()).collect();
+    crate::order::cuts(&access)
+}
+
+/// A submission of `lists` lists is cut before list `at` (counted for the
+/// frame report; the first few logged).
+fn cut(lists: usize, at: usize, hazard: crate::order::Hazard) {
+    static LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    CUTS.fetch_add(1, Ordering::Relaxed);
+    if LOGGED.fetch_add(1, Ordering::Relaxed) < 8 {
+        tracing::info!(
+            list = at,
+            lists,
+            "a submission is cut before a list: {}; the lists before it run, and what their \
+             shaders wrote is copied back, first",
+            hazard.text()
+        );
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Submissions this test thread runs stay one part (the behaviour
+    /// before parts): to show what that gets wrong.
+    pub(crate) static UNCUT_FOR_TESTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The parts of the last submission this test thread ran.
+    pub(crate) static PARTS_FOR_TESTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 static SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] =
@@ -529,17 +575,19 @@ enum Step {
     /// A copy of title memory into the list's own upload memory.
     Fill(usize, usize, usize),
     /// Brings a range (address, bytes) of a buffer's host copy up to date:
-    /// once per submission, whichever lists ask, until a `Copy` or `Run`
+    /// once per submission, whichever lists ask, until a `Copy` or `Move`
     /// intervenes.
     Refresh(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
-    /// Work that may write title memory.
-    Run(Box<dyn Fn() + Send>),
-    /// Work that writes host memory only.
-    Host(Box<dyn Fn() + Send>),
+    /// CopyMemoryToMemoryX (destination, source, bytes of title memory):
+    /// made as a memory move, and only if both ranges are committed.
+    Move(usize, usize, usize),
+    /// Work that writes host memory only, reading title memory `[start,
+    /// end)` (empty for none).
+    Host(Box<dyn Fn() + Send>, crate::order::Range),
     /// Shaders write a range (address, bytes) of a buffer's host copy.
     GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
     /// Brings a texture's staging buffer up to date: once per submission,
-    /// whichever lists sample it, until a `Copy` or `Run` intervenes.
+    /// whichever lists sample it, until a `Copy` or `Move` intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>),
 }
 
@@ -646,16 +694,38 @@ impl Host {
         }
     }
 
-    /// Runs closed lists and waits for them.
+    /// Runs closed lists and waits for them: in parts where a list depends
+    /// on an earlier one's GPU work through title memory (`order`, C5),
+    /// each part run and what its shaders wrote copied back before the next
+    /// part's work at submission, as if the title had submitted them one
+    /// after another.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
+        // A submission's parts run under the same hold: nothing comes
+        // between them.
         let asked = std::time::Instant::now();
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         LOCK_WAIT_US.fetch_add(asked.elapsed().as_micros() as u64, Ordering::Relaxed);
-        let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
+        let cuts = cuts(runs);
+        #[cfg(test)]
+        PARTS_FOR_TESTS.set(cuts.len() + 1);
+        let mut first = 0;
+        for &(at, hazard) in &cuts {
+            cut(runs.len(), at, hazard);
+            self.run_part(&mut submitted, &runs[first..at]);
+            first = at;
+        }
+        self.run_part(&mut submitted, &runs[first..]);
+    }
+
+    /// Runs lists of a submission (all of them, or one part) and waits for
+    /// them: their work at submission, the lists, then what their shaders
+    /// wrote copied back and their bottom-of-pipe writes made.
+    fn run_part(&self, submitted: &mut u64, runs: &[&HostList]) {
+        let started = std::time::Instant::now();
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
@@ -1359,9 +1429,8 @@ impl HostList {
             deferred.budget_zeroed = true;
             let at = *data;
             // SAFETY: the list's own mapped word, written before it runs.
-            deferred
-                .copies
-                .push(Step::Host(Box::new(move || unsafe { (at as *mut u32).write_volatile(0) })));
+            let zero = move || unsafe { (at as *mut u32).write_volatile(0) };
+            deferred.copies.push(Step::Host(Box::new(zero), (0, 0)));
         }
         // SAFETY: a live buffer.
         Some(unsafe { buffer.GetGPUVirtualAddress() })
@@ -1380,16 +1449,60 @@ impl HostList {
         self.deferred().textures.insert(key)
     }
 
-    /// Runs `work` when the list is submitted, in order with its copies.
-    /// `work` may write title memory (refreshes after it copy again).
-    pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Run(Box::new(work)));
-        self.deferred().refreshed.clear();
+    /// Moves `len` bytes of title memory from `src` to `dst` when the list
+    /// is submitted, in order with its copies, if both ranges are committed
+    /// then (CopyMemoryToMemoryX); refreshes after it copy again.
+    pub(crate) fn defer_move(&self, dst: usize, src: usize, len: usize) {
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::Move(dst, src, len));
+        deferred.refreshed.clear();
     }
 
-    /// As [`HostList::defer`], for work that writes only host memory.
-    pub(crate) fn defer_host(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Host(Box::new(work)));
+    /// Runs `work` when the list is submitted, in order with its copies:
+    /// work that reads title memory `[from, from + len)` and writes only
+    /// host memory (rectangles expanded into the list's upload memory).
+    pub(crate) fn defer_host(&self, from: usize, len: usize, work: impl Fn() + Send + 'static) {
+        let reads = (from, from.saturating_add(len));
+        self.deferred()
+            .copies
+            .push(Step::Host(Box::new(work), reads));
+    }
+
+    /// What the list does with title memory when it runs, for cutting a
+    /// submission where it depends on an earlier list (`order`): its
+    /// copies, fills and expansions at submission, what its GPU work reads
+    /// and writes through which copy, and its bottom-of-pipe writes.
+    fn access(&self) -> crate::order::Access {
+        use std::sync::Arc;
+        let deferred = self.deferred();
+        let mut a = crate::order::Access::default();
+        let range = |at: usize, len: usize| (at, at.saturating_add(len));
+        for step in &deferred.copies {
+            match step {
+                &Step::Copy(dst, src, len) | &Step::Move(dst, src, len) => {
+                    a.cpu_reads.push(range(src, len));
+                    a.cpu_writes.push(range(dst, len));
+                }
+                &Step::Fill(_, src, len) => a.cpu_reads.push(range(src, len)),
+                Step::Host(_, reads) => a.cpu_reads.push(*reads),
+                Step::Refresh(shadow, at, len) => {
+                    let copy = Arc::as_ptr(shadow) as usize;
+                    a.gpu_reads.push((copy, range(*at, *len)));
+                }
+                Step::GpuWrite(shadow, at, len) => {
+                    let copy = Arc::as_ptr(shadow) as usize;
+                    a.gpu_writes.push((copy, range(*at, *len)));
+                }
+                Step::Texture(staging) => {
+                    let copy = Arc::as_ptr(staging) as usize;
+                    a.gpu_reads.push((copy, staging.span()));
+                }
+            }
+        }
+        for &(at, _, bytes) in &deferred.writes {
+            a.gpu_writes.push((crate::order::TITLE, range(at, bytes)));
+        }
+        a
     }
 
     /// Brings a texture's staging buffer up to date when the list is
@@ -1446,9 +1559,27 @@ impl HostList {
                     batch.add(shadow, *address, *len);
                     continue;
                 }
-                Step::Run(work) | Step::Host(work) => {
-                    if matches!(step, Step::Run(_)) {
-                        batch.title_written();
+                &Step::Move(dst, src, len) => {
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        add(C::Copies, 1);
+                        add(C::CopyBytes, len as u64);
+                    }
+                    if crate::shadow::written_by_gpu(src, len) {
+                        stale_copy("memory copy", dst, src, len);
+                    }
+                    batch.title_written();
+                    if crate::texture::committed(src as *const u8, len)
+                        && crate::texture::committed(dst as *const u8, len)
+                    {
+                        // SAFETY: both ranges are committed title memory.
+                        unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len) };
+                    }
+                    len
+                }
+                Step::Host(work, (from, to)) => {
+                    if from < to && crate::shadow::written_by_gpu(*from, to - from) {
+                        stale_copy("rectangle expansion", 0, *from, to - from);
                     }
                     work();
                     #[cfg(feature = "diagnostics")]
@@ -1819,7 +1950,16 @@ impl Meter {
                 tracing::warn!(
                     stale,
                     "since the last report: copies at submission that read what shaders earlier \
-                     in their submission write (copied from before those shaders ran)"
+                     in their list write (copied from before those shaders ran)"
+                );
+            }
+            let cuts = CUTS.swap(0, Ordering::Relaxed);
+            if cuts > 0 {
+                tracing::info!(
+                    cuts,
+                    "since the last report: submissions cut before lists that depend on an \
+                     earlier list's GPU work through title memory (each part run and copied \
+                     back before the next)"
                 );
             }
             #[cfg(feature = "diagnostics")]

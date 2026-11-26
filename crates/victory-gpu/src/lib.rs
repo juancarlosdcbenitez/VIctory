@@ -18,6 +18,8 @@
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 pub mod console;
+#[cfg(windows)]
+mod copy;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
 pub mod descriptor;
@@ -33,11 +35,11 @@ mod host;
 mod indirect;
 mod inflight;
 pub mod list;
-#[cfg(windows)]
-mod copy;
 #[cfg(any(windows, test))]
 mod merge;
 pub mod object;
+#[cfg(any(windows, test))]
+mod order;
 pub mod pipeline;
 #[cfg(windows)]
 mod primitive;
@@ -46,10 +48,10 @@ mod probes;
 pub mod query;
 pub mod queue;
 pub mod resource;
-mod schedule;
 pub mod root;
 #[cfg(windows)]
 mod sampler;
+mod schedule;
 #[cfg(windows)]
 pub mod shader_cache;
 #[cfg(windows)]

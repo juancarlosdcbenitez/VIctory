@@ -2275,4 +2275,425 @@ void main(uint3 id : SV_DispatchThreadID) { o.Store(id.x * 4, 0xC0DE0000u | id.x
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
     }
+
+    /// A title queue and title lists submitted through it together, for
+    /// submissions where later lists depend on earlier lists' GPU work
+    /// through title memory (invariant C5, `order`). Work at submission
+    /// runs on the CPU before any GPU work, so as one part (the behaviour
+    /// before parts) a later list's copy takes what was there before an
+    /// earlier list's shaders ran; cut, each part runs and is copied back
+    /// first.
+    #[cfg(windows)]
+    struct Lists {
+        queue: This,
+        lists: Vec<This>,
+    }
+
+    #[cfg(windows)]
+    impl Lists {
+        fn new() -> Lists {
+            let null = std::ptr::null();
+            let iid = guid(
+                0x0ec870a6,
+                0x5d7e,
+                0x4c22,
+                [0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed],
+            );
+            let (desc, mut queue) = ([0u32; 4], null);
+            assert_eq!(
+                crate::queue::create(null, desc.as_ptr().cast(), &iid, &mut queue),
+                S_OK
+            );
+            Lists {
+                queue,
+                lists: Vec::new(),
+            }
+        }
+
+        /// A new title list, open, and its host list.
+        fn list(&mut self) -> (This, &'static crate::host::HostList) {
+            let null = std::ptr::null();
+            let allocator_iid = guid(
+                0x6102dee4,
+                0xaf59,
+                0x4b09,
+                [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24],
+            );
+            let list_iid = guid(
+                0x5b160d0f,
+                0xac1b,
+                0x4185,
+                [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55],
+            );
+            let (mut allocator, mut list) = (null, null);
+            assert_eq!(
+                crate::list::create_allocator(null, 0, &allocator_iid, &mut allocator),
+                S_OK
+            );
+            assert_eq!(
+                crate::list::create_list(null, 0, 0, allocator, null, &list_iid, &mut list),
+                S_OK
+            );
+            self.lists.push(list);
+            (list, crate::list::host_list(list).expect("a host list"))
+        }
+
+        /// Closes the lists and submits them together, in order.
+        fn run(&self) {
+            for &list in &self.lists {
+                let close = slot::<extern "system" fn(This) -> HRESULT>(list, 0x48);
+                assert_eq!(close(list), S_OK);
+            }
+            let submit = slot::<extern "system" fn(This, u32, *const This)>(self.queue, 0x50);
+            submit(self.queue, self.lists.len() as u32, self.lists.as_ptr());
+        }
+
+        /// Waits, as a title does, for a fence the queue signals after what
+        /// was submitted (run by the queue worker with asynchronous queues).
+        fn wait(&self) {
+            let null = std::ptr::null();
+            let mut fence = null;
+            let fence_iid = &crate::fence::FENCE_IIDS[0];
+            assert_eq!(
+                crate::fence::create(null, 0, 0, fence_iid, &mut fence),
+                S_OK
+            );
+            assert_eq!(crate::queue::signal_for_tests(self.queue, fence, 1), S_OK);
+            let value = slot::<extern "system" fn(This) -> u64>(fence, 0x40);
+            let started = std::time::Instant::now();
+            while value(fence) < 1 {
+                assert!(
+                    started.elapsed() < std::time::Duration::from_secs(10),
+                    "the queue worker never signalled after the submission"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+
+        /// Runs the lists as one part (`cut` false) or cut where they depend
+        /// on each other, on this thread; the parts the submission ran in.
+        fn run_cut(&self, cut: bool) -> usize {
+            crate::host::UNCUT_FOR_TESTS.set(!cut);
+            self.run();
+            crate::host::UNCUT_FOR_TESTS.set(false);
+            crate::host::PARTS_FOR_TESTS.get()
+        }
+    }
+
+    /// Whether to skip: no host device (a failure with
+    /// `VICTORY_WARP_REQUIRED=1`).
+    #[cfg(windows)]
+    fn no_host_device() -> bool {
+        if crate::host::host().is_some() {
+            return false;
+        }
+        assert!(
+            !crate::warp::required(),
+            "VICTORY_WARP_REQUIRED=1, but the GPU layer has no host device"
+        );
+        true
+    }
+
+    /// A committed title buffer of `len` bytes of `fill`, and its address.
+    #[cfg(windows)]
+    fn filled(len: u64, fill: u8) -> (This, usize) {
+        let null = std::ptr::null();
+        let mut out = null;
+        let desc = buffer(len);
+        let iid = &RESOURCE_IIDS[0];
+        assert_eq!(
+            create_committed(null, &PROPERTIES, 0, &desc, 0, null.cast(), iid, &mut out),
+            S_OK
+        );
+        let (data, _) = buffer_bytes(out).unwrap();
+        // SAFETY: the buffer holds `len` bytes.
+        unsafe { data.write_bytes(fill, len as usize) };
+        (out, data as usize)
+    }
+
+    /// Title memory `[at, at + len)`, as the title reads it once the
+    /// submission has run.
+    #[cfg(windows)]
+    fn title_bytes(at: usize, len: usize) -> Vec<u8> {
+        // SAFETY: memory of the test's own buffers.
+        unsafe { std::slice::from_raw_parts(at as *const u8, len) }.to_vec()
+    }
+
+    /// The bytes [`WRITER`] writes as dwords `range`.
+    #[cfg(windows)]
+    fn dwords(range: std::ops::Range<u32>) -> Vec<u8> {
+        let bytes = |i: u32| (0xC0DE_0000 | i).to_le_bytes();
+        range.flat_map(bytes).collect()
+    }
+
+    /// Our compute pass writes dwords `0xc0de0000 | i` over `len` bytes (a
+    /// multiple of 256) of title memory from `at` on, through `copy` (a
+    /// host copy holding them), declared written as a title dispatch's
+    /// writes are.
+    #[cfg(windows)]
+    fn shaders_write(
+        list: &crate::host::HostList,
+        copy: &std::sync::Arc<crate::shadow::Shadow>,
+        at: usize,
+        len: usize,
+    ) {
+        let writer = crate::copy::compute(WRITER, windows::core::s!("writer")).expect("a writer");
+        copy.refresh(list, at as u64, len as u64);
+        copy.gpu_writes(list, at as u64, len as u64);
+        // SAFETY: an open list, our pipeline, a live host copy.
+        unsafe {
+            let l = &list.list;
+            l.SetComputeRootSignature(&writer.root);
+            l.SetPipelineState(&writer.pso);
+            l.SetComputeRootUnorderedAccessView(0, copy.gpu(at as u64));
+            l.Dispatch((len / 256) as u32, 1, 1);
+        }
+        list.keep(&writer.pso);
+        list.keep(&writer.root);
+    }
+
+    /// GPU work that reads `len` bytes of title memory at `from` and writes
+    /// them at `to` (the ordered copy, through their host copies).
+    #[cfg(windows)]
+    fn gpu_copies(list: &crate::host::HostList, to: usize, from: usize, len: u64) {
+        assert!(crate::copy::buffers(list, to as u64, from as u64, len));
+    }
+
+    /// The title's CopyBufferRegion.
+    #[cfg(windows)]
+    fn title_copies(list: This, (dst, at): (This, u64), (src, from): (This, u64), len: u64) {
+        type CopyBuffer = extern "system" fn(This, This, u64, This, u64, u64);
+        slot::<CopyBuffer>(list, 0x78)(list, dst, at, src, from, len);
+    }
+
+    /// Shaders of one list write A, the next list copies A to B, by
+    /// CopyBufferRegion and by CopyMemoryToMemoryX: as one part the copy
+    /// takes A's bytes from before the shaders ran; cut, what they wrote.
+    #[cfg(windows)]
+    #[test]
+    fn copies_in_later_lists_read_what_earlier_lists_shaders_wrote() {
+        if no_host_device() {
+            return;
+        }
+        for memory in [false, true] {
+            for cut in [false, true] {
+                let (a, at_a) = filled(1024, 0x11);
+                let (b, at_b) = filled(1024, 0x22);
+                let mut lists = Lists::new();
+                let (_, first) = lists.list();
+                let copy = crate::shadow::find(at_a as u64, 1024).expect("A's host copy");
+                shaders_write(first, &copy, at_a, 1024);
+                let (second, _) = lists.list();
+                if memory {
+                    crate::list::copy_memory(second, at_b as u64, at_a as u64, 1024, 0);
+                } else {
+                    title_copies(second, (b, 0), (a, 0), 1024);
+                }
+                let parts = lists.run_cut(cut);
+                let what = if memory { "memory copy" } else { "buffer copy" };
+                assert_eq!(title_bytes(at_a, 1024), dwords(0..256), "{what}: A");
+                let got = title_bytes(at_b, 1024);
+                if cut {
+                    assert_eq!(parts, 2, "{what}");
+                    assert_eq!(got, dwords(0..256), "{what}: B has what they wrote");
+                } else {
+                    assert_eq!(parts, 1, "{what}");
+                    assert!(
+                        got.iter().all(|&x| x == 0x11),
+                        "{what}, one part: A's bytes from before: {:02x?}",
+                        &got[..8]
+                    );
+                }
+            }
+        }
+    }
+
+    /// A chain: shaders write A, a copy takes A to B, GPU work reads B into
+    /// C, a copy takes C to D. Three parts: the copy after the shaders and
+    /// the copy after the GPU copy each start one; GPU work after a copy
+    /// needs none (the copy runs first).
+    #[cfg(windows)]
+    #[test]
+    fn dependent_lists_run_in_as_many_parts_as_they_need() {
+        if no_host_device() {
+            return;
+        }
+        let (a, at_a) = filled(1024, 0x11);
+        let (b, at_b) = filled(1024, 0x22);
+        let (c, at_c) = filled(1024, 0x33);
+        let (d, at_d) = filled(1024, 0x44);
+        let mut lists = Lists::new();
+        let (_, first) = lists.list();
+        let copy = crate::shadow::find(at_a as u64, 1024).expect("A's host copy");
+        shaders_write(first, &copy, at_a, 1024);
+        let (second, _) = lists.list();
+        title_copies(second, (b, 0), (a, 0), 1024);
+        let (_, third) = lists.list();
+        gpu_copies(third, at_c, at_b, 1024);
+        let (fourth, _) = lists.list();
+        title_copies(fourth, (d, 0), (c, 0), 1024);
+        assert_eq!(lists.run_cut(true), 3);
+        for (name, at) in [("B", at_b), ("C", at_c), ("D", at_d)] {
+            assert_eq!(title_bytes(at, 1024), dwords(0..256), "{name}");
+        }
+    }
+
+    /// Shaders write A's first half; a later list copies 512 bytes of A to B:
+    /// from A's second half, sharing no byte, in one part; from 4 bytes
+    /// before it, sharing the shaders' last dword, cut.
+    #[cfg(windows)]
+    #[test]
+    fn only_lists_sharing_bytes_are_cut_apart() {
+        if no_host_device() {
+            return;
+        }
+        for (from, parts) in [(512usize, 1usize), (508, 2)] {
+            let (a, at_a) = filled(1024, 0x11);
+            let (b, at_b) = filled(1024, 0x22);
+            let mut lists = Lists::new();
+            let (_, first) = lists.list();
+            let copy = crate::shadow::find(at_a as u64, 1024).expect("A's host copy");
+            shaders_write(first, &copy, at_a, 512);
+            let (second, _) = lists.list();
+            title_copies(second, (b, 0), (a, from as u64), 512);
+            assert_eq!(lists.run_cut(true), parts, "copying from {from}");
+            let mut a_after = dwords(0..128);
+            a_after.extend([0x11; 512]);
+            assert_eq!(title_bytes(at_a, 1024), a_after);
+            let mut want = a_after[from..from + 512].to_vec();
+            want.extend([0x22; 512]);
+            assert_eq!(title_bytes(at_b, 1024), want, "copying from {from}");
+        }
+    }
+
+    /// Two buffers over the same memory, each with its own host copy: P, a
+    /// heap's first 192 KiB, and Q, 64 KiB inside it. Shaders write where Q
+    /// lies through P's copy; a later list's GPU work reads it through Q's
+    /// copy, brought up to date from title memory only: as one part from
+    /// before the shaders ran (the heap's zeros), cut from what they wrote.
+    #[cfg(windows)]
+    #[test]
+    fn aliased_buffers_see_earlier_lists_shader_writes() {
+        if no_host_device() {
+            return;
+        }
+        for cut in [false, true] {
+            let null = std::ptr::null();
+            let heap = heap(4 * KIB_64);
+            let place = |offset: u64, len: u64, out: &mut This| {
+                let desc = buffer(len);
+                let iid = &RESOURCE_IIDS[0];
+                create_placed(null, heap, offset, &desc, 0, null.cast(), iid, out)
+            };
+            let (mut p, mut q) = (null, null);
+            assert_eq!(place(0, 3 * KIB_64, &mut p), S_OK);
+            assert_eq!(place(KIB_64, KIB_64, &mut q), S_OK);
+            let at_p = buffer_bytes(p).unwrap().0 as u64;
+            let at_q = buffer_bytes(q).unwrap().0 as usize;
+            let (_, at_b) = filled(1024, 0x22);
+            let whole = crate::shadow::find(at_p, 3 * KIB_64).expect("P's host copy");
+            let inner = crate::shadow::find(at_q as u64, 1024).expect("Q's host copy");
+            assert!(!std::sync::Arc::ptr_eq(&whole, &inner), "two host copies");
+            let mut lists = Lists::new();
+            let (_, first) = lists.list();
+            shaders_write(first, &whole, at_q, 1024);
+            let (_, second) = lists.list();
+            gpu_copies(second, at_b, at_q, 1024);
+            assert_eq!(lists.run_cut(cut), if cut { 2 } else { 1 });
+            let got = title_bytes(at_b, 1024);
+            if cut {
+                assert_eq!(got, dwords(0..256), "through Q, what was written through P");
+            } else {
+                assert!(
+                    got.iter().all(|&x| x == 0),
+                    "one part: Q's copy from before: {:02x?}",
+                    &got[..8]
+                );
+            }
+        }
+    }
+
+    /// Copies over memory earlier lists' GPU work uses. Shaders write A, a
+    /// later list copies W over A: as one part the copy runs first and the
+    /// shaders' bytes, copied back after, win; cut, the copy's. GPU work
+    /// reads Y into Z1, a later list copies X over Y, GPU work reads Y into
+    /// Z2: as one part Y's host copy is brought up to date for the last
+    /// reader before the first one runs, so both get X; cut, Z1 gets Y as
+    /// it was.
+    #[cfg(windows)]
+    #[test]
+    fn copies_over_memory_earlier_lists_use_wait_for_them() {
+        if no_host_device() {
+            return;
+        }
+        for cut in [false, true] {
+            let parts = if cut { 2 } else { 1 };
+            let (a, at_a) = filled(1024, 0x11);
+            let (w, _) = filled(1024, 0x44);
+            let mut lists = Lists::new();
+            let (_, first) = lists.list();
+            let copy = crate::shadow::find(at_a as u64, 1024).expect("A's host copy");
+            shaders_write(first, &copy, at_a, 1024);
+            let (second, _) = lists.list();
+            title_copies(second, (a, 0), (w, 0), 1024);
+            assert_eq!(lists.run_cut(cut), parts);
+            let got = title_bytes(at_a, 1024);
+            if cut {
+                assert!(
+                    got.iter().all(|&x| x == 0x44),
+                    "the copy last: {:02x?}",
+                    &got[..8]
+                );
+            } else {
+                assert_eq!(got, dwords(0..256), "one part: the shaders' bytes last");
+            }
+
+            let (y, at_y) = filled(1024, 0x33);
+            let (x, _) = filled(1024, 0x44);
+            let (_, at_z1) = filled(1024, 0x55);
+            let (_, at_z2) = filled(1024, 0x66);
+            let mut lists = Lists::new();
+            let (_, first) = lists.list();
+            gpu_copies(first, at_z1, at_y, 1024);
+            let (second, _) = lists.list();
+            title_copies(second, (y, 0), (x, 0), 1024);
+            let (_, third) = lists.list();
+            gpu_copies(third, at_z2, at_y, 1024);
+            assert_eq!(lists.run_cut(cut), parts);
+            let z2 = title_bytes(at_z2, 1024);
+            assert!(
+                z2.iter().all(|&v| v == 0x44),
+                "Z2 reads the copy: {:02x?}",
+                &z2[..8]
+            );
+            let z1 = title_bytes(at_z1, 1024);
+            let want = if cut { 0x33 } else { 0x44 };
+            assert!(z1.iter().all(|&v| v == want), "Z1: {:02x?}", &z1[..8]);
+        }
+    }
+
+    /// With asynchronous queues the queue worker runs the submission, cut
+    /// as on the title's thread: the copy in the later list gets what the
+    /// earlier list's shaders wrote.
+    #[cfg(windows)]
+    #[test]
+    fn asynchronous_queues_cut_submissions_too() {
+        if no_host_device() {
+            return;
+        }
+        crate::queue::asynchronous_for_tests(true);
+        let (a, at_a) = filled(1024, 0x11);
+        let (b, at_b) = filled(1024, 0x22);
+        let mut lists = Lists::new();
+        let (_, first) = lists.list();
+        let copy = crate::shadow::find(at_a as u64, 1024).expect("A's host copy");
+        shaders_write(first, &copy, at_a, 1024);
+        let (second, _) = lists.list();
+        title_copies(second, (b, 0), (a, 0), 1024);
+        lists.run();
+        lists.wait();
+        crate::queue::asynchronous_for_tests(false);
+        assert_eq!(title_bytes(at_a, 1024), dwords(0..256));
+        assert_eq!(title_bytes(at_b, 1024), dwords(0..256));
+    }
 }

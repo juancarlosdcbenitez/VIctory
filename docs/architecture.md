@@ -129,10 +129,26 @@ has to keep true some other way:
 | C2 | GPU-written ranges reach title memory before the submission's bottom-of-pipe writes and fence signals tell the title it finished | step order in `execute` | completion (copy-back, bottom-of-pipe writes, signals) run by the queue worker after the host fence |
 | C3 | Preparation reads title memory only after every earlier submission's copy-back of the ranges it reads | the CPU wait | `inflight::InFlight`: wait for exactly the submission that writes a range about to be read |
 | C4 | Work on one title queue runs in submission order, behind the waits it was submitted after | `schedule::Schedule`; work run at once claims its queue | unchanged |
-| C5 | A copy runs after the GPU work recorded before it (D3D12's order on a queue) | **partly**: a title buffer copy whose source shaders recorded earlier in the same list write runs on the GPU, in order (`copy`: a compute pass between the host copies, the destination copied back afterwards); other buffer copies run on the CPU when the submission starts, in step order with the other CPU work (fills of upload memory after a copy read what it wrote), so a copy reading what shaders of an earlier list in the same submission write, and a fill of upload memory reading what shaders wrote, take the bytes from before they ran: counted and logged (`host::STALE_COPIES`) | the same |
+| C5 | Work runs after the GPU work recorded before it (D3D12's order on a queue) | **across lists**: a submission is cut before a list whose work at submission (copies, fills of upload memory, rectangle expansion, all on the CPU before any GPU work) reads or writes title memory that GPU work of an earlier list in its part writes, or writes title memory such work reads, and before a list whose GPU work reads or writes, through another copy of the same memory, what earlier GPU work writes (`order`); each part runs, and what it wrote reaches title memory, before the next part's work at submission. **Inside a list** (nothing to cut): a title buffer or memory copy whose source shaders recorded earlier in the list write runs on the GPU, in order (`copy`: a compute pass between the host copies, the destination copied back afterwards); fills and expansions reading such memory still run first, counted and logged (`host::STALE_COPIES`), and so do copies over memory earlier GPU work in the list reads or writes (not counted) | the same; each cut would then cost a wait, where ordering the dependent work on the GPU would not |
 | O1 | A host list belongs to the submission running it; a title list reset or released meanwhile gets a fresh host list | `Arc` shared with held work | unchanged |
 | O2 | Host resources, allocators and descriptor slots a submission uses live until it finishes | released after `execute` returns, after the GPU finished; the dynamic descriptor slots of fresh tables and the list-owned upload memory are the host list's, so held work keeps them | `inflight::Retire`, released by host fence value |
 | O3 | The probe buffer is read and cleared between submissions | the lock | a probe buffer per submission in flight |
+
+What C5's cuts see (`order::Access`, from each list's steps): GPU reads
+are the ranges brought up to date for it (buffer views, root views,
+tables' buffers, textures it samples), each with the copy it reads
+(buffers' host copies differ per title buffer, so nested or aliased
+buffers, and textures over a buffer's memory, are different copies of the
+same title memory, made consistent only through title memory); GPU writes
+are the ranges declared written (unordered access, GPU copies) and
+bottom-of-pipe writes; CPU reads and writes are the copies', fills' and
+expansions' ranges. Not seen: buffers read through directly indexed heaps,
+which are not brought up to date per use (shadow.rs), and what shaders
+write into host textures (render targets, texture UAVs), which never
+reaches title memory. Inside a list, a copy over memory earlier GPU work
+reads or writes is not moved to the GPU: a fill after it in the list (a
+constant buffer not 256-byte aligned) would then read title memory from
+before it.
 
 `inflight::Retire` and `inflight::InFlight` exist and are tested (WARP:
 eight submissions in flight with their own upload buffers and allocators,

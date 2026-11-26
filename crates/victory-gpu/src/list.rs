@@ -946,15 +946,7 @@ pub(crate) extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u
             with_state(this, |_, state| state.forget_compute_binding());
             return;
         }
-        let len = len as usize;
-        list.defer(move || {
-            if crate::texture::committed(src as *const u8, len)
-                && crate::texture::committed(dst as *const u8, len)
-            {
-                // SAFETY: both ranges are committed title memory.
-                unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len) };
-            }
-        });
+        list.defer_move(dst as usize, src as usize, len as usize);
     }
     #[cfg(not(windows))]
     let _ = (this, dst, src, len);

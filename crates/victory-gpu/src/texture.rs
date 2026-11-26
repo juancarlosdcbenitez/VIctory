@@ -208,6 +208,12 @@ pub(crate) fn refresh(due: &[Arc<Staging>]) {
 }
 
 impl Staging {
+    /// The title memory it is detiled from, `[start, end)`.
+    pub(crate) fn span(&self) -> crate::order::Range {
+        let start = self.memory as usize;
+        (start, start.saturating_add(self.layout.size as usize))
+    }
+
     /// Detiles the texture memory into the staging buffer if it changed
     /// since the last time (and is mapped at all), hashing on up to
     /// `threads` threads; returns the bytes of title memory read.
