@@ -615,6 +615,13 @@ green.
   bytes the GPU changed) and over what GPU work read (old: the earlier
   reader saw the copy); the first case on asynchronous queues. Run 52
   failed on my expectation for that mix; run 53 passed all of them.
+  Measured afterwards (`order::tests::cut_decisions_per_submission`, an
+  ignored benchmark, this container's CPU, not a frame rate): deciding the
+  cuts of a world-sized submission (48 lists of 2,000 reads, 50 writes,
+  200 fills, 5 copies) took 30.5 ms, every list re-sorting every read so
+  far; `56c5050` keeps only reads some copy of the submission writes and
+  checks copies against each other only where they hold the same memory:
+  ~0.2 ms, and ~0.3 ms with every buffer nested in one written buffer.
   Inside one list nothing can be cut and nothing changed: fills and
   expansions reading what earlier shaders of the list write are counted
   (`STALE_COPIES`); copies over memory earlier GPU work in the list reads
@@ -635,6 +642,17 @@ green.
   long rows, dispatch limits, barriers, and that the pass leaves no state
   behind (every title draw and dispatch sets its pipeline, root signature
   and arguments again; graphics bindings, heaps and targets untouched).
+* **Texture-to-buffer copies of other subresources** (`28684cb`; run 54):
+  the path finds a subresource's mip and plane from its index and a 3D
+  texture's slices from the box, which the first tests (mip 0 of 2D
+  textures) did not reach. New fixtures: an 8x8 RGBA8 texture of two
+  slices and two mips (a box of mip 1 of slice 1, all of mip 1 of slice
+  0) and a 4x4x4 volume (depth slices 1..3); every byte checked. Passed.
+  Reviewed and unchanged: buffer-to-texture copies take the title's
+  footprint as it is (our GetCopyableFootprints gives PC pitches, and no
+  title is known to compute others); a texture the GPU renders to is never
+  refreshed from title memory before it is copied out, so its source is
+  what the GPU wrote.
 
 ## Backlog
 

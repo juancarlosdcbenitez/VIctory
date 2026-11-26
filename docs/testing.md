@@ -267,4 +267,6 @@ the copy-back merge), `detile_speed` (victory-formats), `bcpack_throughput`
 (victory-formats), `bench_write` (victory-shader, the bitcode writer),
 `hashing_throughput` (victory-core: one thread against split hashes and
 side-by-side inputs, as texture checks use them), `texture_checks_per_submission`
-(victory-gpu). They measure CPU throughput, never frame rates.
+(victory-gpu), `cut_decisions_per_submission` (victory-gpu, any host: what
+deciding a world-sized submission's cuts costs, with separate and with
+nested buffers). They measure CPU throughput, never frame rates.
