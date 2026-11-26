@@ -137,6 +137,12 @@ with more than 16 logical processors, one more load with
 default) shorten that; with fewer, whether they were taking time from the
 title's own loading threads.
 
+Since the seventh session the console's pipeline syncs become barriers
+(D3D12 does not order a dispatch's writes before later work otherwise).
+If the world shows corruption or flicker that stage 3 did not, or frames
+much slower, one more load with `VICTORY_PIPELINE_SYNCS=0` (the old
+behaviour) says whether the barriers are the cause.
+
 In stage 3's log, also count `copies at submission that read what shaders
 earlier in their submission write`: each is a copy that took stale bytes
 (the GPU orders it after those shaders; we copy before the submission

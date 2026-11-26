@@ -1058,7 +1058,8 @@ extern "system" fn sync(this: This, _flags: u32, _control: u32, _address: u64, _
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
         // SAFETY: the same layout (checked where barriers are translated).
-        let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
+        let barrier =
+            unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
         // SAFETY: an open list; a global barrier names no resource.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
         SYNCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
