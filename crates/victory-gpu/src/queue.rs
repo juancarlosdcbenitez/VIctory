@@ -702,8 +702,8 @@ fn show(frame: u64, resource: usize, copy: Option<&crate::resource::HostTexture>
         return;
     };
     const COPY_SOURCE: u32 = 0x800;
-    // As `resource::host_transition` both ways: the state the copy is in,
-    // tracked as the copy source meanwhile.
+    // The state the copy is in, tracked as the copy source while the
+    // present copies it, then back.
     let state = copy.state.swap(COPY_SOURCE, Ordering::Relaxed);
     let shown = host.present(&copy.texture, state, frame);
     copy.state.store(state, Ordering::Relaxed);
