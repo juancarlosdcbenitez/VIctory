@@ -130,6 +130,13 @@ the last lines of `stderr.txt` if the screen hangs. This is the run where
 the README's machine hung the GPU. A device removal here sends you to stage
 4; a hang without one, to stage 7 and then 6.
 
+The frame lines' `being made` count is the pipelines still being
+translated and compiled, whose draws are dropped meanwhile. On a machine
+with more than 16 logical processors, one more load with
+`VICTORY_PIPELINE_THREADS=16` shows whether more workers (at most 8 by
+default) shorten that; with fewer, whether they were taking time from the
+title's own loading threads.
+
 In stage 3's log, also count `copies at submission that read what shaders
 earlier in their submission write`: each is a copy that took stale bytes
 (the GPU orders it after those shaders; we copy before the submission
