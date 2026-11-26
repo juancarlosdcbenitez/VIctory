@@ -16,7 +16,7 @@
 //! indexed heaps keep what their first use copied.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -48,19 +48,43 @@ pub(crate) struct Shadow {
 /// Title ranges `[start, end)` shaders of the submission being run write,
 /// not yet copied back (submissions run one at a time): what
 /// [`written_by_gpu`] answers from.
+/// Each range once: the world declares the same big ranges dozens of times.
 static GPU_WRITTEN: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+/// How many ranges [`GPU_WRITTEN`] holds: most submissions declare none, and
+/// a fill of upload memory (one per constant-buffer table) asks each time.
+static GPU_WRITTEN_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Whether shaders of the submission being run write any byte of `[at, at +
 /// len)` of title memory. A copy that reads such a range at submission (a
 /// title buffer copy, a fill of upload memory) reads what was there before
 /// those shaders ran, where D3D12 orders it after them.
 pub(crate) fn written_by_gpu(at: usize, len: usize) -> bool {
+    if GPU_WRITTEN_COUNT.load(Ordering::Relaxed) == 0 {
+        return false;
+    }
     let end = at.saturating_add(len);
     GPU_WRITTEN
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .iter()
         .any(|&(a, e)| a < end && at < e)
+}
+
+/// Notes a range shaders of the running submission write.
+fn gpu_writes_range(range: (usize, usize)) {
+    let mut ranges = GPU_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !ranges.contains(&range) {
+        ranges.push(range);
+        GPU_WRITTEN_COUNT.store(ranges.len(), Ordering::Relaxed);
+    }
+}
+
+/// A range shaders wrote has been copied back.
+fn gpu_writes_done(range: (usize, usize)) {
+    let mut ranges = GPU_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+    ranges.retain(|&r| r != range);
+    GPU_WRITTEN_COUNT.store(ranges.len(), Ordering::Relaxed);
 }
 
 /// Snapshot memory kept for reuse (already touched, so no page faults).
@@ -171,10 +195,7 @@ impl Shadow {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push((address, address + len));
-        GPU_WRITTEN
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push((address, address + len));
+        gpu_writes_range((address, address + len));
         let (from, to) = self.inside(address, len);
         // SAFETY: inside the mapping.
         let host = |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
@@ -265,10 +286,7 @@ impl Shadow {
         // submission runs at a time), and the snapshot with the last range.
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         pending.retain(|&r| r != (address, address + len));
-        GPU_WRITTEN
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .retain(|&r| r != (address, address + len));
+        gpu_writes_done((address, address + len));
         if pending.is_empty()
             && let Some((_, bytes)) = snapshot.take()
         {
