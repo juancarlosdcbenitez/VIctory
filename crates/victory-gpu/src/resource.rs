@@ -1620,6 +1620,26 @@ mod tests {
         for (i, b) in bytes.iter_mut().enumerate() {
             *b = (i % 251) as u8;
         }
+        // Copied first, so the source's upload memory is not the first of
+        // the list's: a copy reading the wrong offset would leave these
+        // bytes in the texture.
+        let mut other = null;
+        assert_eq!(
+            create_committed(
+                null,
+                &PROPERTIES,
+                0,
+                &buffer(1024),
+                0,
+                null.cast(),
+                iid,
+                &mut other
+            ),
+            S_OK
+        );
+        let (first, _) = buffer_bytes(other).unwrap();
+        // SAFETY: the buffer holds 1024 bytes.
+        unsafe { first.write_bytes(0xee, 1024) };
 
         let queue_iid = guid(
             0x0ec870a6,
@@ -1678,8 +1698,13 @@ mod tests {
             kind: 1,
             footprint: rows,
         };
+        let from_other = Location {
+            resource: other,
+            ..from
+        };
         type Copy =
             extern "system" fn(This, *const Location, u32, u32, u32, *const Location, *const u8);
+        slot::<Copy>(list, 0x80)(list, &to, 0, 0, 0, &from_other, null.cast());
         slot::<Copy>(list, 0x80)(list, &to, 0, 0, 0, &from, null.cast());
         slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list);
         slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
