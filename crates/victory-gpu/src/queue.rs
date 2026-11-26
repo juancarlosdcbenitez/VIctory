@@ -13,6 +13,12 @@
 //!
 //! shortcut: presents and page mappings on a held queue run at once (they
 //! read title memory at the call); they are counted.
+//!
+//! Experimental (diagnostics builds, `VICTORY_QUEUE_ASYNC=1`): every
+//! submission, signal, present and page mapping is held and run by the
+//! queue worker in each queue's order, so title threads never wait for the
+//! GPU in a submission; presents and page mappings take what they read at
+//! the call. Off by default: not run on a GPU yet.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -66,7 +72,36 @@ enum Held {
     Execute(Vec<std::sync::Arc<crate::host::HostList>>),
     /// A signal of the fence whose value is at `fence`.
     Signal { fence: usize, value: u64 },
+    /// A present (asynchronous queues): frame `frame` of the title texture
+    /// at `resource` (for the log), whose host copy is `shown`.
+    Present {
+        frame: u64,
+        resource: usize,
+        #[cfg(windows)]
+        shown: Option<HostCopy>,
+    },
+    /// Page mappings (asynchronous queues), from the pool of `pool_pages`
+    /// pages at `pool`.
+    Map {
+        batches: Batches,
+        pool: u64,
+        pool_pages: u32,
+    },
 }
+
+/// Page mapping batches as read at the call: each batch's destination and
+/// its ranges as (kind, start, count) (see [`PageRange`]).
+type Batches = Vec<(u64, Vec<(u32, u32, u32)>)>;
+
+/// A title texture's host copy, for a present run later.
+#[cfg(windows)]
+struct HostCopy(std::sync::Arc<crate::resource::HostTexture>);
+
+// SAFETY: D3D12 resources are free-threaded, and the state is atomic; the
+// held present only reads the copy and moves its state, as a present on
+// the title's thread does.
+#[cfg(windows)]
+unsafe impl Send for HostCopy {}
 
 /// The queues' held work, by queue object.
 static QUEUES: Mutex<Schedule<Held>> = Mutex::new(Schedule::new());
@@ -87,6 +122,38 @@ static HELD: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 #[cfg(windows)]
 pub(crate) fn take_held() -> [u64; 2] {
     [0, 1].map(|i| HELD[i].swap(0, Ordering::Relaxed))
+}
+
+/// Whether every queue holds what is submitted to it for the worker
+/// (experimental, see the module): diagnostics builds with
+/// `VICTORY_QUEUE_ASYNC=1`, while queue waits hold work back.
+fn asynchronous() -> bool {
+    #[cfg(test)]
+    if ASYNC_FOR_TESTS.get() {
+        return true;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let asked = cfg!(feature = "diagnostics")
+            && std::env::var("VICTORY_QUEUE_ASYNC").is_ok_and(|v| v.trim() == "1");
+        if asked && !holding() {
+            tracing::warn!("VICTORY_QUEUE_ASYNC=1 needs queue waits to hold work: not asynchronous");
+            return false;
+        }
+        if asked {
+            tracing::warn!(
+                "VICTORY_QUEUE_ASYNC=1: submissions, signals, presents and page mappings run on the \
+                 queue worker (experimental)"
+            );
+        }
+        asked
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Asynchronous queues for the calls of one test's thread.
+    static ASYNC_FOR_TESTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Whether queue waits hold work back (the default). With the
@@ -142,18 +209,32 @@ impl Drop for Claim {
 /// Holds `held` back if the queue has waits not reached (or work before
 /// it), else claims the queue for the caller to run it now.
 fn hold(queue: usize, held: impl FnOnce() -> Held) -> Submit {
-    if !holding() {
+    if !holding() && !asynchronous() {
         return Submit::Now(Claim(None));
+    }
+    if asynchronous() {
+        to_worker(queue, held());
+        return Submit::Held;
     }
     let mut q = queues();
     if q.direct(queue) {
         return Submit::Now(Claim(Some(queue)));
     }
-    q.submit(queue, held());
+    // The queue holds something, so this is kept.
+    let _ = q.submit(queue, held());
+    drop(q);
     HELD[0].fetch_add(1, Ordering::Relaxed);
     start_worker();
     MOVED.notify_all();
     Submit::Held
+}
+
+/// Asynchronous queues: keeps `item` for the worker, in the queue's order.
+fn to_worker(queue: usize, item: Held) {
+    queues().defer(queue, item);
+    HELD[0].fetch_add(1, Ordering::Relaxed);
+    start_worker();
+    MOVED.notify_all();
 }
 
 fn start_worker() {
@@ -216,6 +297,7 @@ fn worker() {
                 Held::Signal { fence, value } => Some((fence, value)),
                 #[cfg(windows)]
                 Held::Execute(_) => None,
+                Held::Present { .. } | Held::Map { .. } => None,
             });
             tracing::warn!(
                 seconds = waited.as_secs(),
@@ -254,6 +336,24 @@ fn run(ready: Vec<(usize, Held)>) {
                     );
                 }
             }
+            Held::Present {
+                frame,
+                resource,
+                #[cfg(windows)]
+                shown,
+            } => {
+                #[cfg(windows)]
+                show(frame, resource, shown.as_ref().map(|c| &*c.0));
+                #[cfg(not(windows))]
+                let _ = (frame, resource);
+                #[cfg(test)]
+                HELD_PRESENTS_RUN.fetch_add(1, Ordering::SeqCst);
+            }
+            Held::Map {
+                batches,
+                pool,
+                pool_pages,
+            } => map_pages(&batches, pool, pool_pages),
         }
         if !done.contains(&queue) {
             done.push(queue);
@@ -516,7 +616,9 @@ extern "system" fn present(
     plane_parameters: *const Plane,
     _parameters: *const u8,
 ) -> HRESULT {
-    ran_ahead(this as usize, "a present");
+    if !asynchronous() {
+        ran_ahead(this as usize, "a present");
+    }
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
@@ -546,35 +648,61 @@ extern "system" fn present(
             tracing::info!(hits, misses, "shaders from the cache and translated so far");
         }
     }
-    #[cfg(all(windows, feature = "diagnostics"))]
-    if crate::capture::listed(frame) {
-        crate::capture::dump_targets(frame);
-    }
-    #[cfg(windows)]
+    // The first plane's first resource, read at the call.
+    let mut resource: This = std::ptr::null();
     if planes > 0
         // SAFETY: the title passes `planes` plane descriptions.
         && let Some(plane) = unsafe { plane_parameters.as_ref() }
         && plane.count > 0
         && !plane.resources.is_null()
-        // SAFETY: the plane lists `count` resources.
-        && let resource = unsafe { *plane.resources }
-        && let Some(texture) = crate::resource::host_resource(resource)
-        && let Some(host) = crate::host::host()
     {
-        const COPY_SOURCE: u32 = 0x800;
-        let state = crate::resource::host_transition(resource, COPY_SOURCE)
-            .map_or(COPY_SOURCE, |(_, before)| before);
-        let shown = host.present(texture, state, frame);
-        crate::resource::host_transition(resource, state);
-        #[cfg(feature = "diagnostics")]
-        blinks(frame, resource, state, shown);
-        #[cfg(not(feature = "diagnostics"))]
-        let _ = shown;
+        // SAFETY: the plane lists `count` resources.
+        resource = unsafe { *plane.resources };
     }
-    #[cfg(not(windows))]
-    let _ = (planes, plane_parameters);
+    #[cfg(windows)]
+    let shown = crate::resource::host_copy(resource).map(HostCopy);
+    if asynchronous() {
+        // In order with the queue's work: the worker presents.
+        let held = Held::Present {
+            frame,
+            resource: resource as usize,
+            #[cfg(windows)]
+            shown,
+        };
+        to_worker(this as usize, held);
+        return S_OK;
+    }
+    #[cfg(windows)]
+    show(frame, resource as usize, shown.as_ref().map(|c| &*c.0));
     S_OK
 }
+
+/// The host part of a present: the frames listed for capture saved, and the
+/// title texture's host copy (if it has one) shown in our window.
+#[cfg(windows)]
+fn show(frame: u64, resource: usize, copy: Option<&crate::resource::HostTexture>) {
+    #[cfg(feature = "diagnostics")]
+    if crate::capture::listed(frame) {
+        crate::capture::dump_targets(frame);
+    }
+    let (Some(copy), Some(host)) = (copy, crate::host::host()) else {
+        return;
+    };
+    const COPY_SOURCE: u32 = 0x800;
+    // As `resource::host_transition` both ways: the state the copy is in,
+    // tracked as the copy source meanwhile.
+    let state = copy.state.swap(COPY_SOURCE, Ordering::Relaxed);
+    let shown = host.present(&copy.texture, state, frame);
+    copy.state.store(state, Ordering::Relaxed);
+    #[cfg(feature = "diagnostics")]
+    blinks(frame, resource as This, state, shown);
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = (shown, resource);
+}
+
+/// Held presents the worker has run (tests).
+#[cfg(test)]
+static HELD_PRESENTS_RUN: AtomicU64 = AtomicU64::new(0);
 /// Diagnostics: logs a presented frame that is black after one that was
 /// not, with what was presented and how many draws ran since.
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -644,10 +772,12 @@ extern "system" fn copy_page_mappings(
     pool_pages: u32,
     _flags: u32,
 ) -> HRESULT {
-    ran_ahead(this as usize, "a page mapping");
-    let Some(map) = crate::resource::page_mapper() else {
+    if !asynchronous() {
+        ran_ahead(this as usize, "a page mapping");
+    }
+    if crate::resource::page_mapper().is_none() {
         return E_INVALIDARG;
-    };
+    }
     if batches.is_null() && count > 0 {
         return E_INVALIDARG;
     }
@@ -655,21 +785,49 @@ extern "system" fn copy_page_mappings(
         // SAFETY: the title passes `count` batches.
         unsafe { std::slice::from_raw_parts(batches, count as usize) }
     });
+    // What the call names, read now: the worker may map it later.
+    let batches: Batches = batches
+        .into_iter()
+        .flatten()
+        .filter(|b| !b.ranges.is_null())
+        .map(|b| {
+            // SAFETY: each batch holds `count` ranges.
+            let ranges = unsafe { std::slice::from_raw_parts(b.ranges, b.count as usize) };
+            (
+                b.destination,
+                ranges.iter().map(|r| (r.kind, r.start, r.count)).collect(),
+            )
+        })
+        .collect();
+    if asynchronous() {
+        // In order with the queue's work: the worker maps.
+        let held = Held::Map {
+            batches,
+            pool,
+            pool_pages,
+        };
+        to_worker(this as usize, held);
+        return S_OK;
+    }
+    map_pages(&batches, pool, pool_pages);
+    S_OK
+}
+
+/// Maps the batches' ranges (see [`copy_page_mappings`]).
+fn map_pages(batches: &Batches, pool: u64, pool_pages: u32) {
+    let Some(map) = crate::resource::page_mapper() else {
+        return;
+    };
     let mut ok = true;
-    for b in batches.into_iter().flatten() {
-        if b.ranges.is_null() {
-            continue;
-        }
-        // SAFETY: each batch holds `count` ranges.
-        let ranges = unsafe { std::slice::from_raw_parts(b.ranges, b.count as usize) };
-        let mut at = b.destination;
-        for r in ranges {
-            let len = u64::from(r.count) * PAGE;
-            let inside = |pages: u32| r.start.checked_add(pages).is_some_and(|e| e <= pool_pages);
-            let source = pool + u64::from(r.start) * PAGE;
-            ok &= match r.kind {
-                0 if inside(r.count) => map(at, source, len),
-                1 if inside(1) => (0..u64::from(r.count)).all(|k| map(at + k * PAGE, source, PAGE)),
+    for (destination, ranges) in batches {
+        let mut at = *destination;
+        for &(kind, start, count) in ranges {
+            let len = u64::from(count) * PAGE;
+            let inside = |pages: u32| start.checked_add(pages).is_some_and(|e| e <= pool_pages);
+            let source = pool + u64::from(start) * PAGE;
+            ok &= match kind {
+                0 if inside(count) => map(at, source, len),
+                1 if inside(1) => (0..u64::from(count)).all(|k| map(at + k * PAGE, source, PAGE)),
                 2 => map(at, 0, len),
                 3 => true,
                 _ => false,
@@ -681,7 +839,6 @@ extern "system" fn copy_page_mappings(
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed"));
     }
-    S_OK
 }
 
 extern "system" fn desc(this: This, out: *mut QueueDesc) {
@@ -901,6 +1058,38 @@ mod tests {
         // SAFETY: the fence's value, as titles store it.
         unsafe { at.write_volatile(2) };
         assert!(reaches(g, 1));
+    }
+
+    /// Asynchronous queues (experimental): the worker runs every signal,
+    /// even on a queue nothing holds, and a present is held in order with
+    /// the queue's work: behind a wait not reached, neither the present nor
+    /// the signal after it runs; once the wait is reached, both do, the
+    /// present first.
+    #[test]
+    fn asynchronous_queues_run_signals_and_presents_on_the_worker_in_order() {
+        ASYNC_FOR_TESTS.set(true);
+        let q = new_queue();
+        let (f, g) = (new_fence(0), new_fence(0));
+        assert_eq!(signal(q, g, 1), S_OK);
+        assert!(reaches(g, 1), "the worker signals");
+        assert_eq!(wait(q, f, 1), S_OK);
+        let presents = HELD_PRESENTS_RUN.load(Ordering::SeqCst);
+        assert_eq!(present(q, 0, std::ptr::null(), std::ptr::null()), S_OK);
+        assert_eq!(signal(q, g, 2), S_OK);
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(value(g), 1, "held behind the wait");
+        assert_eq!(
+            HELD_PRESENTS_RUN.load(Ordering::SeqCst),
+            presents,
+            "the present is held too"
+        );
+        assert_eq!(crate::fence::signal(f, 1), S_OK);
+        assert!(reaches(g, 2), "released");
+        assert!(
+            HELD_PRESENTS_RUN.load(Ordering::SeqCst) > presents,
+            "the present ran before the signal behind it"
+        );
+        ASYNC_FOR_TESTS.set(false);
     }
 
     #[test]

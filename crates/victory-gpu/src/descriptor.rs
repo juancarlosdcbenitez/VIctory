@@ -585,7 +585,7 @@ fn tagged_record(handle: u64, tag: u32) -> Option<RtvRecord> {
 /// Device method.
 /// A shader-visible view heap of `count` descriptors in memory of its own,
 /// as a title makes one: for tests of other modules.
-#[cfg(test)]
+#[cfg(all(test, windows))]
 pub(crate) fn view_heap_for_tests(count: u32) -> This {
     #[repr(C)]
     struct Plain(HeapDesc, Placement);

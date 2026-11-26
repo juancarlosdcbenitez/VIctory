@@ -110,6 +110,15 @@ impl<T> Schedule<T> {
         None
     }
 
+    /// An operation kept for [`Schedule::runnable`] even if nothing holds
+    /// `queue` back: for queues whose work all runs on the worker.
+    pub(crate) fn defer(&mut self, queue: usize, op: T) {
+        self.queues
+            .entry(queue)
+            .or_default()
+            .push_back(Item::Op(op));
+    }
+
     /// `fence` moved to `value` (a signal, or a write to its memory): the
     /// held waits it reaches are satisfied from now on.
     pub(crate) fn fence_moved(&mut self, fence: usize, value: u64) {
@@ -252,6 +261,27 @@ mod tests {
         assert!(!s.direct(A), "busy with the released work");
         s.finished(A);
         assert!(s.direct(A));
+        s.finished(A);
+        assert!(!s.holds(A));
+    }
+
+    /// Deferred work (queues whose work all runs on the worker) is kept
+    /// even on a free queue, released in order with what follows it, and a
+    /// wait not reached holds back what is deferred after it.
+    #[test]
+    fn deferred_work_runs_on_the_worker_in_order() {
+        let mut s: Schedule<u32> = Schedule::new();
+        s.defer(A, 1);
+        s.defer(A, 2);
+        assert!(s.holds(A), "kept for the worker");
+        assert!(!s.direct(A));
+        assert_eq!(s.runnable(), vec![(A, 1), (A, 2)]);
+        s.finished(A);
+        s.wait(A, F, 4, 0);
+        s.defer(A, 3);
+        assert!(s.runnable().is_empty(), "behind the wait");
+        s.fence_moved(F, 4);
+        assert_eq!(s.runnable(), vec![(A, 3)]);
         s.finished(A);
         assert!(!s.holds(A));
     }

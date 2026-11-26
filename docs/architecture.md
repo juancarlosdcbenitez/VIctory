@@ -129,11 +129,32 @@ has to keep true some other way:
 | C2 | GPU-written ranges reach title memory before the submission's bottom-of-pipe writes and fence signals tell the title it finished | step order in `execute` | completion (copy-back, bottom-of-pipe writes, signals) run by the queue worker after the host fence |
 | C3 | Preparation reads title memory only after every earlier submission's copy-back of the ranges it reads | the CPU wait | `inflight::InFlight`: wait for exactly the submission that writes a range about to be read |
 | C4 | Work on one title queue runs in submission order, behind the waits it was submitted after | `schedule::Schedule`; work run at once claims its queue | unchanged |
-| O1 | A host list belongs to the submission running it; a title list reset meanwhile gets a fresh host list | `Arc` shared with held work | unchanged |
-| O2 | Host resources, allocators and descriptor slots a submission uses live until it finishes | released after `execute` returns, after the GPU finished | `inflight::Retire`, released by host fence value |
+| O1 | A host list belongs to the submission running it; a title list reset or released meanwhile gets a fresh host list | `Arc` shared with held work | unchanged |
+| O2 | Host resources, allocators and descriptor slots a submission uses live until it finishes | released after `execute` returns, after the GPU finished; the dynamic descriptor slots of fresh tables and the list-owned upload memory are the host list's, so held work keeps them | `inflight::Retire`, released by host fence value |
 | O3 | The probe buffer is read and cleared between submissions | the lock | a probe buffer per submission in flight |
 
 `inflight::Retire` and `inflight::InFlight` exist and are tested (WARP:
 eight submissions in flight with their own upload buffers and allocators,
 retired by fence value) but nothing uses them yet: every submission still
 waits, so neither has anything to do.
+
+Held work is already asynchronous for the title: a submission behind a
+wait not reached runs later on the queue worker, with the host lists it
+was recorded into. Until the sixth session two things it reads belonged to
+the title list and went with its reset: the dynamic descriptor slots its
+fresh tables were made in (owned by the draw state) and the list-owned
+upload memory (`allocate_upload`). Both are now the host list's (O2).
+
+**Asynchronous queues** (experimental, diagnostics builds,
+`VICTORY_QUEUE_ASYNC=1`): every submission, signal, present and page
+mapping is held and run by the queue worker in each queue's order, so a
+title thread returns from `ExecuteCommandLists` at once and its CPU work
+overlaps the GPU's. The worker runs `execute` as above, one submission at
+a time and waiting for the GPU, so C1, C3 and O3 hold as they do today; a
+queue's signals and presents run after its earlier submissions' copy-back
+(C2); the schedule keeps C4; O1 and O2 hold through the host lists' own
+ownership. Presents and page mappings take what they read at the call (the
+texture's host copy, the mapping batches) and run in order, where they run
+ahead of held work otherwise. What does not overlap: the worker's own
+preparation and copy-back with the GPU. Off by default until a GPU run
+(hardware-validation.md, stage 9) shows it safe and worth it.

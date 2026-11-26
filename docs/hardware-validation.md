@@ -216,6 +216,16 @@ millisecond or two per frame, one more run, same route, with
 rises, the texture checks' threads compete with the title's (PERF-5);
 if both rise, they help.
 
+Last, and only if stage 12 passed with the defaults: one run, same route,
+with `VICTORY_QUEUE_ASYNC=1` (experimental, PERF-2): every submission,
+signal, present and page mapping runs on our queue worker in each queue's
+order, so the title's threads no longer wait for the GPU inside a
+submission and their work overlaps the GPU's. Compare fps, ms per frame and
+the presented-frame intervals with the run without it, and note any hang,
+device removal, flicker or wrong image (those settle whether it is safe,
+whatever the frame rate says). The `held back` counts after the frame lines
+count everything in this mode.
+
 The 5 s lines are averages. Presented-frame intervals one by one, which
 show stutter the averages hide: `VICTORY_LOG=victory_gpu::frame=debug,info`
 logs a timestamped `present` line per frame (a variable of its own: run
@@ -276,7 +286,8 @@ Keep `build.txt`, `machine.txt`, `bind.txt` and each stage's folder. What
 each stage settles in the engineering record
 ([engineering-status.md](engineering-status.md)): 3 and 4, the world hang
 and GPU-1; 5, GPU-1; 6, SYNC-1; 7, PERF-3; 8, SH-1; 9 and 10, PERF-1, PERF-4
-and PERF-5 (their baselines); 11, the scene's correctness; 0 and the
+and PERF-5 (their baselines), with `VICTORY_QUEUE_ASYNC=1` PERF-2; 11, the
+scene's correctness; 0 and the
 census, what changed since `ffe310e` and which lowerings matter most; 12,
 whether the game is playable at all. A stage not run,
 or run with a different variable, is reported as such, never as passed.
