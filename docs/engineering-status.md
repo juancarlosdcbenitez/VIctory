@@ -611,10 +611,16 @@ this section.
    * The d16 texture returns' rounding (D3D's toward zero today), once a
      hardware run can compare them with nearest-even.
 
-CI at the time of writing: run 31 (`89ed258`, the f16 fix and
-differential) passed both jobs; runs 34 and 35 failed (the test defect
-above); run 36 (`dbce613`) passed its checks; the runs for `e6d16c6` and
-`8efa1e6` had not finished. The latest diagnostic package whose run passed
-both jobs: run 31's `victory-diag-0.1.0-89ed25834c46-windows-x64`
-(10,683,891 bytes, zip SHA-256
-`d7cec95773969cd7514734bca907a6be3f4de85dec3ede203201a5d0a776d40d`).
+CI at the end of the sixth session's first part: run 31 (`89ed258`, the
+f16 fix and differential) passed both jobs; runs 34 and 35 failed (the
+test defect above); runs 36, 38 and 41 passed their checks; run 43
+(`a54583d`, the last code commit then) passed both jobs. The latest
+verified diagnostic package is run 43's
+`victory-diag-0.1.0-a54583d51539-windows-x64` (build
+`0.1.0+diag.a54583d51539`, 10,700,375 bytes, zip SHA-256
+`c088edc0955052c76934925c423c8edd8bb82dc8205c04467ac2ed72d4901cac`;
+`victory.exe`
+`02192b7bdeb59c16daf0c59d6a3d626daabd738ded80ea9fab1ef8263376536b`,
+`victory.pdb`
+`82d3576aef2df2d5eeeefc3edcf9c52fa0b352d03438f9d5a275009f197d3a4c`; the
+job checked the nine files and `--version`).
